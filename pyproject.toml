@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pylon"
+version = "0.1.0"
+description = "A Rust-cored Python web framework where every route is also an agent tool."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+pylon = "pylon.cli:main"
+
+[tool.maturin]
+manifest-path = "crates/pylon-py/Cargo.toml"
+python-source = "python"
+module-name = "pylon._core"
+features = []

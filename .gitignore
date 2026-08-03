@@ -1,0 +1,7 @@
+target/
+.venv/
+.venv-gil/
+__pycache__/
+*.so
+*.db
+.pytest_cache/

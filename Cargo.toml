@@ -1,0 +1,32 @@
+[workspace]
+members = ["crates/pylon-core", "crates/pylon-py"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tokio = { version = "1.53", features = ["full"] }
+hyper = { version = "1.11", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+matchit = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "charset", "http2"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Deliberately not `panic = "abort"`: a panic inside one request handler must
+# unwind and fail that request, not take the whole server down with it.
