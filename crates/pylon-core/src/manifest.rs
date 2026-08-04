@@ -81,6 +81,17 @@ pub struct JwtConfig {
     pub audience: Option<String>,
     #[serde(default)]
     pub issuer: Option<String>,
+    /// Seconds of clock skew tolerated on `exp` and `nbf`.
+    ///
+    /// Explicit because the underlying library defaults to 60, which silently
+    /// keeps a revoked-by-expiry token usable for a full minute. Thirty seconds
+    /// still absorbs realistic NTP drift.
+    #[serde(default = "default_jwt_leeway")]
+    pub leeway_secs: u64,
+}
+
+fn default_jwt_leeway() -> u64 {
+    30
 }
 
 fn default_jwt_alg() -> String {
@@ -300,6 +311,18 @@ pub struct ServerConfig {
     /// How long to drain in-flight connections on shutdown.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
+    /// Maximum nesting for in-process invocations (behaviour → tool → behaviour).
+    ///
+    /// Without this a self-recursive behaviour recurses forever: each nested
+    /// invocation receives a fresh step budget, so the per-behaviour cap never
+    /// bounds the total, and every level holds a worker thread while it waits.
+    /// One request could permanently exhaust the interpreter pool.
+    #[serde(default = "default_max_depth")]
+    pub max_invocation_depth: u32,
+}
+
+fn default_max_depth() -> u32 {
+    8
 }
 
 fn default_request_timeout() -> u64 {
@@ -328,6 +351,7 @@ impl Default for ServerConfig {
             control_prefix: default_control_prefix(),
             request_timeout_secs: default_request_timeout(),
             shutdown_timeout_secs: default_shutdown_timeout(),
+            max_invocation_depth: default_max_depth(),
         }
     }
 }

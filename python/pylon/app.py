@@ -443,17 +443,24 @@ class Pylon:
         algorithm: str = "HS256",
         audience: str | None = None,
         issuer: str | None = None,
+        leeway_secs: int = 30,
     ) -> None:
         """Accept bearer JWTs verified with the secret in `secret_env`.
 
         Scopes are read from the standard `scope` (space-delimited) or `scopes`
-        (array) claims. Expiry is always validated.
+        (array) claims. `exp` is required and always validated.
+
+        `leeway_secs` is the clock skew tolerated on `exp`/`nbf`. It is stated
+        here rather than inherited because the underlying library defaults to
+        60 seconds, and an expired token staying valid for a further minute
+        should be a decision, not a surprise.
         """
         self._auth["jwt"] = {
             "secret_env": secret_env,
             "algorithm": algorithm,
             "audience": audience,
             "issuer": issuer,
+            "leeway_secs": leeway_secs,
         }
 
     def anonymous_scopes(self, *scopes: str) -> None:

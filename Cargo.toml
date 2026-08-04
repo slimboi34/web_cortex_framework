@@ -24,7 +24,12 @@ thiserror = "2"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "charset", "http2"] }
 minijinja = { version = "2.22", features = ["loader", "builtins"] }
-jsonwebtoken = "11"
+# Both features are load-bearing. Without a crypto provider (`rust_crypto` or
+# `aws_lc_rs`) jsonwebtoken *panics* inside `decode` — reachable by any
+# unauthenticated client sending an Authorization header. Without `use_pem` the
+# RSA/EC PEM parsers vanish and only HMAC works. rust_crypto is pure Rust and
+# covers HS, RS, ES, and EdDSA.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 sha2 = "0.11"
 hmac = "0.13"
 subtle = "2"
@@ -40,3 +45,8 @@ lto = "thin"
 codegen-units = 1
 # Deliberately not `panic = "abort"`: a panic inside one request handler must
 # unwind and fail that request, not take the whole server down with it.
+
+# Incremental compilation artifacts reached several GB across rebuild cycles
+# during development. The workspace rebuilds fast enough without them.
+[profile.dev]
+incremental = false

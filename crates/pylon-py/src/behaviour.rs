@@ -66,6 +66,10 @@ pub struct BehaviourContext {
     max_tokens: u32,
     temperature: f32,
 
+    /// How deep this run already sits in the invocation chain. Tools called from
+    /// here run one level deeper, which is what bounds a recursive behaviour.
+    depth: u32,
+
     trace: Mutex<Vec<TraceEntry>>,
 }
 
@@ -92,6 +96,7 @@ impl BehaviourContext {
         model: String,
         max_tokens: u32,
         temperature: f32,
+        depth: u32,
     ) -> Self {
         Self {
             app,
@@ -109,6 +114,7 @@ impl BehaviourContext {
             model,
             max_tokens,
             temperature,
+            depth,
             trace: Mutex::new(Vec::new()),
         }
     }
@@ -199,9 +205,12 @@ impl BehaviourContext {
 
         // Release the GIL: the tool call may take real time, and other worker
         // threads must keep running while it does.
+        let depth = self.depth;
         let result = py.detach(|| {
-            self.handle
-                .block_on(async move { app.call_tool_as(&tool_name, &args, &principal).await })
+            self.handle.block_on(async move {
+                app.call_tool_at_depth(&tool_name, &args, &principal, depth)
+                    .await
+            })
         });
 
         let elapsed = started.elapsed().as_millis() as u64;
@@ -211,7 +220,15 @@ impl BehaviourContext {
                 json_to_py(py, &value)
             }
             Err(e) => {
-                self.record("call_failed", tool, serde_json::json!({"error": e}), elapsed);
+                self.record("call_failed", tool, serde_json::json!({"error": &e}), elapsed);
+                // The runtime's nesting ceiling is a deliberate stop, not a
+                // handler fault; surface it as a halt so the caller sees why.
+                if e.contains("508") || e.contains("nesting ceiling") {
+                    return Err(BehaviourHalted::new_err(format!(
+                        "behaviour {:?} was stopped: {e}",
+                        self.behaviour
+                    )));
+                }
                 Err(PyRuntimeError::new_err(e))
             }
         }
@@ -378,6 +395,13 @@ impl BehaviourContext {
         &self.run_id
     }
 
+    /// How deep this run sits in the invocation chain. Zero for a run started
+    /// directly over HTTP.
+    #[getter]
+    fn depth(&self) -> u32 {
+        self.depth
+    }
+
     /// Budget consumed so far. Readable mid-run so a behaviour can adapt.
     #[getter]
     fn usage<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -387,6 +411,7 @@ impl BehaviourContext {
         d.set_item("input_tokens", self.input_tokens.load(Ordering::SeqCst))?;
         d.set_item("output_tokens", self.output_tokens.load(Ordering::SeqCst))?;
         d.set_item("token_budget", self.token_budget)?;
+        d.set_item("depth", self.depth)?;
         Ok(d)
     }
 

@@ -116,6 +116,7 @@ impl PyBridge for PythonBridge {
         def: pylon_core::manifest::BehaviourDef,
         input: serde_json::Value,
         principal: pylon_core::auth::Principal,
+        depth: u32,
     ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Captured here, on a tokio thread. The behaviour later runs on a Python
@@ -136,6 +137,7 @@ impl PyBridge for PythonBridge {
                 def.model.clone(),
                 def.max_tokens,
                 def.temperature,
+                depth,
             );
             let completer = Py::new(
                 py,

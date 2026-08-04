@@ -283,6 +283,13 @@ fn build_jwt_decoder(cfg: &JwtConfig) -> Result<JwtDecoder, String> {
 
     let mut validation = jsonwebtoken::Validation::new(algorithm);
     validation.validate_exp = true;
+    validation.validate_nbf = true;
+    // Set explicitly rather than inherited: the library default is 60s, which
+    // is a longer grace window than most operators would knowingly choose.
+    validation.leeway = cfg.leeway_secs;
+    // `exp` is required by default; state it so a library default change cannot
+    // silently start accepting non-expiring tokens.
+    validation.set_required_spec_claims(&["exp"]);
     if let Some(aud) = &cfg.audience {
         validation.set_audience(&[aud]);
     }

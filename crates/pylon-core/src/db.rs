@@ -46,16 +46,13 @@ impl Db {
         sql: &str,
         bindings: &[Value],
         returns: QueryReturns,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, QueryError> {
         if returns == QueryReturns::Affected {
             let mut q = sqlx::query(AssertSqlSafe(sql));
             for b in bindings {
                 q = bind_value(q, b);
             }
-            let res = q
-                .execute(&self.pool)
-                .await
-                .map_err(|e| format!("query failed: {e}"))?;
+            let res = q.execute(&self.pool).await.map_err(QueryError::from_sqlx)?;
             return Ok(serde_json::json!({
                 "affected": res.rows_affected(),
                 "last_insert_id": res.last_insert_rowid(),
@@ -66,14 +63,11 @@ impl Db {
         for b in bindings {
             q = bind_value(q, b);
         }
-        let rows = q
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| format!("query failed: {e}"))?;
+        let rows = q.fetch_all(&self.pool).await.map_err(QueryError::from_sqlx)?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
-            out.push(row_to_json(row)?);
+            out.push(row_to_json(row));
         }
 
         match returns {
@@ -109,14 +103,69 @@ fn bind_value<'a>(q: SqliteQuery<'a>, v: &'a Value) -> SqliteQuery<'a> {
     }
 }
 
-fn row_to_json(row: &sqlx::sqlite::SqliteRow) -> Result<Value, String> {
+fn row_to_json(row: &sqlx::sqlite::SqliteRow) -> Value {
     let mut map = Map::new();
     for (i, col) in row.columns().iter().enumerate() {
         let name = col.name().to_string();
         let value = decode_column(row, i, col.type_info().name());
         map.insert(name, value);
     }
-    Ok(Value::Object(map))
+    Value::Object(map)
+}
+
+/// Distinguishes "the caller sent something the query cannot use" from "the
+/// database is broken". Conflating them turns a malformed query string into a
+/// 500, which reads as a server fault and inflates error budgets.
+#[derive(Debug)]
+pub enum QueryError {
+    /// Caused by the request's own data: a bad type, a constraint violation.
+    BadInput(String),
+    /// Anything else. The detail stays in the log.
+    Internal(String),
+}
+
+impl QueryError {
+    fn from_sqlx(e: sqlx::Error) -> Self {
+        let text = e.to_string();
+        let lowered = text.to_ascii_lowercase();
+        let caller_fault = matches!(&e, sqlx::Error::Database(db) if {
+            let msg = db.message().to_ascii_lowercase();
+            msg.contains("constraint")
+                || msg.contains("datatype mismatch")
+                || msg.contains("not a")
+                || msg.contains("no such column")
+        }) || lowered.contains("datatype mismatch")
+            || lowered.contains("constraint")
+            || lowered.contains("error occurred while decoding")
+            || lowered.contains("mismatched types");
+
+        // Full detail is logged; the client is told only which side is at fault.
+        tracing::warn!(error = %text, caller_fault, "query failed");
+        if caller_fault {
+            Self::BadInput("the request contained a value this query cannot use".into())
+        } else {
+            Self::Internal("query failed".into())
+        }
+    }
+
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::BadInput(_) => 400,
+            Self::Internal(_) => 500,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::BadInput(m) | Self::Internal(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
 }
 
 /// SQLite is dynamically typed, so the declared column type is a hint rather

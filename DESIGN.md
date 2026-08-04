@@ -240,7 +240,27 @@ Ordered by what unblocks the most.
 
 ---
 
-## 7. The honest summary
+## 7. What the security review changed
+
+An adversarial review (see [`SECURITY.md`](SECURITY.md)) found six issues. Two
+are worth pulling into the design record because they were *design* faults, not
+slips:
+
+**Budgets did not compose.** A behaviour's `max_steps` bounded that behaviour,
+but each nested invocation received a fresh budget — so recursion was unbounded
+even though every individual frame was capped. The lesson generalises: a
+per-invocation limit is not a per-request limit, and anything that can re-enter
+the dispatcher needs a counter that travels *with the request* rather than with
+the frame. `PylonRequest.depth` is that counter.
+
+**A panic was indistinguishable from a network fault.** A dependency panicking
+in the auth path severed the connection with no status line. The framework had
+no boundary, so the symptom was "connection closed" — one of the hardest
+failures to diagnose. The request path now catches unwinds. This is why
+`panic = "abort"` was rejected in v0.1: an aborting process would have made the
+same bug a crash loop instead of a contained 500.
+
+## 8. The honest summary
 
 The novel, defensible idea here is **"declared once, executed by Rust, callable
 by agents"** — and it is demonstrated working end to end today, not sketched.

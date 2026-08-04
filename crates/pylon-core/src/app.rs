@@ -304,7 +304,10 @@ impl App {
                         .iter()
                         .map(|name| req.lookup(name).unwrap_or(serde_json::Value::Null))
                         .collect();
-                    let value = db.run(sql, &bindings, *returns).await?;
+                    let value = match db.run(sql, &bindings, *returns).await {
+                        Ok(v) => v,
+                        Err(e) => return Ok(PylonResponse::error(e.status(), e.message())),
+                    };
                     if value.is_null() && *returns == crate::manifest::QueryReturns::One {
                         return Ok(PylonResponse::error(404, "not found"));
                     }
@@ -334,10 +337,47 @@ impl App {
                 Ok(server.serve(&relative, req.headers.get("if-none-match").map(|s| s.as_str())))
             }
 
-            Op::Agent { agent, .. } => self.run_agent(agent, req).await,
+            Op::Agent { agent, .. } => {
+                if let Some(res) = self.depth_exceeded(&req) {
+                    return Ok(res);
+                }
+                self.run_agent(agent, req).await
+            }
 
-            Op::Behaviour { behaviour, .. } => self.run_behaviour(behaviour, req).await,
+            Op::Behaviour { behaviour, .. } => {
+                if let Some(res) = self.depth_exceeded(&req) {
+                    return Ok(res);
+                }
+                self.run_behaviour(behaviour, req).await
+            }
         }
+    }
+
+    /// Refuse an invocation nested deeper than the configured ceiling.
+    ///
+    /// Checked only for behaviour and agent ops, because those are the ones that
+    /// can re-enter the dispatcher and form a cycle.
+    fn depth_exceeded(&self, req: &PylonRequest) -> Option<PylonResponse> {
+        let max = self.manifest.server.max_invocation_depth;
+        if req.depth < max {
+            return None;
+        }
+        tracing::warn!(
+            depth = req.depth,
+            max,
+            path = %req.path,
+            principal = %req.principal.id,
+            "refused an invocation past the nesting ceiling; likely a recursive behaviour"
+        );
+        // 508 Loop Detected says precisely what happened.
+        Some(PylonResponse::error(
+            508,
+            format!(
+                "invocation nested {} deep, exceeding the ceiling of {max}; \
+                 a behaviour or agent is calling itself",
+                req.depth
+            ),
+        ))
     }
 
     async fn run_behaviour(
@@ -365,7 +405,11 @@ impl App {
         });
 
         let app = self.arc_self()?;
-        match self.bridge.call_behaviour(app, def.clone(), input, actor.clone()).await {
+        match self
+            .bridge
+            .call_behaviour(app, def.clone(), input, actor.clone(), req.depth + 1)
+            .await
+        {
             Ok(value) => Ok(PylonResponse::json(200, &value)),
             Err(e) => {
                 self.audit.record(crate::audit::AuditEvent {
@@ -405,7 +449,10 @@ impl App {
                         .iter()
                         .map(|n| req.lookup(n).unwrap_or(serde_json::Value::Null))
                         .collect();
-                    let value = db.run(sql, &bindings, *returns).await?;
+                    let value = match db.run(sql, &bindings, *returns).await {
+                        Ok(v) => v,
+                        Err(e) => return Ok(PylonResponse::error(e.status(), e.message())),
+                    };
                     if value.is_null() && *returns == crate::manifest::QueryReturns::One {
                         return Ok(PylonResponse::error(404, "not found"));
                     }
@@ -503,10 +550,32 @@ impl App {
             .get(upstream_name)
             .ok_or_else(|| format!("unknown upstream {upstream_name:?}"))?;
 
+        // Path parameters are attacker-controlled. Substituted naively into a
+        // rewrite template they can climb out of the intended upstream prefix —
+        // `/proxy/..` reaching `/` on the upstream was a confirmed escape — which
+        // turns a narrow proxy into a general SSRF primitive against whatever the
+        // upstream happens to be.
+        for (name, value) in &req.path_params {
+            if is_traversal(value) {
+                tracing::warn!(
+                    upstream = %upstream_name, param = %name,
+                    "rejected proxy request whose path parameter contained traversal"
+                );
+                return Ok(PylonResponse::error(400, "invalid path parameter"));
+            }
+        }
+
         let tail = match rewrite {
             Some(t) => substitute_path(t, &req.path_params),
             None => req.path.clone(),
         };
+
+        // Belt and braces: even with clean parameters, the assembled tail must
+        // not contain a traversal segment.
+        if tail.split('/').any(|seg| seg == ".." || seg == ".") {
+            return Ok(PylonResponse::error(400, "invalid upstream path"));
+        }
+
         let url = format!("{}{}", up.base_url.trim_end_matches('/'), tail);
 
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
@@ -577,7 +646,19 @@ impl App {
         args: &'a serde_json::Value,
         principal: &'a Principal,
     ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
-        Box::pin(async move { self.call_tool_inner(tool_name, args, principal).await })
+        self.call_tool_at_depth(tool_name, args, principal, 0)
+    }
+
+    /// As [`Self::call_tool_as`], carrying the caller's nesting depth so a cycle
+    /// through tools is bounded.
+    pub fn call_tool_at_depth<'a>(
+        &'a self,
+        tool_name: &'a str,
+        args: &'a serde_json::Value,
+        principal: &'a Principal,
+        depth: u32,
+    ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
+        Box::pin(async move { self.call_tool_inner(tool_name, args, principal, depth).await })
     }
 
     async fn call_tool_inner(
@@ -585,6 +666,7 @@ impl App {
         tool_name: &str,
         args: &serde_json::Value,
         principal: &Principal,
+        depth: u32,
     ) -> Result<serde_json::Value, String> {
         let route_id = *self
             .tools_by_name
@@ -632,6 +714,7 @@ impl App {
             body,
             route_id: Some(route_id),
             principal: principal.clone(),
+            depth,
         };
 
         let res = self.dispatch(req).await;
@@ -661,6 +744,53 @@ impl App {
         };
         self.call_tool_as(tool_name, args, &principal).await
     }
+}
+
+/// True when a value could alter the structure of a URL path it is spliced into.
+///
+/// Deliberately blunt: a path *parameter* is a single segment, so a slash or a
+/// dot-dot in one is always either an attack or a bug. Checked after percent
+/// decoding, and again on the raw text, so a doubly-encoded payload cannot slip
+/// through whichever layer decoded only once.
+fn is_traversal(value: &str) -> bool {
+    let decoded = percent_decode_twice(value);
+    for candidate in [value, decoded.as_str()] {
+        if candidate.contains("..")
+            || candidate.contains('/')
+            || candidate.contains('\\')
+            || candidate.contains('\0')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn percent_decode_twice(s: &str) -> String {
+    fn once(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    Ok(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    once(&once(s))
 }
 
 fn json_to_path_string(v: &serde_json::Value) -> String {

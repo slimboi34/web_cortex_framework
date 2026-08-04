@@ -29,6 +29,11 @@ from typing import Any, Callable, Sequence
 
 __all__ = ["Dispatcher", "free_threaded", "default_worker_count"]
 
+# Tracebacks go to the log always, and to the client only when explicitly
+# enabled. A stack trace in an HTTP response hands an attacker your file layout,
+# dependency versions, and code structure for free.
+_EXPOSE_TRACEBACKS = os.environ.get("PYLON_DEBUG_ERRORS", "").lower() in {"1", "true", "yes"}
+
 
 def free_threaded() -> bool:
     """True when running on a build with the GIL disabled."""
@@ -309,11 +314,17 @@ def _deliver(value: Any, completer: Any) -> None:
 
 
 def _deliver_exception(exc: BaseException, completer: Any) -> None:
+    """Turn a handler exception into a response without leaking internals."""
     if isinstance(exc, HTTPError):
+        # Deliberately raised by the application: the message is intended for
+        # the caller, so it is safe to pass through.
         _deliver(Response({"error": {"status": exc.status, "message": exc.message}}, exc.status), completer)
         return
+
     detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    _fail(completer, detail)
+    # Always logged in full, so nothing is lost by not returning it.
+    print(f"[pylon] unhandled handler exception:\n{detail}", file=sys.stderr, flush=True)
+    _fail(completer, detail if _EXPOSE_TRACEBACKS else "internal error")
 
 
 def _settle_behaviour(future: Any, completer: Any) -> None:
@@ -331,12 +342,17 @@ def _settle_behaviour(future: Any, completer: Any) -> None:
                 traceback.print_exc()
                 return
         detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        _fail(completer, detail)
+        print(f"[pylon] behaviour failed:\n{detail}", file=sys.stderr, flush=True)
+        _fail(completer, detail if _EXPOSE_TRACEBACKS else "behaviour failed")
         return
     try:
         completer.complete(future.result())
     except Exception:
-        _fail(completer, f"behaviour returned an unconvertible value:\n{traceback.format_exc()}")
+        detail = traceback.format_exc()
+        print(f"[pylon] behaviour returned an unconvertible value:\n{detail}",
+              file=sys.stderr, flush=True)
+        _fail(completer, detail if _EXPOSE_TRACEBACKS else
+              "behaviour returned a value that could not be serialised")
 
 
 def _fail(completer: Any, message: str) -> None:

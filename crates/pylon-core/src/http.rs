@@ -22,6 +22,12 @@ pub struct PylonRequest {
     /// tool call arrives with a *delegated* principal whose scopes are a subset
     /// of the caller's — see [`crate::auth::Principal::delegate_to_agent`].
     pub principal: crate::auth::Principal,
+    /// How many in-process invocations deep this request is.
+    ///
+    /// Zero for anything arriving over HTTP. Incremented every time a behaviour
+    /// or agent calls a tool, so a cycle is bounded even though each nested
+    /// invocation gets its own step budget.
+    pub depth: u32,
 }
 
 impl PylonRequest {
@@ -35,6 +41,7 @@ impl PylonRequest {
             body: Bytes::new(),
             route_id: None,
             principal: crate::auth::Principal::anonymous(),
+            depth: 0,
         }
     }
 

@@ -28,6 +28,7 @@ pub trait PyBridge: Send + Sync + 'static {
         def: crate::manifest::BehaviourDef,
         _input: serde_json::Value,
         _principal: crate::auth::Principal,
+        _depth: u32,
     ) -> BoxFuture<'a, Result<serde_json::Value, String>> {
         Box::pin(async move {
             Err(format!(

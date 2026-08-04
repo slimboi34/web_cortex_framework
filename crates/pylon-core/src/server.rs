@@ -17,7 +17,9 @@ use crate::auth::Principal;
 use crate::http::{PylonRequest, PylonResponse, parse_query};
 use crate::{mcp, middleware, openapi};
 use bytes::Bytes;
+use futures::FutureExt;
 use http_body_util::{BodyExt, Full, Limited};
+use std::panic::AssertUnwindSafe;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -158,7 +160,32 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let (mut res, principal_id) = route_request(&app, req, &client_ip, &request_id).await;
+    // Defence in depth. A panic anywhere in the request path — ours or a
+    // dependency's — must become a 500 for that one request, not a severed
+    // connection with no status line. A dependency panicking inside the auth
+    // path is exactly how this was discovered, and the symptom (connection
+    // closed, no response) is far harder to diagnose than a 500 would have been.
+    let outcome = AssertUnwindSafe(route_request(&app, req, &client_ip, &request_id))
+        .catch_unwind()
+        .await;
+
+    let (mut res, principal_id) = match outcome {
+        Ok(v) => v,
+        Err(payload) => {
+            let detail = panic_message(&payload);
+            tracing::error!(
+                request_id = %request_id,
+                method = %method,
+                path = %path,
+                panic = %detail,
+                "request handler panicked; returning 500"
+            );
+            (
+                PylonResponse::error(500, "internal error"),
+                "panic".to_string(),
+            )
+        }
+    };
 
     // Applied on every exit path, including errors and rejections.
     res.headers.push(("x-request-id".into(), request_id.clone()));
@@ -265,6 +292,7 @@ async fn route_request(
             body,
             route_id: None,
             principal,
+            depth: 0,
         });
         // A handler that hangs must not hold a connection forever.
         match tokio::time::timeout(timeout, dispatch).await {
@@ -452,6 +480,18 @@ fn op_name(op: &crate::manifest::Op) -> &'static str {
         Files { .. } => "files",
         Behaviour { .. } => "behaviour",
     }
+}
+
+/// Best-effort extraction of a panic message for the log. Never surfaced to the
+/// client, which only ever sees "internal error".
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "non-string panic payload".to_string()
 }
 
 fn to_hyper(res: PylonResponse) -> Response<Full<Bytes>> {

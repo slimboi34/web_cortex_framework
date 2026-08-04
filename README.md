@@ -261,14 +261,35 @@ pylon sql             DDL for declared resources
 pylon keygen          mint an API key
 ```
 
+## Security
+
+Pylon has been through an adversarial review of its own controls — auth,
+authorization, injection, traversal, SSRF, exhaustion, disclosure — plus stress
+and soak testing. **Six issues were found and fixed**, each with a regression
+test in `tests/test_pentest.py`:
+
+| | Severity |
+|---|---|
+| Remote DoS + total auth failure via a JWT library panic | Critical |
+| No panic boundary on the request path | High |
+| Proxy path traversal usable as an SSRF primitive | High |
+| Unbounded behaviour recursion exhausting the worker pool | High |
+| Python tracebacks returned to clients | Medium |
+| Client input faults reported as 500s | Low |
+
+Soak: **1,786,805 requests, 0 errors, 0 panics**, memory at steady state.
+
+[`SECURITY.md`](SECURITY.md) has the full report — including what was *not*
+tested and the known limits.
+
 ## Status
 
 v0.3. Working and tested: the manifest IR, router, native ops (static / query /
 proxy / page / files), the free-threaded Python bridge, authentication and
 scopes, rate limiting, CORS, security headers, graceful shutdown, Behaviours,
 the agent runtime with approval gates and budgets, the audit trail, OpenAPI, the
-MCP server, and TypeScript generation. **197 tests** (66 Rust, 131 Python),
-clippy clean.
+MCP server, and TypeScript generation. **251 tests** (66 Rust, 185 Python,
+including a 54-test adversarial suite), clippy clean.
 
 Not yet: Postgres, SSE streaming, durable agent runs, local model supervision.
 See [DESIGN.md](DESIGN.md) for the roadmap, honest risk grading, and — just as
