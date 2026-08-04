@@ -130,5 +130,6 @@ fn op_kind(op: &Op) -> &'static str {
         Op::Agent { .. } => "agent",
         Op::Page { .. } => "page",
         Op::Files { .. } => "files",
+        Op::Behaviour { .. } => "behaviour",
     }
 }

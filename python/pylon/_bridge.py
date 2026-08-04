@@ -118,6 +118,25 @@ class Dispatcher:
             future = self._threads.submit(handler, req)
             future.add_done_callback(lambda f: _settle_future(f, completer))
 
+    def submit_behaviour(self, handler_id: int, ctx: Any, payload: Any, completer: Any) -> None:
+        """Run a Behaviour on a worker thread.
+
+        Behaviours always run on the thread pool, never on an event loop:
+        `ctx.call` and `ctx.ask` block while the Rust runtime does the work, and
+        blocking an event loop that other requests share would stall them.
+        """
+        try:
+            handler = self._handlers[handler_id]
+        except IndexError:
+            _fail(completer, f"no behaviour registered at index {handler_id}")
+            return
+
+        def run() -> Any:
+            return handler(ctx, payload)
+
+        future = self._threads.submit(run)
+        future.add_done_callback(lambda f: _settle_behaviour(f, completer))
+
     def shutdown(self) -> None:
         for w in self._loops:
             w.shutdown()
@@ -295,6 +314,29 @@ def _deliver_exception(exc: BaseException, completer: Any) -> None:
         return
     detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     _fail(completer, detail)
+
+
+def _settle_behaviour(future: Any, completer: Any) -> None:
+    """Deliver a behaviour's return value, or its failure."""
+    exc = future.exception()
+    if exc is not None:
+        # A halt is the runtime stopping the behaviour on purpose (budget
+        # exhausted, approval required). It is reported as a structured result
+        # rather than a crash, because the caller usually wants to act on it.
+        if type(exc).__name__ == "BehaviourHalted":
+            try:
+                completer.complete({"halted": True, "reason": str(exc)})
+                return
+            except Exception:
+                traceback.print_exc()
+                return
+        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        _fail(completer, detail)
+        return
+    try:
+        completer.complete(future.result())
+    except Exception:
+        _fail(completer, f"behaviour returned an unconvertible value:\n{traceback.format_exc()}")
 
 
 def _fail(completer: Any, message: str) -> None:

@@ -41,6 +41,12 @@ pub struct App {
     file_servers: HashMap<u32, FileServer>,
     pub audit: Arc<dyn AuditSink>,
     agent_runtime: Option<AgentRuntime>,
+    provider: Option<Arc<dyn crate::agent::ModelProvider>>,
+    behaviours: HashMap<String, crate::manifest::BehaviourDef>,
+    /// Set once the App is wrapped in an Arc. A Behaviour needs a handle to the
+    /// application in order to call tools, and that reference is necessarily
+    /// cyclic; a Weak keeps it from leaking.
+    self_ref: std::sync::OnceLock<std::sync::Weak<App>>,
 }
 
 impl App {
@@ -115,20 +121,32 @@ impl App {
 
         // An app with declared agents but no API key still boots; the agent
         // routes report a clear 503 instead of the process refusing to start.
-        let agent_runtime = if manifest.agents.is_empty() {
-            None
-        } else {
+        let needs_model = !manifest.agents.is_empty() || !manifest.behaviours.is_empty();
+        let provider: Option<Arc<dyn crate::agent::ModelProvider>> = if needs_model {
             match crate::agent::provider::AnthropicProvider::from_env() {
-                Some(p) => Some(AgentRuntime::new(Arc::new(p), audit.clone())),
+                Some(p) => Some(Arc::new(p)),
                 None => {
                     tracing::warn!(
-                        "agents are declared but ANTHROPIC_API_KEY is unset; \
-                         agent routes will return 503"
+                        "agents or behaviours are declared but ANTHROPIC_API_KEY is unset; \
+                         model-backed routes will fail until it is set"
                     );
                     None
                 }
             }
+        } else {
+            None
         };
+
+        let agent_runtime = provider
+            .clone()
+            .filter(|_| !manifest.agents.is_empty())
+            .map(|p| AgentRuntime::new(p, audit.clone()));
+
+        let behaviours: HashMap<String, crate::manifest::BehaviourDef> = manifest
+            .behaviours
+            .iter()
+            .map(|b| (b.name.clone(), b.clone()))
+            .collect();
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
@@ -152,7 +170,35 @@ impl App {
             file_servers,
             audit,
             agent_runtime,
+            provider,
+            behaviours,
+            self_ref: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Wrap in an `Arc` and record the self-reference behaviours need.
+    ///
+    /// Always use this rather than `Arc::new(app)`: a behaviour dispatched from
+    /// an App that never learned its own `Arc` cannot call tools.
+    pub fn into_arc(self) -> Arc<Self> {
+        let arc = Arc::new(self);
+        let _ = arc.self_ref.set(Arc::downgrade(&arc));
+        arc
+    }
+
+    fn arc_self(&self) -> Result<Arc<App>, String> {
+        self.self_ref
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| "app was not created with App::into_arc()".to_string())
+    }
+
+    pub fn provider(&self) -> Option<&Arc<dyn crate::agent::ModelProvider>> {
+        self.provider.as_ref()
+    }
+
+    pub fn behaviour(&self, name: &str) -> Option<&crate::manifest::BehaviourDef> {
+        self.behaviours.get(name)
     }
 
     pub async fn build_without_python(manifest: Manifest) -> Result<Self, String> {
@@ -289,6 +335,48 @@ impl App {
             }
 
             Op::Agent { agent, .. } => self.run_agent(agent, req).await,
+
+            Op::Behaviour { behaviour, .. } => self.run_behaviour(behaviour, req).await,
+        }
+    }
+
+    async fn run_behaviour(
+        &self,
+        name: &str,
+        req: PylonRequest,
+    ) -> Result<PylonResponse, String> {
+        let def = self
+            .behaviours
+            .get(name)
+            .ok_or_else(|| format!("unknown behaviour {name:?}"))?
+            .clone();
+
+        // Same delegation rule as agents: a behaviour holds a subset of its
+        // caller's authority, never a superset.
+        let actor = req.principal.delegate_to_agent(&def.name, &def.scopes);
+        let input = req.json_body().unwrap_or(serde_json::Value::Null);
+
+        self.audit.record(crate::audit::AuditEvent {
+            kind: "behaviour_started".into(),
+            run_id: String::new(),
+            actor: Some(actor.id.clone()),
+            tool: Some(def.name.clone()),
+            detail: serde_json::json!({"granted_scopes": actor.scopes}),
+        });
+
+        let app = self.arc_self()?;
+        match self.bridge.call_behaviour(app, def.clone(), input, actor.clone()).await {
+            Ok(value) => Ok(PylonResponse::json(200, &value)),
+            Err(e) => {
+                self.audit.record(crate::audit::AuditEvent {
+                    kind: "behaviour_failed".into(),
+                    run_id: String::new(),
+                    actor: Some(actor.id),
+                    tool: Some(name.to_string()),
+                    detail: serde_json::json!({"error": &e}),
+                });
+                Ok(PylonResponse::error(500, e))
+            }
         }
     }
 

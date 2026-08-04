@@ -17,6 +17,26 @@ pub trait PyBridge: Send + Sync + 'static {
         req: PylonRequest,
     ) -> BoxFuture<'a, Result<PylonResponse, String>>;
 
+    /// Run a Behaviour.
+    ///
+    /// Distinct from [`Self::call`] because a behaviour receives a context
+    /// object rather than a request: it needs to reach back into the runtime for
+    /// tool and model calls, which a plain handler never does.
+    fn call_behaviour<'a>(
+        &'a self,
+        _app: std::sync::Arc<crate::App>,
+        def: crate::manifest::BehaviourDef,
+        _input: serde_json::Value,
+        _principal: crate::auth::Principal,
+    ) -> BoxFuture<'a, Result<serde_json::Value, String>> {
+        Box::pin(async move {
+            Err(format!(
+                "behaviour {:?} requires an interpreter, but this runtime was built without one",
+                def.name
+            ))
+        })
+    }
+
     /// How many interpreter workers are live. Reported on the health endpoint.
     fn workers(&self) -> usize {
         0

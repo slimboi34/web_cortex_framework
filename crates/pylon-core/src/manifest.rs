@@ -27,6 +27,8 @@ pub struct Manifest {
     #[serde(default)]
     pub agents: Vec<AgentDef>,
     #[serde(default)]
+    pub behaviours: Vec<BehaviourDef>,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub cors: CorsConfig,
@@ -225,6 +227,47 @@ impl Default for SecurityHeaders {
     }
 }
 
+/// A Behaviour: a named, versioned procedure written in Python.
+///
+/// The framework's answer to "skills". A skill is a prompt the model may
+/// ignore; a Behaviour is code whose control flow always runs, with model calls
+/// only at the leaves. It is exposed as a tool like any route, so agents can
+/// invoke behaviours and behaviours can invoke each other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehaviourDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Index into the Python handler registry.
+    pub handler: u32,
+    /// Tools this behaviour may call. Empty means "whatever its caller can".
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Scopes the run executes with, intersected with the caller's.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Total leaf operations (tool calls plus model calls) permitted.
+    #[serde(default = "default_behaviour_steps")]
+    pub max_steps: u32,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default = "default_behaviour_model")]
+    pub model: String,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+}
+
+fn default_behaviour_steps() -> u32 {
+    50
+}
+fn default_behaviour_model() -> String {
+    "claude-opus-5".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateConfig {
     /// Directory containing `.html` templates, resolved relative to the app.
@@ -420,6 +463,13 @@ pub enum Op {
         #[serde(default = "default_page_status")]
         status: u16,
     },
+    /// Run a Behaviour: Python control flow whose leaves are tool and model
+    /// calls. Unlike an agent, the *structure* is deterministic — the loops and
+    /// branches are code, and only the leaves are probabilistic.
+    Behaviour {
+        behaviour: String,
+        handler: u32,
+    },
     /// Serve files from a directory.
     Files {
         dir: String,
@@ -593,6 +643,22 @@ impl Manifest {
             return Err("rate_limit.per_second must be greater than zero".into());
         }
 
+        // Checked before route tool-name collisions, because a duplicate
+        // behaviour causes one of those too and the generic message would
+        // point at the wrong fix.
+        let mut behaviour_names = std::collections::HashSet::new();
+        for b in &self.behaviours {
+            if !behaviour_names.insert(b.name.as_str()) {
+                return Err(format!("duplicate behaviour name {:?}", b.name));
+            }
+            if b.max_steps == 0 {
+                return Err(format!(
+                    "behaviour {:?} has max_steps=0 and could never do anything",
+                    b.name
+                ));
+            }
+        }
+
         // Two routes answering to one tool name would make a model's tool call
         // ambiguous. Caught here rather than at bind time so `pylon check`
         // reports it.
@@ -606,13 +672,40 @@ impl Manifest {
             }
         }
 
+        for b in &self.behaviours {
+            for t in &b.tools {
+                // A behaviour may call another behaviour, so both namespaces
+                // are valid targets.
+                if tool_names.contains(t.as_str())
+                    || self.behaviours.iter().any(|o| &o.name == t)
+                {
+                    continue;
+                }
+                let hint = nearest(t, &tool_names);
+                return Err(match hint {
+                    Some(h) => format!(
+                        "behaviour {:?} declares tool {:?}, which is not an exposed route \
+                         or behaviour. Did you mean {:?}?",
+                        b.name, t, h
+                    ),
+                    None => format!(
+                        "behaviour {:?} declares tool {:?}, which is not an exposed route \
+                         or behaviour",
+                        b.name, t
+                    ),
+                });
+            }
+        }
+
         let mut agent_names = std::collections::HashSet::new();
         for a in &self.agents {
             if !agent_names.insert(a.name.as_str()) {
                 return Err(format!("duplicate agent name {:?}", a.name));
             }
             for t in &a.tools {
-                if !tool_names.contains(t.as_str()) {
+                if !tool_names.contains(t.as_str())
+                    && !self.behaviours.iter().any(|b| &b.name == t)
+                {
                     let hint = nearest(t, &tool_names);
                     return Err(match hint {
                         Some(h) => format!(

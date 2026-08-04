@@ -85,6 +85,7 @@ class Pylon:
         self._handlers: list[Callable] = []
         self._upstreams: dict[str, dict] = {}
         self._agents: list[dict] = []
+        self._behaviours: list[dict] = []
         self._resources: list[Resource] = []
         self._schema_sql: list[str] = []
         self._templates_used: set[str] = set()
@@ -611,6 +612,122 @@ class Pylon:
         )
 
     # ------------------------------------------------------------------
+    # Behaviours
+    # ------------------------------------------------------------------
+
+    def behaviour(
+        self,
+        name: str | None = None,
+        *,
+        description: str = "",
+        tools: Sequence[str] = (),
+        scopes: Sequence[str] = (),
+        max_steps: int = 50,
+        token_budget: int | None = None,
+        model: str = "claude-opus-5",
+        max_tokens: int = 4096,
+        temperature: float = 1.0,
+        expose_at: str | None = None,
+        expose_scopes: Sequence[str] | None = None,
+        tool: bool = True,
+    ) -> Callable:
+        """Declare a Behaviour: a procedure whose control flow is real Python.
+
+        A "skill" written as a prompt is a suggestion — the model reads it and
+        may ignore it, and "if X then Y" fails silently when it does. A Behaviour
+        inverts that. The loops and branches are code that always runs; only the
+        leaves are probabilistic:
+
+            @app.behaviour("triage", tools=["list_tickets", "update_tickets"])
+            def triage(ctx, input):
+                tickets = ctx.call("list_tickets", status="open")
+
+                urgent = 0
+                for ticket in tickets:                      # a real loop
+                    verdict = ctx.ask(                      # a model call
+                        f"Classify this ticket: {ticket['body']}",
+                        schema={
+                            "type": "object",
+                            "properties": {
+                                "category": {"enum": ["bug", "billing", "other"]},
+                                "urgency": {"type": "integer"},
+                            },
+                            "required": ["category", "urgency"],
+                        },
+                    )
+                    if verdict["urgency"] > 7:              # a real branch
+                        urgent += 1
+                        ctx.call("page_oncall", ticket=ticket["id"])
+                    ctx.call("update_tickets", id=ticket["id"],
+                             category=verdict["category"])
+
+                return {"triaged": len(tickets), "urgent": urgent}
+
+        The handler takes `(ctx, input)`. `input` is the JSON payload the caller
+        sent; `ctx` is how the behaviour reaches the outside world:
+
+        - `ctx.call(tool, **kwargs)` — invoke one of the app's tools, in-process,
+          under this behaviour's delegated principal
+        - `ctx.ask(prompt, schema=...)` — a model call; with a schema the model
+          is *forced* into that shape, so branches switch on real values
+        - `ctx.log(msg)`, `ctx.halt(reason)`, `ctx.usage`, `ctx.trace`, `ctx.user`
+
+        A behaviour is exposed as a tool by default, so agents can invoke
+        behaviours and behaviours can compose with each other. `max_steps` caps
+        total leaf operations and `token_budget` caps spend — both enforced by
+        the runtime, so a runaway loop costs a bounded amount.
+        """
+
+        def decorator(fn: Callable) -> Callable:
+            behaviour_name = name or fn.__name__
+            doc = inspect.getdoc(fn) or ""
+            handler_index = len(self._handlers)
+            self._handlers.append(fn)
+
+            input_schema = _behaviour_input_schema(fn)
+
+            self._behaviours.append(
+                {
+                    "name": behaviour_name,
+                    "description": description or doc,
+                    "handler": handler_index,
+                    "tools": list(tools),
+                    "scopes": list(scopes),
+                    "max_steps": max_steps,
+                    "token_budget": token_budget,
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "input_schema": input_schema,
+                }
+            )
+
+            # A behaviour becomes a route, which is what makes it a tool, an
+            # OpenAPI operation, and an MCP entry — with no separate plumbing.
+            path = expose_at or f"/behaviours/{behaviour_name.replace('_', '-')}"
+            guard = list(expose_scopes if expose_scopes is not None else scopes)
+            self._add_route(
+                "POST",
+                path,
+                {"kind": "behaviour", "behaviour": behaviour_name, "handler": handler_index},
+                summary=(description or doc).split("\n", 1)[0] or f"Run the {behaviour_name} behaviour",
+                description=description or doc,
+                input_schema=input_schema,
+                tool=tool,
+                tool_name=behaviour_name,
+                read_only=False,
+                idempotent=False,
+                scopes=guard,
+            )
+            return fn
+
+        # Allow both @app.behaviour and @app.behaviour("name").
+        if callable(name):
+            fn, name = name, None
+            return decorator(fn)
+        return decorator
+
+    # ------------------------------------------------------------------
     # Agents
     # ------------------------------------------------------------------
 
@@ -736,6 +853,7 @@ class Pylon:
             "routes": self._routes_with_default_root(),
             "upstreams": self._upstreams,
             "agents": self._agents,
+            "behaviours": self._behaviours,
         }
 
     def manifest_json(self) -> str:
@@ -792,6 +910,16 @@ class Pylon:
                 {"name": a["name"], "tools": a["tools"], "scopes": a.get("scopes", [])}
                 for a in self._agents
             ],
+            "behaviours": [
+                {
+                    "name": b["name"],
+                    "tools": b["tools"],
+                    "scopes": b.get("scopes", []),
+                    "max_steps": b["max_steps"],
+                    "token_budget": b.get("token_budget"),
+                }
+                for b in self._behaviours
+            ],
         }
 
     def run(self) -> None:
@@ -835,6 +963,29 @@ class Pylon:
 # ----------------------------------------------------------------------
 # Handler binding
 # ----------------------------------------------------------------------
+
+
+def _behaviour_input_schema(fn: Callable) -> dict:
+    """Derive the payload schema from the handler's `input` annotation.
+
+    A behaviour signature is `(ctx, input)`. Annotating `input` with a dataclass
+    gives agents a precise tool schema for free; leaving it bare accepts any
+    object.
+    """
+    try:
+        hints = __import__("typing").get_type_hints(fn)
+    except Exception:
+        hints = getattr(fn, "__annotations__", {})
+
+    params = [p for p in inspect.signature(fn).parameters]
+    if len(params) < 2:
+        return {"type": "object", "properties": {}}
+
+    annotation = hints.get(params[1], inspect.Parameter.empty)
+    schema = _schema.json_schema_for(annotation)
+    if schema.get("type") == "object" and "properties" in schema:
+        return schema
+    return {"type": "object", "properties": {}, "additionalProperties": True}
 
 
 def _path_params(path: str) -> list[str]:

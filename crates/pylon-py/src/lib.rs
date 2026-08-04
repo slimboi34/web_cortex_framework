@@ -5,6 +5,9 @@
 //! fires, work is handed to the Python-side dispatcher, which spreads it across
 //! free-threaded interpreter workers and calls back into [`Completer`].
 
+mod behaviour;
+
+use behaviour::{BehaviourContext, BehaviourHalted, json_to_py, py_to_json};
 use pylon_core::{App, Manifest, PylonRequest, PylonResponse, PyBridge};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -107,8 +110,92 @@ impl PyBridge for PythonBridge {
         })
     }
 
+    fn call_behaviour<'a>(
+        &'a self,
+        app: Arc<App>,
+        def: pylon_core::manifest::BehaviourDef,
+        input: serde_json::Value,
+        principal: pylon_core::auth::Principal,
+    ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Captured here, on a tokio thread. The behaviour later runs on a Python
+        // worker thread and uses this handle to re-enter the runtime.
+        let handle = tokio::runtime::Handle::current();
+
+        let submitted = Python::attach(|py| -> PyResult<()> {
+            let ctx = BehaviourContext::new(
+                app.clone(),
+                handle,
+                principal,
+                app.provider().cloned(),
+                uuid::Uuid::new_v4().to_string(),
+                def.name.clone(),
+                def.tools.clone(),
+                def.max_steps,
+                def.token_budget,
+                def.model.clone(),
+                def.max_tokens,
+                def.temperature,
+            );
+            let completer = Py::new(
+                py,
+                ValueCompleter { tx: Mutex::new(Some(tx)) },
+            )?;
+            let py_input = json_to_py(py, &input)?;
+            self.dispatcher.bind(py).call_method1(
+                "submit_behaviour",
+                (def.handler, Py::new(py, ctx)?, py_input, completer),
+            )?;
+            Ok(())
+        });
+
+        Box::pin(async move {
+            if let Err(e) = submitted {
+                return Err(format!("failed to submit behaviour to Python: {e}"));
+            }
+            match rx.await {
+                Ok(result) => result,
+                Err(_) => Err("behaviour dropped without producing a result".to_string()),
+            }
+        })
+    }
+
     fn workers(&self) -> usize {
         self.workers
+    }
+}
+
+/// Resolves a behaviour run with a JSON value rather than an HTTP response.
+#[pyclass]
+struct ValueCompleter {
+    tx: Mutex<Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>,
+}
+
+#[pymethods]
+impl ValueCompleter {
+    fn complete(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let json = py_to_json(value)?;
+        self.send(Ok(json))
+    }
+
+    fn fail(&self, message: String) -> PyResult<()> {
+        self.send(Err(message))
+    }
+}
+
+impl ValueCompleter {
+    fn send(&self, value: Result<serde_json::Value, String>) -> PyResult<()> {
+        let mut guard = self
+            .tx
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("completer lock poisoned"))?;
+        match guard.take() {
+            Some(tx) => {
+                let _ = tx.send(value);
+                Ok(())
+            }
+            None => Err(PyRuntimeError::new_err("behaviour completed twice")),
+        }
     }
 }
 
@@ -170,7 +257,9 @@ fn serve(py: Python<'_>, manifest_json: &str, dispatcher: Py<PyAny>, workers: us
             let app = App::build(manifest, bridge)
                 .await
                 .map_err(PyRuntimeError::new_err)?;
-            pylon_core::server::serve(Arc::new(app))
+            // `into_arc` rather than `Arc::new`: behaviours need the App's own
+            // Arc in order to call tools.
+            pylon_core::server::serve(app.into_arc())
                 .await
                 .map_err(PyRuntimeError::new_err)
         })
@@ -229,8 +318,11 @@ fn generate_api_key() -> String {
 // `gil_used = false` marks this extension as free-threading compatible, which is
 // what lets CPython 3.13+/3.14 skip re-enabling the GIL when it is imported.
 #[pymodule(gil_used = false)]
-fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Completer>()?;
+    m.add_class::<ValueCompleter>()?;
+    m.add_class::<BehaviourContext>()?;
+    m.add("BehaviourHalted", py.get_type::<BehaviourHalted>())?;
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(openapi_for, m)?)?;

@@ -6,6 +6,8 @@ same one with features toggled:
 * **api**       — a JSON API plus an MCP tool surface
 * **fullstack** — the above, plus server-rendered pages and static assets
 * **agent**     — the above, plus an agent with a gated tool and an approval flow
+* **behaviour** — the above, plus Behaviours: procedures whose control flow is
+  real Python and whose leaves are model and tool calls
 
 Every starter boots with authentication, rate limiting, and security headers
 already on. A starter that generates an insecure app teaches an insecure habit.
@@ -327,6 +329,9 @@ def files_for(template: str, name: str, description: str) -> dict[str, str]:
     if template == "agent":
         return {**common, "api.py": AGENT_API.format(name=name, description=description)}
 
+    if template == "behaviour":
+        return {**common, "api.py": BEHAVIOUR_API.format(name=name, description=description)}
+
     return {
         **common,
         "api.py": FULLSTACK_API.format(name=name, description=description),
@@ -338,4 +343,130 @@ def files_for(template: str, name: str, description: str) -> dict[str, str]:
     }
 
 
-TEMPLATES = ("api", "fullstack", "agent")
+BEHAVIOUR_API = '''\
+"""{name} — an application built around Behaviours.
+
+A "skill" written as a prompt is a suggestion: the model reads it and may
+ignore it, and "if X then Y" fails silently when it does.
+
+A Behaviour inverts that. The loops and branches below are real Python that
+always runs; only the leaves — `ctx.ask(...)` — are probabilistic. You get a
+procedure with deterministic structure and probabilistic steps, rather than a
+probabilistic procedure.
+"""
+
+from pylon import Pylon
+
+app = Pylon(
+    "{name}",
+    description="{description}",
+    database="sqlite://./{name}.db",
+)
+
+app.api_key("PYLON_API_KEY", id="service", scopes=["read", "write", "pylon:admin"])
+app.rate_limit(per_second=50, burst=100)
+app.anonymous_scopes("read")
+
+app.resource(
+    "tickets",
+    fields={{"id": int, "body": str, "urgency": int, "state": str}},
+    tools=True,
+    read_scopes=["read"],
+    write_scopes=["write"],
+)
+
+
+@app.behaviour(
+    "triage",
+    description="Classify every open ticket and escalate the urgent ones.",
+    tools=["list_tickets", "update_tickets"],
+    scopes=["read", "write"],
+    max_steps=100,
+    token_budget=100_000,
+)
+def triage(ctx, input):
+    """Walk the open tickets, ask the model to grade each, act on the grade."""
+    threshold = input.get("threshold", 7)
+    tickets = ctx.call("list_tickets", limit=50)
+
+    escalated, routine = [], []
+
+    for ticket in tickets:                          # a real loop
+        if ticket["state"] != "open":               # a real branch
+            continue
+
+        # A leaf. `schema` forces the shape, so the branch below switches on a
+        # real value rather than on parsed prose.
+        verdict = ctx.ask(
+            f"Grade this support ticket.\\n\\n{{ticket['body']}}",
+            schema={{
+                "type": "object",
+                "properties": {{
+                    "urgency": {{"type": "integer", "minimum": 1, "maximum": 10}},
+                    "category": {{"enum": ["bug", "billing", "question", "other"]}},
+                    "reason": {{"type": "string"}},
+                }},
+                "required": ["urgency", "category", "reason"],
+            }},
+        )
+
+        if verdict["urgency"] >= threshold:
+            escalated.append(ticket["id"])
+            state = "escalated"
+        else:
+            routine.append(ticket["id"])
+            state = "triaged"
+
+        ctx.call(
+            "update_tickets",
+            id=ticket["id"],
+            body=ticket["body"],
+            urgency=verdict["urgency"],
+            state=state,
+        )
+
+    ctx.log(f"escalated {{len(escalated)}}, routed {{len(routine)}}")
+    return {{
+        "escalated": escalated,
+        "routine": routine,
+        "usage": ctx.usage,
+    }}
+
+
+@app.behaviour(
+    "daily_report",
+    description="Summarise the queue. Composes with triage.",
+    tools=["triage", "list_tickets"],
+    scopes=["read", "write"],
+)
+def daily_report(ctx, input):
+    """Behaviours compose: one can call another, budgets and scopes intact."""
+    result = ctx.call("triage", threshold=input.get("threshold", 7))
+    remaining = ctx.call("list_tickets", limit=50)
+
+    summary = ctx.ask(
+        "Write two sentences summarising this queue for a standup: "
+        f"{{len(remaining)}} tickets, {{len(result['escalated'])}} escalated."
+    )
+    return {{"summary": summary, "triage": result}}
+
+
+# An agent can invoke a Behaviour like any other tool, which is how you give a
+# conversational agent a procedure it is not free to improvise around.
+app.agent(
+    "supervisor",
+    model="claude-opus-5",
+    description="Runs the queue.",
+    system="You supervise a support queue. Use the triage behaviour rather than "
+           "grading tickets yourself.",
+    tools=["triage", "daily_report", "list_tickets"],
+    scopes=["read", "write"],
+    expose_scopes=["write"],
+    max_steps=8,
+    token_budget=100_000,
+    expose_at="/ask",
+)
+'''
+
+
+TEMPLATES = ("api", "fullstack", "agent", "behaviour")

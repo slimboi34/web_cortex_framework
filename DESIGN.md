@@ -34,7 +34,15 @@ endpoint: the route, and the tool. They drift. In Pylon the route *is* the tool.
 `tools/list` is a projection of the route table, and a tool call re-enters the
 same dispatcher an HTTP request would, in-process.
 
-Everything else in this document is downstream of those two ideas.
+**Consequence C — control flow belongs in code, not in a prompt.** A prompt-based
+"skill" asks a model to follow a procedure; when it deviates, nothing notices.
+A **Behaviour** is Python whose loops and branches always execute, with model
+calls only at the leaves. The structure is deterministic and the steps are
+probabilistic, which is the opposite of the usual arrangement and the reason a
+behaviour can be given a budget, a scope set, and an audit trail that mean
+something.
+
+Everything else in this document is downstream of those three ideas.
 
 ---
 
@@ -58,9 +66,11 @@ clean:
 - CORS with boot-time rejection of `*`-with-credentials; security headers
 - Static server hardened against traversal, symlink escape, and dotfile leaks
 
-**Agents**
+**Agents and Behaviours**
 - Tool loop with an Anthropic provider and a scripted provider for tests
 - Scope delegation by intersection; approval gates; step and token budgets
+- Behaviours: Python control flow bridged back into the runtime, exposed as
+  tools, composable, with the same budgets, scopes, gates, and audit
 - Audit trail including refused calls
 
 **Developer surface**
@@ -142,6 +152,7 @@ Graded by risk of *not working well*, not by effort.
 | Component | Risk | The honest assessment |
 |---|---|---|
 | **Agent runtime in Rust** | **Medium–High** | The loop itself (call model → parse tool calls → dispatch → repeat) is easy; the runtime already has in-process tool dispatch, which is the valuable half. The hard parts are provider drift (every vendor's streaming tool-call format differs and changes), and cancellation/timeout semantics mid-stream. Mitigation: implement one provider properly rather than a leaky universal abstraction. |
+| **Behaviour runtime** | **Shipped, low ongoing risk** | The bridge is `Handle::block_on` from Python worker threads, which are deliberately not tokio contexts. The design constraint that keeps it sound: behaviours run on the thread pool, never on a shared event loop, because `ctx.call` blocks. Budgets, scope checks, and approval gates all sit on the Rust side of the boundary rather than being enforced in Python, so a behaviour cannot talk its way past them. |
 | **Durable / resumable agent runs** | **High** | This is what separates a demo from production: checkpointing each step so a run survives a deploy. It is essentially building a small workflow engine, and getting exactly-once tool execution right is genuinely hard. **Recommendation: do not build this in v1.** Make agent runs explicitly ephemeral and say so. |
 | **Local model hosting** | **High** | You asked about running local agents in-process. Be precise about what is feasible: *supervising* a llama.cpp or vLLM sidecar and routing to it over an OpenAI-compatible socket is very doable (Tier 2, honestly). *Embedding* inference in the server process, with GPU memory management and continuous batching, is a different project — that is what vLLM is, and it is years of work. **Recommendation: supervise, never embed.** |
 | **Own ORM** | **High** | See §5. |
@@ -205,7 +216,11 @@ Ordered by what unblocks the most.
 3. ✅ Agent runtime with delegation, approval gates, budgets, audit
 4. ✅ Server-rendered pages, static files, TypeScript generation, scaffolding
 
-**v0.3 — the streaming release**
+**v0.3 — shipped**
+✅ Behaviours: programmable procedures with deterministic control flow,
+   composable, budget-capped, and exposed as tools.
+
+**v0.4 — the streaming release**
 5. SSE responses. Agent token streaming depends on it, and it is invasive
    enough that delaying it makes it worse.
 6. Postgres dialect.
@@ -214,7 +229,7 @@ Ordered by what unblocks the most.
    request today; the resume endpoint is not wired up, so a gated run currently
    ends rather than continuing. **This is the most visible unfinished edge.**
 
-**v0.4 — operational depth**
+**v0.5 — operational depth**
 9. Local model *supervision* (sidecar process management + routing).
 10. `pylon.toml` for environment/deploy configuration.
 11. A real load benchmark against Django and FastAPI (see §2).
@@ -245,8 +260,12 @@ suite, not for the absence of remaining bugs.
 
 **Known unfinished edges**, stated plainly: a gated agent run records its
 approval request and stops, but cannot yet be resumed; the Anthropic provider is
-not exercised against the live API in CI; there is no CSRF or session support,
-so the page layer suits internal tools more than public authenticated apps.
+not exercised against the live API in CI, so `ctx.ask` and the agent loop are
+tested against a scripted provider rather than the real one; there is no CSRF or
+session support, so the page layer suits internal tools more than public
+authenticated apps; and a Behaviour holds a worker thread for its whole run,
+which is fine for procedures measured in seconds and wrong for ones measured in
+hours.
 
 The largest genuine risk is still not technical, it is scope. A framework that
 also tries to be an ORM, a migration tool, a workflow engine, and an inference

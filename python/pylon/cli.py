@@ -82,6 +82,9 @@ def _banner(app: Any) -> None:
         print(f"  {len(report['tools'])} agent tools: {shown}{more}")
     if report["agents"]:
         print(f"  agents: {', '.join(report['agents'])}")
+    behaviours = security.get("behaviours", [])
+    if behaviours:
+        print(f"  behaviours: {', '.join(b['name'] for b in behaviours)}")
 
     posture = []
     posture.append("auth" if security["auth_configured"] else "NO AUTH")
@@ -144,8 +147,9 @@ def main(argv: list[str] | None = None) -> int:
     new.add_argument("name")
     new.add_argument(
         "--template", "-t", default="api",
-        choices=("api", "fullstack", "agent"),
-        help="api: JSON+MCP · fullstack: adds pages · agent: adds an agent with an approval gate",
+        choices=("api", "fullstack", "agent", "behaviour"),
+        help=("api: JSON+MCP · fullstack: adds pages · agent: adds an approval gate · "
+              "behaviour: adds programmable procedures"),
     )
     new.add_argument("--directory", "-d", default=None)
     new.add_argument("--description", default=None)

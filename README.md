@@ -46,7 +46,7 @@ headers. No second file, no schema written twice, no drift.
 
 ```bash
 pip install pylon              # or: uv pip install pylon
-pylon new myapp                # --template api | fullstack | agent
+pylon new myapp                # --template api | fullstack | agent | behaviour
 cd myapp
 export PYLON_API_KEY=$(pylon keygen)
 pylon dev
@@ -75,6 +75,75 @@ the GIL** ([DESIGN.md](DESIGN.md) has the numbers and their caveats).
 
 Pylon runs correctly on a GIL build too, and tells you which mode it is in.
 
+## Behaviours
+
+A "skill" written as a prompt is a *suggestion*. The model reads it and may
+ignore it, and "if X then Y" fails silently when it does.
+
+A **Behaviour** inverts that. The control flow is real Python — a `for` loop is
+a loop, an `if` is a branch, and both execute whether or not a model would have
+chosen to. Only the *leaves* are probabilistic:
+
+```python
+@app.behaviour("triage", tools=["list_tickets", "update_tickets"],
+               max_steps=100, token_budget=100_000)
+def triage(ctx, input):
+    """Classify every open ticket and escalate the urgent ones."""
+    tickets = ctx.call("list_tickets", limit=50)
+    escalated = []
+
+    for ticket in tickets:                        # a real loop
+        verdict = ctx.ask(                        # a model call
+            f"Grade this ticket:\n{ticket['body']}",
+            schema={
+                "type": "object",
+                "properties": {
+                    "urgency": {"type": "integer"},
+                    "category": {"enum": ["bug", "billing", "other"]},
+                },
+                "required": ["urgency", "category"],
+            },
+        )
+        if verdict["urgency"] >= input.get("threshold", 7):   # a real branch
+            escalated.append(ticket["id"])
+        ctx.call("update_tickets", id=ticket["id"], body=ticket["body"],
+                 urgency=verdict["urgency"],
+                 state="escalated" if ticket["id"] in escalated else "triaged")
+
+    return {"escalated": escalated, "usage": ctx.usage}
+```
+
+You get a procedure with **deterministic structure and probabilistic steps**,
+rather than a probabilistic procedure.
+
+`ctx` is how a behaviour reaches the world:
+
+| | |
+|---|---|
+| `ctx.call(tool, **kwargs)` | invoke one of the app's tools, in-process |
+| `ctx.ask(prompt, schema=...)` | a model call; a schema **forces** the shape, so branches switch on real values |
+| `ctx.log(msg)` / `ctx.halt(reason)` | narrate or stop deliberately |
+| `ctx.usage` / `ctx.trace` | budget consumed and every leaf executed, readable mid-run |
+| `ctx.user` / `ctx.tools` | the delegated principal and what it may call |
+
+**A behaviour is a tool.** It registers as a route, so it is automatically an
+MCP tool, an OpenAPI operation, and something an agent — or another behaviour —
+can call. Composition is just a tool call, so budgets and scopes still apply.
+
+**The runtime enforces the limits, not your diligence:**
+
+- `max_steps` caps total leaf operations. A loop that would run 100 times with
+  `max_steps=3` stops at 3 and returns `{"halted": true, "reason": ...}`.
+- `token_budget` caps spend.
+- A behaviour cannot call a tool it did not declare.
+- An approval-gated tool cannot be laundered through a behaviour — the gate
+  halts the run, exactly as it halts an agent.
+- Scopes are delegated by intersection, never unioned.
+
+```bash
+pylon new myapp --template behaviour
+```
+
 ## The seven kinds of route
 
 | Kind | Declared with | Runs in |
@@ -85,6 +154,7 @@ Pylon runs correctly on a GIL build too, and tells you which mode it is in.
 | Files | `app.static_files(...)` | Rust |
 | Proxy | `app.proxy(...)` | Rust |
 | Agent | `app.agent(..., expose_at=...)` | Rust |
+| Behaviour | `@app.behaviour(...)` | Python worker pool |
 | Python | `@app.get(...)` | Python worker pool |
 
 ## Every route is a tool
@@ -180,7 +250,7 @@ are excluded — they are not part of the JSON API surface.
 ## Commands
 
 ```
-pylon new <name>      scaffold a project (api | fullstack | agent)
+pylon new <name>      scaffold a project (api | fullstack | agent | behaviour)
 pylon dev             run with a startup report
 pylon check           routes, tools, and the public attack surface
 pylon security        what is reachable without a credential
@@ -193,12 +263,12 @@ pylon keygen          mint an API key
 
 ## Status
 
-v0.2. Working and tested: the manifest IR, router, native ops (static / query /
+v0.3. Working and tested: the manifest IR, router, native ops (static / query /
 proxy / page / files), the free-threaded Python bridge, authentication and
-scopes, rate limiting, CORS, security headers, graceful shutdown, the agent
-runtime with approval gates and budgets, the audit trail, OpenAPI, the MCP
-server, and TypeScript generation. **170 tests** (66 Rust, 104 Python), clippy
-clean.
+scopes, rate limiting, CORS, security headers, graceful shutdown, Behaviours,
+the agent runtime with approval gates and budgets, the audit trail, OpenAPI, the
+MCP server, and TypeScript generation. **197 tests** (66 Rust, 131 Python),
+clippy clean.
 
 Not yet: Postgres, SSE streaming, durable agent runs, local model supervision.
 See [DESIGN.md](DESIGN.md) for the roadmap, honest risk grading, and — just as

@@ -382,6 +382,21 @@ async fn control_plane(
             &serde_json::json!({"events": app.audit.recent(200)}),
         ),
 
+        ("GET", "/behaviours") => PylonResponse::json(
+            200,
+            &serde_json::json!({
+                "behaviours": app.manifest.behaviours.iter().map(|b| serde_json::json!({
+                    "name": b.name,
+                    "description": b.description,
+                    "tools": b.tools,
+                    "scopes": b.scopes,
+                    "max_steps": b.max_steps,
+                    "token_budget": b.token_budget,
+                    "input_schema": b.input_schema,
+                })).collect::<Vec<_>>()
+            }),
+        ),
+
         ("GET", "/agents") => PylonResponse::json(
             200,
             &serde_json::json!({
@@ -435,6 +450,7 @@ fn op_name(op: &crate::manifest::Op) -> &'static str {
         Agent { .. } => "agent",
         Page { .. } => "page",
         Files { .. } => "files",
+        Behaviour { .. } => "behaviour",
     }
 }
 
