@@ -26,6 +26,211 @@ pub struct Manifest {
     pub upstreams: BTreeMap<String, Upstream>,
     #[serde(default)]
     pub agents: Vec<AgentDef>,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub cors: CorsConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub security_headers: SecurityHeaders,
+    #[serde(default)]
+    pub templates: Option<TemplateConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Security configuration
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuthConfig {
+    /// Maps an environment variable holding a secret to the principal it grants.
+    /// Keys live in the environment; the manifest only ever names them.
+    #[serde(default)]
+    pub api_keys: BTreeMap<String, ApiKeySpec>,
+    #[serde(default = "default_api_key_header")]
+    pub api_key_header: String,
+    #[serde(default)]
+    pub jwt: Option<JwtConfig>,
+    /// Scopes granted to callers presenting no credential at all. Empty by
+    /// default: unauthenticated means unprivileged.
+    #[serde(default)]
+    pub anonymous_scopes: Vec<String>,
+}
+
+fn default_api_key_header() -> String {
+    "x-api-key".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeySpec {
+    pub id: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwtConfig {
+    /// Environment variable holding the HMAC secret or PEM public key.
+    pub secret_env: String,
+    #[serde(default = "default_jwt_alg")]
+    pub algorithm: String,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+}
+
+fn default_jwt_alg() -> String {
+    "HS256".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_origins: Vec<String>,
+    #[serde(default = "default_cors_methods")]
+    pub allow_methods: Vec<String>,
+    #[serde(default = "default_cors_headers")]
+    pub allow_headers: Vec<String>,
+    #[serde(default)]
+    pub expose_headers: Vec<String>,
+    #[serde(default)]
+    pub allow_credentials: bool,
+    #[serde(default = "default_cors_max_age")]
+    pub max_age_secs: u64,
+}
+
+fn default_cors_methods() -> Vec<String> {
+    ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+fn default_cors_headers() -> Vec<String> {
+    ["content-type", "authorization", "x-api-key", "x-request-id"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+fn default_cors_max_age() -> u64 {
+    600
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_origins: Vec::new(),
+            allow_methods: default_cors_methods(),
+            allow_headers: default_cors_headers(),
+            expose_headers: Vec::new(),
+            allow_credentials: false,
+            max_age_secs: default_cors_max_age(),
+        }
+    }
+}
+
+impl CorsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.allow_origins.is_empty() {
+            return Err("cors is enabled but allow_origins is empty".into());
+        }
+        // The spec forbids this combination, and browsers reject it — but the
+        // failure is silent and confusing, so refuse at boot instead.
+        if self.allow_credentials && self.allow_origins.iter().any(|o| o == "*") {
+            return Err(
+                "cors: allow_credentials with a '*' origin is forbidden; list explicit origins"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_rate_per_second")]
+    pub per_second: f64,
+    #[serde(default = "default_rate_burst")]
+    pub burst: u32,
+    #[serde(default = "default_idle_eviction")]
+    pub idle_eviction_secs: u64,
+}
+
+fn default_rate_per_second() -> f64 {
+    50.0
+}
+fn default_rate_burst() -> u32 {
+    100
+}
+fn default_idle_eviction() -> u64 {
+    300
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            per_second: default_rate_per_second(),
+            burst: default_rate_burst(),
+            idle_eviction_secs: default_idle_eviction(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityHeaders {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default = "default_frame_options")]
+    pub frame_options: String,
+    #[serde(default = "default_referrer_policy")]
+    pub referrer_policy: String,
+    #[serde(default)]
+    pub content_security_policy: Option<String>,
+    #[serde(default = "default_hsts")]
+    pub hsts_max_age_secs: u64,
+}
+
+fn yes() -> bool {
+    true
+}
+fn default_frame_options() -> String {
+    "DENY".into()
+}
+fn default_referrer_policy() -> String {
+    "strict-origin-when-cross-origin".into()
+}
+fn default_hsts() -> u64 {
+    31_536_000
+}
+
+impl Default for SecurityHeaders {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            frame_options: default_frame_options(),
+            referrer_policy: default_referrer_policy(),
+            content_security_policy: None,
+            hsts_max_age_secs: default_hsts(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateConfig {
+    /// Directory containing `.html` templates, resolved relative to the app.
+    pub dir: String,
+    #[serde(default = "yes")]
+    pub autoescape: bool,
 }
 
 fn default_version() -> String {
@@ -45,6 +250,20 @@ pub struct ServerConfig {
     /// Mount point for the introspection surfaces (OpenAPI, MCP, health).
     #[serde(default = "default_control_prefix")]
     pub control_prefix: String,
+    /// Ceiling on a single request's handling time. Prevents a hung handler
+    /// from pinning a connection indefinitely.
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_secs: u64,
+    /// How long to drain in-flight connections on shutdown.
+    #[serde(default = "default_shutdown_timeout")]
+    pub shutdown_timeout_secs: u64,
+}
+
+fn default_request_timeout() -> u64 {
+    30
+}
+fn default_shutdown_timeout() -> u64 {
+    25
 }
 
 fn default_host() -> String {
@@ -64,6 +283,8 @@ impl Default for ServerConfig {
             port: default_port(),
             python_workers: None,
             control_prefix: default_control_prefix(),
+            request_timeout_secs: default_request_timeout(),
+            shutdown_timeout_secs: default_shutdown_timeout(),
         }
     }
 }
@@ -116,6 +337,16 @@ pub struct Route {
     pub output_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub tool: ToolExposure,
+    /// Scopes required to reach this route at all, over HTTP or as a tool.
+    /// Distinct from `tool.scopes`, which historically served both purposes.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Whether an agent may invoke this without a human in the loop.
+    #[serde(default)]
+    pub approval: Approval,
+    /// Reject requests whose body fails this JSON Schema before the op runs.
+    #[serde(default)]
+    pub validate_body: bool,
 }
 
 /// Controls whether a route is visible to agents as a callable tool.
@@ -174,6 +405,80 @@ pub enum Op {
         #[serde(default)]
         stream: bool,
     },
+    /// Render a server-side template.
+    ///
+    /// The template receives a data dictionary and nothing else — no database
+    /// handle, no ability to call back into Python. That restriction is the
+    /// whole reason this layer stays clean: a template cannot grow logic,
+    /// because it has nothing to call.
+    Page {
+        template: String,
+        /// Where the template's data comes from. Both options produce a plain
+        /// object; neither is reachable from inside the template itself.
+        #[serde(default)]
+        data: PageData,
+        #[serde(default = "default_page_status")]
+        status: u16,
+    },
+    /// Serve files from a directory.
+    Files {
+        dir: String,
+        #[serde(default)]
+        index: Option<String>,
+        #[serde(default = "default_cache_secs")]
+        cache_secs: u64,
+    },
+}
+
+fn default_page_status() -> u16 {
+    200
+}
+fn default_cache_secs() -> u64 {
+    3600
+}
+
+/// How a [`Op::Page`] obtains its rendering context.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PageData {
+    /// No data beyond the request context.
+    #[default]
+    None,
+    /// Constant data baked in at boot.
+    Static { value: serde_json::Value },
+    /// A SQL query, executed in Rust. A fully dynamic page with zero Python.
+    Query {
+        sql: String,
+        #[serde(default)]
+        params: Vec<String>,
+        #[serde(default)]
+        returns: QueryReturns,
+        /// Name to bind the result under in the template context.
+        #[serde(default = "default_bind")]
+        bind: String,
+    },
+    /// A Python handler returning a dict.
+    Python { handler: u32 },
+}
+
+fn default_bind() -> String {
+    "data".into()
+}
+
+/// Whether a tool call may proceed unattended.
+///
+/// The runtime — not the model, and not the application author's diligence —
+/// decides. A tool marked `Required` suspends the agent run and waits for a
+/// human, which is the difference between an agent you can point at production
+/// and a demo.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Approval {
+    /// Runs immediately.
+    #[default]
+    Never,
+    /// Suspends the run and records an approval request.
+    Required,
 }
 
 fn default_status() -> u16 {
@@ -209,6 +514,21 @@ pub struct AgentDef {
     /// Hard ceiling on tokens per run. Enforced by the runtime, not the model.
     #[serde(default)]
     pub token_budget: Option<u64>,
+    /// Scopes this agent may exercise. Always intersected with the scopes of
+    /// whoever started the run — an agent is a delegate, never an escalation.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+}
+
+fn default_temperature() -> f32 {
+    1.0
+}
+fn default_max_tokens() -> u32 {
+    4096
 }
 
 impl Manifest {
@@ -239,8 +559,38 @@ impl Manifest {
                         r.method, r.path
                     ));
                 }
+                Op::Page { data: PageData::Query { .. }, .. } if self.database.is_none() => {
+                    return Err(format!(
+                        "page {} {} sources data from a query but no database is configured",
+                        r.method, r.path
+                    ));
+                }
+                Op::Page { .. } if self.templates.is_none() => {
+                    return Err(format!(
+                        "route {} {} renders a template but no template directory is configured; \
+                         pass templates=... to Pylon()",
+                        r.method, r.path
+                    ));
+                }
                 _ => {}
             }
+
+            // An approval gate on a route no agent can call is almost always a
+            // mistake — either the author meant to expose it, or the gate is
+            // dead configuration giving false confidence.
+            if r.approval == Approval::Required && !r.tool.expose {
+                return Err(format!(
+                    "route {} {} requires approval but is not exposed as a tool; \
+                     approval gates only apply to agent tool calls",
+                    r.method, r.path
+                ));
+            }
+        }
+
+        self.cors.validate()?;
+
+        if self.rate_limit.enabled && self.rate_limit.per_second <= 0.0 {
+            return Err("rate_limit.per_second must be greater than zero".into());
         }
 
         // Two routes answering to one tool name would make a model's tool call
@@ -256,18 +606,66 @@ impl Manifest {
             }
         }
 
+        let mut agent_names = std::collections::HashSet::new();
         for a in &self.agents {
+            if !agent_names.insert(a.name.as_str()) {
+                return Err(format!("duplicate agent name {:?}", a.name));
+            }
             for t in &a.tools {
                 if !tool_names.contains(t.as_str()) {
-                    return Err(format!(
-                        "agent {:?} references tool {:?}, which is not an exposed route",
-                        a.name, t
-                    ));
+                    let hint = nearest(t, &tool_names);
+                    return Err(match hint {
+                        Some(h) => format!(
+                            "agent {:?} references tool {:?}, which is not an exposed route. Did you mean {:?}?",
+                            a.name, t, h
+                        ),
+                        None => format!(
+                            "agent {:?} references tool {:?}, which is not an exposed route",
+                            a.name, t
+                        ),
+                    });
                 }
+            }
+            if a.max_steps == Some(0) {
+                return Err(format!("agent {:?} has max_steps=0 and could never act", a.name));
             }
         }
         Ok(())
     }
+
+    /// Routes reachable without any credential. Surfaced by `pylon check` so an
+    /// operator can see their public attack surface on one screen.
+    pub fn public_routes(&self) -> Vec<&Route> {
+        self.routes
+            .iter()
+            .filter(|r| r.scopes.is_empty() && r.tool.scopes.is_empty())
+            .collect()
+    }
+}
+
+/// Closest match by edit distance, for "did you mean" hints on typos.
+fn nearest(needle: &str, haystack: &std::collections::HashSet<String>) -> Option<String> {
+    haystack
+        .iter()
+        .map(|c| (edit_distance(needle, c), c))
+        .filter(|(d, _)| *d <= 3)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c.clone())
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 impl Route {

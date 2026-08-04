@@ -3,28 +3,44 @@
 //! Everything funnels through `dispatch`, whether it arrived over HTTP or was
 //! invoked in-process by an agent. That single path is what makes "every route
 //! is automatically a tool" true rather than aspirational — there is no second
-//! implementation for agents to drift away from.
+//! implementation for agents to drift away from, and in particular no second
+//! place where an authorization check could be forgotten.
 
+use crate::agent::{AgentRuntime, RunResult};
+use crate::audit::{AuditSink, MemoryAudit};
+use crate::auth::{Authenticator, Principal};
 use crate::bridge::{NoBridge, PyBridge};
-use crate::db::Db;
+use crate::files::FileServer;
 use crate::http::{PylonRequest, PylonResponse};
-use crate::manifest::{Manifest, Op, Route};
+use crate::manifest::{Manifest, Op, PageData, Route};
+use crate::middleware::{Cors, RateLimiter};
 use crate::router::{MatchError, Router};
+use crate::templates::Templates;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "sqlite")]
+use crate::db::Db;
 
 pub struct App {
     pub manifest: Manifest,
     router: Router,
     routes_by_id: HashMap<u32, Route>,
     tools_by_name: HashMap<String, u32>,
+    #[cfg(feature = "sqlite")]
     db: Option<Db>,
     bridge: Arc<dyn PyBridge>,
     client: reqwest::Client,
-    /// Upstream bearer tokens resolved from the environment at boot, so the
-    /// manifest can be logged or shipped without leaking credentials.
     upstream_tokens: HashMap<String, String>,
+
+    pub authenticator: Authenticator,
+    pub cors: Cors,
+    pub rate_limiter: Option<RateLimiter>,
+    templates: Option<Templates>,
+    file_servers: HashMap<u32, FileServer>,
+    pub audit: Arc<dyn AuditSink>,
+    agent_runtime: Option<AgentRuntime>,
 }
 
 impl App {
@@ -34,8 +50,6 @@ impl App {
         let router = Router::build(&manifest.routes)?;
         let routes_by_id: HashMap<u32, Route> =
             manifest.routes.iter().map(|r| (r.id, r.clone())).collect();
-
-        // `validate` has already rejected duplicate tool names.
         let tools_by_name: HashMap<String, u32> = manifest
             .routes
             .iter()
@@ -43,6 +57,7 @@ impl App {
             .map(|r| (r.tool_name(), r.id))
             .collect();
 
+        #[cfg(feature = "sqlite")]
         let db = match &manifest.database {
             Some(cfg) => Some(Db::connect(cfg).await?),
             None => None,
@@ -55,16 +70,65 @@ impl App {
                     Ok(tok) => {
                         upstream_tokens.insert(name.clone(), tok);
                     }
-                    Err(_) => {
-                        tracing::warn!(
-                            upstream = %name,
-                            env = %var,
-                            "bearer env var not set; upstream will be called unauthenticated"
-                        );
-                    }
+                    Err(_) => tracing::warn!(
+                        upstream = %name, env = %var,
+                        "bearer env var not set; upstream will be called unauthenticated"
+                    ),
                 }
             }
         }
+
+        let templates = match &manifest.templates {
+            Some(cfg) => {
+                let t = Templates::load(cfg)?;
+                // Verify every declared template parses now, so a typo is a boot
+                // failure rather than a 500 for whoever visits that page first.
+                let names: Vec<String> = manifest
+                    .routes
+                    .iter()
+                    .filter_map(|r| match &r.op {
+                        Op::Page { template, .. } => Some(template.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                t.verify(&names)?;
+                Some(t)
+            }
+            None => None,
+        };
+
+        let mut file_servers = HashMap::new();
+        for r in &manifest.routes {
+            if let Op::Files { dir, index, cache_secs } = &r.op {
+                file_servers.insert(r.id, FileServer::new(dir, index.clone(), *cache_secs)?);
+            }
+        }
+
+        let authenticator = Authenticator::build(&manifest.auth)?;
+        let cors = Cors::new(manifest.cors.clone());
+        let rate_limiter = manifest
+            .rate_limit
+            .enabled
+            .then(|| RateLimiter::new(&manifest.rate_limit));
+
+        let audit: Arc<dyn AuditSink> = Arc::new(MemoryAudit::default());
+
+        // An app with declared agents but no API key still boots; the agent
+        // routes report a clear 503 instead of the process refusing to start.
+        let agent_runtime = if manifest.agents.is_empty() {
+            None
+        } else {
+            match crate::agent::provider::AnthropicProvider::from_env() {
+                Some(p) => Some(AgentRuntime::new(Arc::new(p), audit.clone())),
+                None => {
+                    tracing::warn!(
+                        "agents are declared but ANTHROPIC_API_KEY is unset; \
+                         agent routes will return 503"
+                    );
+                    None
+                }
+            }
+        };
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
@@ -76,10 +140,18 @@ impl App {
             router,
             routes_by_id,
             tools_by_name,
+            #[cfg(feature = "sqlite")]
             db,
             bridge,
             client,
             upstream_tokens,
+            authenticator,
+            cors,
+            rate_limiter,
+            templates,
+            file_servers,
+            audit,
+            agent_runtime,
         })
     }
 
@@ -87,6 +159,13 @@ impl App {
         Self::build(manifest, Arc::new(NoBridge)).await
     }
 
+    /// Swap in a deterministic provider. Used by tests and `pylon dev --offline`.
+    pub fn with_agent_runtime(mut self, rt: AgentRuntime) -> Self {
+        self.agent_runtime = Some(rt);
+        self
+    }
+
+    #[cfg(feature = "sqlite")]
     pub fn db(&self) -> Option<&Db> {
         self.db.as_ref()
     }
@@ -99,9 +178,25 @@ impl App {
         self.routes_by_id.get(&id)
     }
 
-    /// Routes an agent may call, in declaration order.
+    pub fn route_for_tool(&self, name: &str) -> Option<&Route> {
+        self.tools_by_name.get(name).and_then(|id| self.routes_by_id.get(id))
+    }
+
     pub fn exposed_tools(&self) -> Vec<&Route> {
         self.manifest.routes.iter().filter(|r| r.tool.expose).collect()
+    }
+
+    pub fn agent(&self, name: &str) -> Option<&crate::manifest::AgentDef> {
+        self.manifest.agents.iter().find(|a| a.name == name)
+    }
+
+    /// All scopes a route demands, from either declaration site.
+    fn required_scopes(route: &Route) -> Vec<String> {
+        let mut all = route.scopes.clone();
+        all.extend(route.tool.scopes.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
     }
 
     pub async fn dispatch(&self, mut req: PylonRequest) -> PylonResponse {
@@ -128,20 +223,17 @@ impl App {
             return PylonResponse::error(500, "router matched an unknown route id");
         };
 
-        if !route.tool.scopes.is_empty() {
-            let missing: Vec<&String> = route
-                .tool
-                .scopes
-                .iter()
-                .filter(|s| !req.scopes.contains(s))
-                .collect();
+        let required = Self::required_scopes(route);
+        if !required.is_empty() {
+            let missing = req.principal.missing_scopes(&required);
             if !missing.is_empty() {
+                // 401 when nobody is authenticated (the client can fix it by
+                // logging in); 403 when a known principal simply lacks the
+                // scope. Collapsing both to 403 makes auth bugs hard to debug.
+                let status = if req.principal.is_anonymous() { 401 } else { 403 };
                 return PylonResponse::error(
-                    403,
-                    format!(
-                        "missing required scope(s): {}",
-                        missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-                    ),
+                    status,
+                    format!("missing required scope(s): {}", missing.join(", ")),
                 );
             }
         }
@@ -159,29 +251,156 @@ impl App {
             Op::Python { handler } => self.bridge.call(*handler, req).await,
 
             Op::Query { sql, params, returns } => {
-                let db = self.db.as_ref().ok_or("no database configured")?;
-                let bindings: Vec<serde_json::Value> = params
-                    .iter()
-                    .map(|name| req.lookup(name).unwrap_or(serde_json::Value::Null))
-                    .collect();
-                let value = db.run(sql, &bindings, *returns).await?;
-                if value.is_null() && *returns == crate::manifest::QueryReturns::One {
-                    return Ok(PylonResponse::error(404, "not found"));
+                #[cfg(feature = "sqlite")]
+                {
+                    let db = self.db.as_ref().ok_or("no database configured")?;
+                    let bindings: Vec<serde_json::Value> = params
+                        .iter()
+                        .map(|name| req.lookup(name).unwrap_or(serde_json::Value::Null))
+                        .collect();
+                    let value = db.run(sql, &bindings, *returns).await?;
+                    if value.is_null() && *returns == crate::manifest::QueryReturns::One {
+                        return Ok(PylonResponse::error(404, "not found"));
+                    }
+                    Ok(PylonResponse::json(200, &value))
                 }
-                Ok(PylonResponse::json(200, &value))
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    let _ = (sql, params, returns, &req);
+                    Err("this build has no database support".into())
+                }
             }
 
             Op::Proxy { upstream, rewrite } => self.proxy(upstream, rewrite.as_deref(), req).await,
 
-            Op::Agent { agent, .. } => {
-                // The agent runtime lands in the next milestone; until then this
-                // reports precisely what is missing rather than pretending.
-                Ok(PylonResponse::error(
-                    501,
-                    format!("agent {agent:?} is declared but the agent runtime is not enabled in this build"),
-                ))
+            Op::Page { template, data, status } => self.render_page(template, data, *status, req).await,
+
+            Op::Files { .. } => {
+                let id = req.route_id.ok_or("file route dispatched without a route id")?;
+                let server = self.file_servers.get(&id).ok_or("file server not initialised")?;
+                // The wildcard segment carries the path beneath the mount point.
+                let relative = req
+                    .path_params
+                    .values()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "/".into());
+                Ok(server.serve(&relative, req.headers.get("if-none-match").map(|s| s.as_str())))
+            }
+
+            Op::Agent { agent, .. } => self.run_agent(agent, req).await,
+        }
+    }
+
+    async fn render_page(
+        &self,
+        template: &str,
+        data: &PageData,
+        status: u16,
+        req: PylonRequest,
+    ) -> Result<PylonResponse, String> {
+        let templates = self.templates.as_ref().ok_or("no templates configured")?;
+
+        // Resolve data *before* rendering. The template never gets a handle to
+        // anything it could use to fetch more.
+        let mut context = serde_json::Map::new();
+        match data {
+            PageData::None => {}
+            PageData::Static { value } => {
+                context.insert("data".into(), value.clone());
+            }
+            PageData::Query { sql, params, returns, bind } => {
+                #[cfg(feature = "sqlite")]
+                {
+                    let db = self.db.as_ref().ok_or("no database configured")?;
+                    let bindings: Vec<serde_json::Value> = params
+                        .iter()
+                        .map(|n| req.lookup(n).unwrap_or(serde_json::Value::Null))
+                        .collect();
+                    let value = db.run(sql, &bindings, *returns).await?;
+                    if value.is_null() && *returns == crate::manifest::QueryReturns::One {
+                        return Ok(PylonResponse::error(404, "not found"));
+                    }
+                    context.insert(bind.clone(), value);
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    let _ = (sql, params, returns, bind);
+                    return Err("this build has no database support".into());
+                }
+            }
+            PageData::Python { handler } => {
+                let res = self.bridge.call(*handler, req.clone()).await?;
+                if res.status >= 400 {
+                    return Ok(res);
+                }
+                context.insert("data".into(), res.json_value());
             }
         }
+
+        // Request context every page can rely on, namespaced so it cannot
+        // collide with the page's own data.
+        context.insert(
+            "request".into(),
+            serde_json::json!({
+                "path": req.path,
+                "params": req.path_params,
+                "query": req.query,
+            }),
+        );
+        context.insert(
+            "user".into(),
+            serde_json::json!({
+                "id": req.principal.id,
+                "authenticated": !req.principal.is_anonymous(),
+                "scopes": req.principal.scopes,
+            }),
+        );
+
+        Ok(templates.render(template, &serde_json::Value::Object(context), status))
+    }
+
+    async fn run_agent(&self, name: &str, req: PylonRequest) -> Result<PylonResponse, String> {
+        let Some(runtime) = &self.agent_runtime else {
+            return Ok(PylonResponse::error(
+                503,
+                "agent runtime is unavailable; set ANTHROPIC_API_KEY to enable agents",
+            ));
+        };
+        let def = self
+            .agent(name)
+            .ok_or_else(|| format!("unknown agent {name:?}"))?;
+
+        let input = req
+            .lookup("input")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or("agent invocation requires an 'input' string")?;
+
+        let result = runtime.run(self, def, &req.principal, &input).await;
+        let status = match result.status {
+            crate::agent::RunStatus::Failed => 502,
+            crate::agent::RunStatus::AwaitingApproval => 202,
+            _ => 200,
+        };
+        Ok(PylonResponse::json(
+            status,
+            &serde_json::to_value(&result).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// Run an agent directly. Used by the control plane and by tests.
+    pub async fn invoke_agent(
+        &self,
+        name: &str,
+        input: &str,
+        caller: &Principal,
+    ) -> Result<RunResult, String> {
+        let runtime = self
+            .agent_runtime
+            .as_ref()
+            .ok_or("agent runtime is unavailable; set ANTHROPIC_API_KEY")?;
+        let def = self.agent(name).ok_or_else(|| format!("unknown agent {name:?}"))?;
+        Ok(runtime.run(self, def, caller, input).await)
     }
 
     async fn proxy(
@@ -215,8 +434,9 @@ impl App {
         if let Some(tok) = self.upstream_tokens.get(upstream_name) {
             builder = builder.bearer_auth(tok);
         }
-        // Forward content-type and accept, but never hop-by-hop headers or the
-        // caller's own Authorization — the upstream gets our credentials only.
+        // Forward only content negotiation. Never hop-by-hop headers, and never
+        // the caller's Authorization — the upstream sees our credentials, not
+        // whatever the client happened to send us.
         for k in ["content-type", "accept"] {
             if let Some(v) = req.headers.get(k) {
                 builder = builder.header(k, v);
@@ -253,16 +473,30 @@ impl App {
         })
     }
 
-    /// Invoke an exposed route by tool name with a flat argument object.
+    /// Invoke an exposed route by tool name, as a given principal.
     ///
-    /// This is the in-process path an agent uses. It never opens a socket, so a
-    /// local agent calling ten tools pays ten function calls, not ten round
-    /// trips through the loopback interface.
-    pub async fn call_tool(
+    /// This is the in-process path an agent uses. It goes through `dispatch`,
+    /// so scope enforcement is the same code that guards the HTTP path — there
+    /// is no way to reach a route as an agent that you could not reach as a
+    /// request.
+    ///
+    /// Returns a boxed future deliberately: an agent route can invoke a tool
+    /// that reaches another agent, so this call graph is genuinely cyclic and
+    /// needs an indirection to have a finite type.
+    pub fn call_tool_as<'a>(
+        &'a self,
+        tool_name: &'a str,
+        args: &'a serde_json::Value,
+        principal: &'a Principal,
+    ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
+        Box::pin(async move { self.call_tool_inner(tool_name, args, principal).await })
+    }
+
+    async fn call_tool_inner(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
-        scopes: Vec<String>,
+        principal: &Principal,
     ) -> Result<serde_json::Value, String> {
         let route_id = *self
             .tools_by_name
@@ -275,7 +509,6 @@ impl App {
 
         let obj = args.as_object().cloned().unwrap_or_default();
 
-        // Path params come out of the same flat object the model produced.
         let mut path_params = std::collections::BTreeMap::new();
         for seg in route.path.split('/') {
             if let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
@@ -286,14 +519,15 @@ impl App {
         }
 
         let concrete_path = substitute_path(&route.path, &path_params);
-        let body = if route.method == "GET" || route.method == "DELETE" {
+        let body_less = route.method == "GET" || route.method == "DELETE";
+        let body = if body_less {
             bytes::Bytes::new()
         } else {
             bytes::Bytes::from(serde_json::to_vec(&obj).map_err(|e| e.to_string())?)
         };
 
         let mut query = std::collections::BTreeMap::new();
-        if route.method == "GET" || route.method == "DELETE" {
+        if body_less {
             for (k, v) in &obj {
                 if !path_params.contains_key(k) {
                     query.insert(k.clone(), json_to_path_string(v));
@@ -309,7 +543,7 @@ impl App {
             headers: Default::default(),
             body,
             route_id: Some(route_id),
-            scopes,
+            principal: principal.clone(),
         };
 
         let res = self.dispatch(req).await;
@@ -321,6 +555,23 @@ impl App {
             ));
         }
         Ok(res.json_value())
+    }
+
+    /// Convenience wrapper granting exactly the scopes a route declares.
+    /// Used only where no real principal exists (tests, local tooling).
+    pub async fn call_tool(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        scopes: Vec<String>,
+    ) -> Result<serde_json::Value, String> {
+        let principal = Principal {
+            id: "local".into(),
+            kind: crate::auth::PrincipalKind::ApiKey,
+            scopes,
+            claims: Default::default(),
+        };
+        self.call_tool_as(tool_name, args, &principal).await
     }
 }
 
@@ -341,7 +592,11 @@ fn substitute_path(
             continue;
         }
         out.push('/');
-        match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        match seg
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .map(|n| n.trim_start_matches('*'))
+        {
             Some(name) => out.push_str(params.get(name).map(|s| s.as_str()).unwrap_or("")),
             None => out.push_str(seg),
         }

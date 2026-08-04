@@ -23,6 +23,16 @@ anyhow = "1"
 thiserror = "2"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "charset", "http2"] }
+minijinja = { version = "2.22", features = ["loader", "builtins"] }
+jsonwebtoken = "11"
+sha2 = "0.11"
+hmac = "0.13"
+subtle = "2"
+base64 = "0.23"
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+mime_guess = "2"
+async-stream = "0.3"
+pin-project-lite = "0.2"
 
 [profile.release]
 opt-level = 3

@@ -40,14 +40,34 @@ Everything else in this document is downstream of those two ideas.
 
 ## 2. What exists and has been measured
 
-Working today, with 8 Rust tests and 54 Python tests passing:
+Working today, with **66 Rust tests and 104 Python tests** passing and clippy
+clean:
 
+**Runtime**
 - Manifest IR, boot-time validation, method-partitioned radix router
-- Native ops: `Static`, `Query` (SQLite via sqlx), `Proxy` (the gateway)
+- Native ops: `Static`, `Query` (SQLite via sqlx), `Proxy`, `Page` (minijinja),
+  `Files`
 - Python bridge over PyO3 onto a free-threaded interpreter worker pool
-- OpenAPI 3.1 generation and a live MCP server (`initialize`, `tools/list`,
-  `tools/call`, batching, notifications)
-- `pylon` CLI: `dev`, `run`, `check`, `openapi`, `tools`, `sql`
+- Graceful shutdown with connection draining; per-request timeouts
+
+**Security**
+- Principals from API keys (SHA-256, constant-time) and JWT (HS/RS, expiry
+  enforced); scope enforcement on one code path shared by HTTP, MCP, and agents
+- Per-principal token-bucket rate limiting, sharded to avoid a contention point
+  under exactly the load that motivates it
+- CORS with boot-time rejection of `*`-with-credentials; security headers
+- Static server hardened against traversal, symlink escape, and dotfile leaks
+
+**Agents**
+- Tool loop with an Anthropic provider and a scripted provider for tests
+- Scope delegation by intersection; approval gates; step and token budgets
+- Audit trail including refused calls
+
+**Developer surface**
+- OpenAPI 3.1, MCP (`initialize`, `tools/list`, `tools/call`, batching,
+  notifications), TypeScript client generation
+- `pylon` CLI: `new`, `dev`, `run`, `check`, `security`, `openapi`, `tools`,
+  `typegen`, `sql`, `keygen`
 
 ### Measured numbers
 
@@ -109,11 +129,13 @@ Graded by risk of *not working well*, not by effort.
 
 | Component | Risk | The actual difficulty |
 |---|---|---|
-| **Postgres support** | Low–Medium | sqlx makes the driver easy. The work is that `Query` currently assumes `?` placeholders and SQLite's `RETURNING` semantics. Needs a small dialect layer. |
-| **Migrations** | Medium | Deliberately *not* auto-applied today (see §5). A real versioned migration tool is a week of careful work, and it must be reviewable SQL, not implicit. |
-| **Auth / scopes** | Medium | The enforcement point exists and is tested; what's missing is credential *ingestion* — JWT/session/API-key parsing into `req.scopes`, and per-connection scoping for MCP callers. Currently an MCP caller receives each route's declared scopes, which is fine for development and **not** an access-control boundary. This is the most important gap before anything real ships. |
-| **SSE / WebSocket streaming** | Medium | Required for agent token streaming. The response type is currently `Bytes`; it needs to become a stream. Touches every op signature — better done soon than late. |
-| **TypeScript client generation** | Low | The schemas already exist. This is a code generator over `openapi.json`, not research. |
+| ~~Auth / scopes~~ | **Done** | Shipped in v0.2. Credential ingestion, principals, per-caller MCP scoping, and scope delegation for agents. |
+| ~~TypeScript generation~~ | **Done** | Shipped in v0.2. |
+| ~~Templating~~ | **Done** | Shipped in v0.2 via minijinja, executed in Rust. |
+| **Postgres support** | Low–Medium | sqlx makes the driver easy. The work is that `Query` assumes `?` placeholders and SQLite's `RETURNING` semantics. Needs a small dialect layer. |
+| **Migrations** | Medium | Deliberately *not* auto-applied (see §5). A real versioned migration tool is a week of careful work, and it must produce reviewable SQL. |
+| **SSE / WebSocket streaming** | Medium | Required for agent token streaming. The response body is `Bytes`; it needs to become a stream, which touches every op signature. The single most invasive item remaining — better done soon than late. |
+| **Session auth for pages** | Low–Medium | Server-rendered apps want cookies and CSRF, not just bearer tokens. The principal abstraction already accommodates it; the cookie/CSRF machinery does not exist yet. |
 
 ### Tier 3 — The genuinely hard parts
 
@@ -176,25 +198,30 @@ beats five done leakily.
 
 Ordered by what unblocks the most.
 
-**v0.2 — make it safe to deploy**
-1. Credential ingestion into `req.scopes` (JWT + API key), per-connection MCP
-   scoping. *Until this lands, `scopes` is a structural placeholder, not
-   security.*
-2. Graceful shutdown, request timeouts, structured request IDs.
-3. Postgres dialect.
+**v0.2 — shipped**
+1. ✅ Credential ingestion, principals, per-caller MCP scoping
+2. ✅ Graceful shutdown, request timeouts, request IDs, rate limiting, CORS,
+   security headers
+3. ✅ Agent runtime with delegation, approval gates, budgets, audit
+4. ✅ Server-rendered pages, static files, TypeScript generation, scaffolding
 
-**v0.3 — make it pleasant**
-4. Streaming responses (SSE), which the agent runtime depends on.
-5. TypeScript client generation + a dev-mode schema-push websocket.
-6. `pylon.toml` for environment/database/deploy configuration.
+**v0.3 — the streaming release**
+5. SSE responses. Agent token streaming depends on it, and it is invasive
+   enough that delaying it makes it worse.
+6. Postgres dialect.
+7. Session cookies + CSRF, so the page layer is usable for real apps.
+8. Resume an agent run after an approval is granted. The gate records the
+   request today; the resume endpoint is not wired up, so a gated run currently
+   ends rather than continuing. **This is the most visible unfinished edge.**
 
-**v0.4 — make it agentic**
-7. Agent runtime, one provider, explicitly ephemeral runs.
-8. Local model *supervision* (sidecar process management + routing).
-9. Per-run token budgets and a full tool-call audit log.
+**v0.4 — operational depth**
+9. Local model *supervision* (sidecar process management + routing).
+10. `pylon.toml` for environment/deploy configuration.
+11. A real load benchmark against Django and FastAPI (see §2).
 
 **Later, if warranted**
-10. Durable agent runs — only with a real design for exactly-once tool execution.
+12. Durable agent runs — only with a real design for exactly-once tool
+    execution.
 
 ---
 
@@ -208,7 +235,20 @@ technical justification for the whole approach.
 The performance story against Django/FastAPI is **not yet proven** — the current
 benchmark is client-limited and a proper one is owed.
 
-The largest genuine risk is not technical, it is scope. A framework that also
-tries to be an ORM, a migration tool, a workflow engine, and an inference server
-will ship none of them. The pieces marked "do not build" in §5 are the ones most
-likely to sink this if they creep back in.
+The security model is now real rather than structural: scope enforcement runs on
+one code path shared by HTTP, MCP, and agents, and agent authority is a subset of
+its caller's *by construction*. Three genuine holes were found and fixed by
+tests while building v0.2 — MCP substituting route scopes for caller scopes,
+`resource()` leaving writes public while claiming otherwise, and `expose_at`
+creating an unauthenticated agent endpoint. That is the argument for the test
+suite, not for the absence of remaining bugs.
+
+**Known unfinished edges**, stated plainly: a gated agent run records its
+approval request and stops, but cannot yet be resumed; the Anthropic provider is
+not exercised against the live API in CI; there is no CSRF or session support,
+so the page layer suits internal tools more than public authenticated apps.
+
+The largest genuine risk is still not technical, it is scope. A framework that
+also tries to be an ORM, a migration tool, a workflow engine, and an inference
+server will ship none of them. The pieces marked "do not build" in §5 are the
+ones most likely to sink this if they creep back in.

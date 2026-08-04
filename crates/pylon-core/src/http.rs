@@ -18,8 +18,10 @@ pub struct PylonRequest {
     pub body: Bytes,
     /// Set once the router has matched. `None` for synthetic in-process calls.
     pub route_id: Option<u32>,
-    /// Populated by the auth layer; agents inherit a scoped subset of these.
-    pub scopes: Vec<String>,
+    /// Established once at the edge and carried unchanged from there. An agent
+    /// tool call arrives with a *delegated* principal whose scopes are a subset
+    /// of the caller's — see [`crate::auth::Principal::delegate_to_agent`].
+    pub principal: crate::auth::Principal,
 }
 
 impl PylonRequest {
@@ -32,8 +34,20 @@ impl PylonRequest {
             headers: BTreeMap::new(),
             body: Bytes::new(),
             route_id: None,
-            scopes: Vec::new(),
+            principal: crate::auth::Principal::anonymous(),
         }
+    }
+
+    /// A synthetic request carrying the given scopes. Test and tooling helper.
+    pub fn synthetic_with_scopes(method: &str, path: &str, scopes: &[&str]) -> Self {
+        let mut req = Self::synthetic(method, path);
+        req.principal = crate::auth::Principal {
+            id: "local".into(),
+            kind: crate::auth::PrincipalKind::ApiKey,
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            claims: Default::default(),
+        };
+        req
     }
 
     /// Look a name up across path params, then query string, then a top-level

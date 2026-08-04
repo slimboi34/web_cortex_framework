@@ -136,7 +136,15 @@ fn request_to_py<'py>(py: Python<'py>, req: &PylonRequest) -> PyResult<Bound<'py
     d.set_item("headers", headers)?;
 
     d.set_item("body", PyBytes::new(py, &req.body))?;
-    d.set_item("scopes", req.scopes.clone())?;
+
+    // The authenticated caller, so a handler can make its own decisions without
+    // re-deriving identity from headers.
+    let user = PyDict::new(py);
+    user.set_item("id", &req.principal.id)?;
+    user.set_item("authenticated", !req.principal.is_anonymous())?;
+    user.set_item("scopes", req.principal.scopes.clone())?;
+    d.set_item("user", user)?;
+    d.set_item("scopes", req.principal.scopes.clone())?;
     Ok(d)
 }
 
@@ -201,6 +209,23 @@ fn openapi_for(manifest_json: &str) -> PyResult<String> {
     Ok(pylon_core::openapi::generate(&manifest).to_string())
 }
 
+/// Generate a dependency-free typed TypeScript client.
+#[pyfunction]
+fn typescript_client(manifest_json: &str) -> PyResult<String> {
+    let manifest: Manifest = serde_json::from_str(manifest_json)
+        .map_err(|e| PyValueError::new_err(format!("invalid manifest: {e}")))?;
+    manifest
+        .validate()
+        .map_err(|e| PyValueError::new_err(format!("invalid application: {e}")))?;
+    Ok(pylon_core::typegen::generate(&manifest))
+}
+
+/// Mint an API key suitable for handing to a client.
+#[pyfunction]
+fn generate_api_key() -> String {
+    pylon_core::auth::generate_api_key()
+}
+
 // `gil_used = false` marks this extension as free-threading compatible, which is
 // what lets CPython 3.13+/3.14 skip re-enabling the GIL when it is imported.
 #[pymodule(gil_used = false)]
@@ -209,6 +234,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(openapi_for, m)?)?;
+    m.add_function(wrap_pyfunction!(typescript_client, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_api_key, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

@@ -200,7 +200,8 @@ def test_unknown_route_and_method(server):
 
 
 def test_scoped_route_is_refused_over_plain_http(server):
-    assert server.request("/vault")[0] == 403
+    # 401, not 403: nobody is authenticated, so the caller can still fix this.
+    assert server.request("/vault")[0] == 401
 
 
 # ---------------------------------------------------------------- OpenAPI
@@ -266,10 +267,21 @@ def test_mcp_reports_tool_failure_to_the_model_not_as_a_transport_error(server):
     assert "404" in out["result"]["content"][0]["text"]
 
 
-def test_mcp_scoped_tool_is_callable_with_its_declared_scope(server):
-    # Over HTTP the same route is 403; through MCP the route's own scopes apply.
+def test_mcp_caller_cannot_reach_a_tool_its_scopes_do_not_cover(server):
+    """MCP must not grant authority the same caller lacks over HTTP.
+
+    Earlier this substituted the *route's* declared scopes for the caller's,
+    which made every scoped tool reachable by any MCP client.
+    """
     out = server.rpc("tools/call", {"name": "vault", "arguments": {}})
-    assert out["result"]["isError"] is False
+    assert out["result"]["isError"] is True
+    assert "scope" in out["result"]["content"][0]["text"].lower()
+
+
+def test_mcp_tool_list_hides_tools_the_caller_cannot_use(server):
+    names = {t["name"] for t in server.rpc("tools/list")["result"]["tools"]}
+    assert "ping" in names
+    assert "vault" not in names, "a tool the caller cannot call must not be advertised"
 
 
 def test_mcp_unknown_tool_and_method(server):

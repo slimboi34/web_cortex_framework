@@ -53,6 +53,9 @@ class Pylon:
         port: int = 8000,
         workers: int | None = None,
         control_prefix: str = "/_pylon",
+        templates: str | None = None,
+        request_timeout: int = 30,
+        shutdown_timeout: int = 25,
     ) -> None:
         self.name = name
         self.description = description
@@ -62,6 +65,21 @@ class Pylon:
         self.port = port
         self.workers = workers
         self.control_prefix = control_prefix
+        self.templates_dir = templates
+        self.request_timeout = request_timeout
+        self.shutdown_timeout = shutdown_timeout
+
+        # Security posture. Every one of these defaults to the safe setting;
+        # relaxing it is what costs a line of code, not tightening it.
+        self._auth: dict = {
+            "api_keys": {},
+            "api_key_header": "x-api-key",
+            "jwt": None,
+            "anonymous_scopes": [],
+        }
+        self._cors: dict | None = None
+        self._rate_limit: dict | None = None
+        self._security_headers: dict = {"enabled": True}
 
         self._routes: list[dict] = []
         self._handlers: list[Callable] = []
@@ -69,11 +87,12 @@ class Pylon:
         self._agents: list[dict] = []
         self._resources: list[Resource] = []
         self._schema_sql: list[str] = []
+        self._templates_used: set[str] = set()
         self._next_id = 0
 
-        # Always present, so a deployment can be probed before any user route
-        # exists and an agent can discover the app's shape.
-        self.static("GET", "/", {"app": name, "version": version, "docs": f"{control_prefix}/openapi.json"})
+        # A default root route is added at manifest time *only* if the app did
+        # not define its own. Registering it here instead would make `/` the one
+        # path a user could never claim.
 
     # ------------------------------------------------------------------
     # Route registration
@@ -99,6 +118,7 @@ class Pylon:
         read_only: bool | None = None,
         idempotent: bool | None = None,
         scopes: Sequence[str] = (),
+        approval: str = "never",
     ) -> int:
         method = method.upper()
         if method not in _HTTP_METHODS:
@@ -127,8 +147,10 @@ class Pylon:
                     "name": tool_name,
                     "read_only": read_only,
                     "idempotent": idempotent,
-                    "scopes": list(scopes),
+                    "scopes": [],
                 },
+                "scopes": list(scopes),
+                "approval": approval,
             }
         )
         return rid
@@ -143,6 +165,7 @@ class Pylon:
         read_only: bool | None = None,
         idempotent: bool | None = None,
         scopes: Sequence[str] = (),
+        approval: str = "never",
         summary: str = "",
     ) -> Callable:
         """Register a Python handler.
@@ -180,6 +203,7 @@ class Pylon:
                 read_only=read_only,
                 idempotent=idempotent,
                 scopes=scopes,
+                approval=approval,
             )
             return fn
 
@@ -275,6 +299,8 @@ class Pylon:
         primary_key: str = "id",
         tools: bool = False,
         scopes: Sequence[str] = (),
+        read_scopes: Sequence[str] | None = None,
+        write_scopes: Sequence[str] | None = None,
         create_table: bool = True,
     ) -> Resource:
         """Generate a full CRUD surface for a table.
@@ -282,6 +308,11 @@ class Pylon:
         This is the Django-admin-scale shortcut, except the resulting endpoints
         are executed by Rust rather than by an ORM. Five routes, zero
         interpreter involvement, and — with `tools=True` — five agent tools.
+
+        Authorization is split, because reads and writes almost never warrant
+        the same scope: `read_scopes` guards list/get, `write_scopes` guards
+        create/update/delete. `scopes` sets both at once. Leaving all three
+        unset makes the resource fully public, which `pylon security` reports.
         """
         table = table or name
         if not self.database:
@@ -320,7 +351,9 @@ class Pylon:
             "additionalProperties": False,
         }
 
-        common = {"tool": tools, "scopes": scopes}
+        reads = list(read_scopes if read_scopes is not None else scopes)
+        writes = list(write_scopes if write_scopes is not None else scopes)
+        common = {"tool": tools}
 
         res.route_ids.append(
             self.query(
@@ -331,7 +364,7 @@ class Pylon:
                 description=f"Return a page of {name} rows, newest first by insertion order.",
                 input_schema=list_schema,
                 output_schema={"type": "array", "items": body_schema(True, [])},
-                tool_name=f"list_{name}", **common,
+                tool_name=f"list_{name}", scopes=reads, **common,
             )
         )
         res.route_ids.append(
@@ -343,7 +376,7 @@ class Pylon:
                 description=f"Fetch a single {name} row. Responds 404 when no row matches.",
                 input_schema=pk_schema,
                 output_schema=body_schema(True, []),
-                tool_name=f"get_{name}", **common,
+                tool_name=f"get_{name}", scopes=reads, **common,
             )
         )
         res.route_ids.append(
@@ -355,7 +388,7 @@ class Pylon:
                 description=f"Insert a new {name} row and return it, including its generated {primary_key}.",
                 input_schema=body_schema(False, writable),
                 output_schema=body_schema(True, []),
-                tool_name=f"create_{name}", **common,
+                tool_name=f"create_{name}", scopes=writes, **common,
             )
         )
         res.route_ids.append(
@@ -367,7 +400,7 @@ class Pylon:
                 description=f"Overwrite every writable field of a {name} row. Responds 404 when no row matches.",
                 input_schema=body_schema(True, [primary_key, *writable]),
                 output_schema=body_schema(True, []),
-                tool_name=f"update_{name}", **common,
+                tool_name=f"update_{name}", scopes=writes, **common,
             )
         )
         res.route_ids.append(
@@ -379,7 +412,7 @@ class Pylon:
                 description=f"Delete a {name} row by {primary_key}. Reports how many rows were removed.",
                 input_schema=pk_schema,
                 output_schema={"type": "object", "properties": {"affected": {"type": "integer"}}},
-                tool_name=f"delete_{name}", **common,
+                tool_name=f"delete_{name}", scopes=writes, **common,
             )
         )
 
@@ -388,6 +421,194 @@ class Pylon:
 
         self._resources.append(res)
         return res
+
+    # ------------------------------------------------------------------
+    # Security
+    # ------------------------------------------------------------------
+
+    def api_key(self, env_var: str, *, id: str, scopes: Sequence[str] = ()) -> None:
+        """Accept an API key read from `env_var`, granting `scopes`.
+
+        The key itself never appears in your source or in the manifest — only
+        the name of the variable holding it. The runtime stores a SHA-256 of the
+        secret and compares in constant time.
+        """
+        self._auth["api_keys"][env_var] = {"id": id, "scopes": list(scopes)}
+
+    def jwt(
+        self,
+        *,
+        secret_env: str,
+        algorithm: str = "HS256",
+        audience: str | None = None,
+        issuer: str | None = None,
+    ) -> None:
+        """Accept bearer JWTs verified with the secret in `secret_env`.
+
+        Scopes are read from the standard `scope` (space-delimited) or `scopes`
+        (array) claims. Expiry is always validated.
+        """
+        self._auth["jwt"] = {
+            "secret_env": secret_env,
+            "algorithm": algorithm,
+            "audience": audience,
+            "issuer": issuer,
+        }
+
+    def anonymous_scopes(self, *scopes: str) -> None:
+        """Grant scopes to callers presenting no credential.
+
+        Empty by default. Use sparingly: this is how a route you believed was
+        protected becomes public.
+        """
+        self._auth["anonymous_scopes"] = list(scopes)
+
+    def cors(
+        self,
+        *origins: str,
+        credentials: bool = False,
+        methods: Sequence[str] | None = None,
+        headers: Sequence[str] | None = None,
+        expose: Sequence[str] = (),
+        max_age: int = 600,
+    ) -> None:
+        """Enable CORS for explicit origins.
+
+        `credentials=True` together with a `"*"` origin is rejected at boot: the
+        combination is forbidden by the CORS spec, and browsers fail it in ways
+        that are maddening to debug.
+        """
+        self._cors = {
+            "enabled": True,
+            "allow_origins": list(origins),
+            "allow_credentials": credentials,
+            "expose_headers": list(expose),
+            "max_age_secs": max_age,
+        }
+        if methods:
+            self._cors["allow_methods"] = list(methods)
+        if headers:
+            self._cors["allow_headers"] = list(headers)
+
+    def rate_limit(self, per_second: float = 50.0, *, burst: int = 100) -> None:
+        """Token-bucket rate limiting, keyed per principal (IP when anonymous)."""
+        self._rate_limit = {
+            "enabled": True,
+            "per_second": per_second,
+            "burst": burst,
+            "idle_eviction_secs": 300,
+        }
+
+    def security_headers(
+        self,
+        *,
+        enabled: bool = True,
+        frame_options: str = "DENY",
+        referrer_policy: str = "strict-origin-when-cross-origin",
+        content_security_policy: str | None = None,
+        hsts_max_age: int = 31_536_000,
+    ) -> None:
+        """Tune the always-on security headers. Sensible without calling this."""
+        self._security_headers = {
+            "enabled": enabled,
+            "frame_options": frame_options,
+            "referrer_policy": referrer_policy,
+            "content_security_policy": content_security_policy,
+            "hsts_max_age_secs": hsts_max_age,
+        }
+
+    # ------------------------------------------------------------------
+    # Server-rendered pages and static assets
+    # ------------------------------------------------------------------
+
+    def page(
+        self,
+        path: str,
+        template: str,
+        *,
+        sql: str | None = None,
+        params: Sequence[str] = (),
+        returns: str = "many",
+        bind: str = "data",
+        data: Any = None,
+        status: int = 200,
+        scopes: Sequence[str] = (),
+        method: str = "GET",
+    ) -> int:
+        """Render a server-side template.
+
+        Data comes from exactly one declared source and is resolved *before*
+        rendering: `sql=` for a query, `data=` for a constant, or neither. The
+        template itself can never fetch anything — it has no handle to the
+        database and no way to call Python — which is the constraint that keeps
+        this layer from turning into a second, worse view layer.
+
+        For a template whose data needs real logic, use `@app.page_handler`.
+        """
+        if sql and data is not None:
+            raise ValueError("page(): pass either sql= or data=, not both")
+
+        if sql:
+            if not self.database:
+                raise ValueError(f"page {path!r} uses sql= but no database is configured")
+            page_data: dict = {
+                "kind": "query", "sql": sql, "params": list(params),
+                "returns": returns, "bind": bind,
+            }
+        elif data is not None:
+            page_data = {"kind": "static", "value": data}
+        else:
+            page_data = {"kind": "none"}
+
+        self._templates_used.add(template)
+        return self._add_route(
+            method, path,
+            {"kind": "page", "template": template, "data": page_data, "status": status},
+            summary=f"Page {path}",
+            scopes=scopes,
+        )
+
+    def page_handler(
+        self, path: str, template: str, *, status: int = 200, scopes: Sequence[str] = ()
+    ) -> Callable:
+        """A page whose context comes from a Python function returning a dict."""
+
+        def decorator(fn: Callable) -> Callable:
+            wants_request = _request_param(fn)
+            handler_index = len(self._handlers)
+            self._handlers.append(_bind_handler(fn, wants_request))
+            self._templates_used.add(template)
+            self._add_route(
+                "GET", path,
+                {
+                    "kind": "page", "template": template,
+                    "data": {"kind": "python", "handler": handler_index},
+                    "status": status,
+                },
+                summary=inspect.getdoc(fn) or f"Page {path}",
+                scopes=scopes,
+            )
+            return fn
+
+        return decorator
+
+    def static_files(
+        self, path: str, directory: str, *, index: str | None = None, cache_secs: int = 3600
+    ) -> int:
+        """Serve a directory. `path` must end in a wildcard segment.
+
+        Traversal, symlink escapes, and dotfiles are refused by the runtime.
+        """
+        if not path.endswith("}"):
+            path = path.rstrip("/") + "/{*file}"
+        if not os.path.isdir(directory):
+            raise ValueError(f"static_files(): {directory!r} is not a directory")
+        return self._add_route(
+            "GET",
+            path,
+            {"kind": "files", "dir": directory, "index": index, "cache_secs": cache_secs},
+            summary=f"Static files from {directory}",
+        )
 
     # ------------------------------------------------------------------
     # Agents
@@ -404,6 +625,10 @@ class Pylon:
         max_steps: int | None = 12,
         token_budget: int | None = None,
         expose_at: str | None = None,
+        scopes: Sequence[str] = (),
+        expose_scopes: Sequence[str] | None = None,
+        temperature: float = 1.0,
+        max_tokens: int = 4096,
     ) -> None:
         """Declare an agent that lives inside the application.
 
@@ -411,6 +636,12 @@ class Pylon:
         them through the same dispatcher the HTTP server uses, a tool call is an
         in-process function call — not a loopback request — and it inherits the
         route's declared scopes.
+
+        `scopes` is what the agent may *use*; `expose_scopes` is who may *start*
+        a run. They default to the same set, because an endpoint that spends
+        tokens and exercises tools should not be less guarded than the tools
+        themselves. Passing `expose_scopes=[]` makes the endpoint public — which
+        `pylon security` will report.
 
         A typo in `tools` is a boot error, not a runtime surprise.
         """
@@ -423,9 +654,13 @@ class Pylon:
                 "tools": list(tools),
                 "max_steps": max_steps,
                 "token_budget": token_budget,
+                "scopes": list(scopes),
+                "temperature": temperature,
+                "max_tokens": max_tokens,
             }
         )
         if expose_at:
+            guard = list(expose_scopes if expose_scopes is not None else scopes)
             self._add_route(
                 "POST", expose_at,
                 {"kind": "agent", "agent": name, "stream": False},
@@ -436,11 +671,40 @@ class Pylon:
                     "properties": {"input": {"type": "string"}},
                     "required": ["input"],
                 },
+                scopes=guard,
             )
 
     # ------------------------------------------------------------------
     # Manifest + run
     # ------------------------------------------------------------------
+
+    def _routes_with_default_root(self) -> list[dict]:
+        """Routes, plus a discovery route at `/` when the app leaves it free."""
+        if any(r["path"] == "/" and r["method"] == "GET" for r in self._routes):
+            return self._routes
+        default = {
+            "id": self._next_id,
+            "method": "GET",
+            "path": "/",
+            "op": {
+                "kind": "static",
+                "status": 200,
+                "body": {
+                    "app": self.name,
+                    "version": self.version,
+                    "docs": f"{self.control_prefix}/openapi.json",
+                },
+            },
+            "summary": "Service discovery",
+            "description": "Identifies the application and points at its OpenAPI document.",
+            "input_schema": None,
+            "output_schema": None,
+            "tool": {"expose": False, "name": None, "read_only": True,
+                     "idempotent": True, "scopes": []},
+            "scopes": [],
+            "approval": "never",
+        }
+        return [*self._routes, default]
 
     def manifest(self) -> dict:
         return {
@@ -452,13 +716,24 @@ class Pylon:
                 "port": int(os.environ.get("PYLON_PORT", self.port)),
                 "python_workers": self.workers,
                 "control_prefix": self.control_prefix,
+                "request_timeout_secs": self.request_timeout,
+                "shutdown_timeout_secs": self.shutdown_timeout,
             },
+            "auth": self._auth,
+            "cors": self._cors or {"enabled": False},
+            "rate_limit": self._rate_limit or {"enabled": False},
+            "security_headers": self._security_headers,
+            "templates": (
+                {"dir": self.templates_dir, "autoescape": True}
+                if self.templates_dir
+                else None
+            ),
             "database": (
                 {"url": os.environ.get("PYLON_DATABASE_URL", self.database), "max_connections": 16}
                 if self.database
                 else None
             ),
-            "routes": self._routes,
+            "routes": self._routes_with_default_root(),
             "upstreams": self._upstreams,
             "agents": self._agents,
         }
@@ -481,6 +756,43 @@ class Pylon:
         from . import _core
 
         return json.loads(_core.openapi_for(self.manifest_json()))
+
+    def typescript_client(self) -> str:
+        """Generate a dependency-free typed TypeScript client."""
+        from . import _core
+
+        return _core.typescript_client(self.manifest_json())
+
+    def security_report(self) -> dict:
+        """What is reachable without a credential, and what is gated.
+
+        Printed by `pylon check` so the public attack surface is something you
+        read on every run rather than something you audit once.
+        """
+        auth_on = bool(self._auth["api_keys"]) or self._auth["jwt"] is not None
+        public = [
+            f"{r['method']} {r['path']}"
+            for r in self._routes_with_default_root()
+            if not r["scopes"] and not r["tool"]["scopes"]
+        ]
+        return {
+            "auth_configured": auth_on,
+            "anonymous_scopes": self._auth["anonymous_scopes"],
+            "cors_enabled": bool(self._cors),
+            "cors_origins": (self._cors or {}).get("allow_origins", []),
+            "rate_limited": bool(self._rate_limit),
+            "security_headers": self._security_headers.get("enabled", True),
+            "public_routes": public,
+            "gated_tools": [
+                r["tool"]["name"] or f"{r['method']} {r['path']}"
+                for r in self._routes_with_default_root()
+                if r.get("approval") == "required"
+            ],
+            "agents": [
+                {"name": a["name"], "tools": a["tools"], "scopes": a.get("scopes", [])}
+                for a in self._agents
+            ],
+        }
 
     def run(self) -> None:
         """Boot the runtime and serve. Blocks."""

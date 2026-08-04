@@ -11,6 +11,9 @@ pub fn generate(m: &Manifest) -> Value {
     let mut paths: Map<String, Value> = Map::new();
 
     for r in &m.routes {
+        if matches!(r.op, Op::Page { .. } | Op::Files { .. }) {
+            continue;
+        }
         let entry = paths
             .entry(r.path.clone())
             .or_insert_with(|| Value::Object(Map::new()));
@@ -125,5 +128,7 @@ fn op_kind(op: &Op) -> &'static str {
         Op::Query { .. } => "query",
         Op::Proxy { .. } => "proxy",
         Op::Agent { .. } => "agent",
+        Op::Page { .. } => "page",
+        Op::Files { .. } => "files",
     }
 }

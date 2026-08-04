@@ -5,19 +5,29 @@
 //! proxies, static responses, agent invocations — never re-enter the
 //! interpreter. Only [`manifest::Op::Python`] routes cross the bridge.
 
+pub mod agent;
 pub mod app;
+pub mod audit;
+pub mod auth;
 pub mod bridge;
+pub mod files;
 pub mod http;
 pub mod manifest;
 pub mod mcp;
+pub mod middleware;
 pub mod openapi;
 pub mod router;
 pub mod server;
+pub mod templates;
+pub mod typegen;
 
 #[cfg(feature = "sqlite")]
 pub mod db;
 
+pub use agent::{AgentRuntime, RunResult, RunStatus};
 pub use app::App;
+pub use audit::{AuditSink, MemoryAudit, TracingAudit};
+pub use auth::{Principal, PrincipalKind};
 pub use bridge::{NoBridge, PyBridge};
 pub use http::{PylonRequest, PylonResponse};
 pub use manifest::Manifest;
@@ -108,7 +118,15 @@ mod tests {
             "tool": {"expose": true, "name": "secret", "scopes": ["admin"]}
         }]));
         let app = App::build_without_python(m).await.expect("app builds");
-        assert_eq!(app.dispatch(PylonRequest::synthetic("GET", "/secret")).await.status, 403);
+
+        // Anonymous gets 401: the client can fix this by authenticating.
+        assert_eq!(app.dispatch(PylonRequest::synthetic("GET", "/secret")).await.status, 401);
+
+        // A known principal holding the wrong scope gets 403: authenticating
+        // again will not help, and conflating the two makes auth bugs opaque.
+        let wrong_scope = PylonRequest::synthetic_with_scopes("GET", "/secret", &["reader"]);
+        assert_eq!(app.dispatch(wrong_scope).await.status, 403);
+
         assert!(
             app.call_tool("secret", &serde_json::json!({}), vec!["admin".into()])
                 .await
@@ -125,7 +143,7 @@ mod tests {
         ]));
         let app = App::build_without_python(m).await.expect("app builds");
         let req = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
-        let res = mcp::handle(&app, req).await;
+        let res = mcp::handle(&app, req, &Principal::anonymous()).await;
         let tools = res.json_value()["result"]["tools"].clone();
         assert_eq!(tools.as_array().expect("tools array").len(), 1);
         assert_eq!(tools[0]["name"], "a");
@@ -135,7 +153,12 @@ mod tests {
     async fn mcp_notifications_get_no_response_body() {
         let m = manifest_json(serde_json::json!([]));
         let app = App::build_without_python(m).await.expect("app builds");
-        let res = mcp::handle(&app, br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
+        let res = mcp::handle(
+            &app,
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &Principal::anonymous(),
+        )
+        .await;
         assert_eq!(res.status, 202);
         assert!(res.body.is_empty());
     }

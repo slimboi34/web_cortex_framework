@@ -7,13 +7,14 @@
 //! loopback HTTP round trip.
 
 use crate::app::App;
+use crate::auth::Principal;
 use crate::http::PylonResponse;
 use serde_json::{Value, json};
 
 /// The MCP revision this server implements.
-const PROTOCOL_VERSION: &str = "2025-06-18";
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
-pub async fn handle(app: &App, body: &[u8]) -> PylonResponse {
+pub async fn handle(app: &App, body: &[u8], caller: &Principal) -> PylonResponse {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -26,7 +27,7 @@ pub async fn handle(app: &App, body: &[u8]) -> PylonResponse {
         Value::Array(items) => {
             let mut out = Vec::new();
             for item in items {
-                if let Some(res) = handle_one(app, item).await {
+                if let Some(res) = handle_one(app, item, caller).await {
                     out.push(res);
                 }
             }
@@ -35,7 +36,7 @@ pub async fn handle(app: &App, body: &[u8]) -> PylonResponse {
             }
             jsonrpc_response(Value::Array(out))
         }
-        single => match handle_one(app, single).await {
+        single => match handle_one(app, single, caller).await {
             Some(res) => jsonrpc_response(res),
             // Notifications get 202 with no body, per the spec.
             None => accepted(),
@@ -44,7 +45,7 @@ pub async fn handle(app: &App, body: &[u8]) -> PylonResponse {
 }
 
 /// Returns `None` for notifications, which must not receive a response.
-async fn handle_one(app: &App, req: Value) -> Option<Value> {
+async fn handle_one(app: &App, req: Value, caller: &Principal) -> Option<Value> {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let id = req.get("id").cloned();
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -73,9 +74,12 @@ async fn handle_one(app: &App, req: Value) -> Option<Value> {
 
         "ping" => Ok(json!({})),
 
-        "tools/list" => Ok(json!({ "tools": tool_descriptors(app) })),
+        // Only tools this caller could actually invoke are advertised. Listing
+        // a tool the caller cannot use invites the model to plan around it and
+        // then fail, and it discloses the shape of the privileged surface.
+        "tools/list" => Ok(json!({ "tools": tool_descriptors(app, caller) })),
 
-        "tools/call" => call_tool(app, &params).await,
+        "tools/call" => call_tool(app, &params, caller).await,
 
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -86,9 +90,14 @@ async fn handle_one(app: &App, req: Value) -> Option<Value> {
     })
 }
 
-fn tool_descriptors(app: &App) -> Vec<Value> {
+fn tool_descriptors(app: &App, caller: &Principal) -> Vec<Value> {
     app.exposed_tools()
         .into_iter()
+        .filter(|r| {
+            let mut required = r.scopes.clone();
+            required.extend(r.tool.scopes.iter().cloned());
+            caller.missing_scopes(&required).is_empty()
+        })
         .map(|r| {
             let description = if r.description.is_empty() {
                 if r.summary.is_empty() {
@@ -108,31 +117,39 @@ fn tool_descriptors(app: &App) -> Vec<Value> {
                 "annotations": {
                     "readOnlyHint": r.tool.read_only,
                     "idempotentHint": r.tool.idempotent,
+                    // Surfaced so a client can warn a user before a call that
+                    // will block on human approval.
+                    "requiresApproval": r.approval == crate::manifest::Approval::Required,
                 },
             })
         })
         .collect()
 }
 
-async fn call_tool(app: &App, params: &Value) -> Result<Value, (i64, String)> {
+async fn call_tool(app: &App, params: &Value, caller: &Principal) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
         .and_then(|n| n.as_str())
         .ok_or((-32602, "tools/call requires a 'name'".to_string()))?;
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
-    // Scopes for MCP callers are granted per-connection by the auth layer; until
-    // that lands, an MCP caller holds exactly the scopes each tool declares,
-    // which keeps scoped routes callable in development without silently
-    // widening access for unscoped ones.
-    let route_scopes = app
-        .exposed_tools()
-        .into_iter()
-        .find(|r| r.tool_name() == name)
-        .map(|r| r.tool.scopes.clone())
-        .unwrap_or_default();
+    // A gated tool is not callable straight off the MCP surface: approval gates
+    // exist so a human sees the call first, and honouring them only inside the
+    // agent loop would leave an obvious way around them.
+    if let Some(route) = app.route_for_tool(name) {
+        if route.approval == crate::manifest::Approval::Required {
+            return Ok(json!({
+                "content": [{"type": "text", "text": format!(
+                    "tool {name:?} requires human approval and cannot be invoked directly over MCP"
+                )}],
+                "isError": true,
+            }));
+        }
+    }
 
-    match app.call_tool(name, &args, route_scopes).await {
+    // The MCP caller's own principal is used — no scope substitution. This is
+    // the same authority the caller would have over plain HTTP.
+    match app.call_tool_as(name, &args, caller).await {
         Ok(value) => {
             let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
             Ok(json!({
