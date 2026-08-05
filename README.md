@@ -4,6 +4,11 @@
 > installs as **`web-cortex-framework`** and imports as **`webcortex`** — the same
 > split as `djangorestframework` → `import rest_framework`.
 
+**📖 [Documentation](https://slimboi34.github.io/web_cortex_framework/)** ·
+[Tutorial](https://slimboi34.github.io/web_cortex_framework/tutorial/) ·
+[Use cases](https://slimboi34.github.io/web_cortex_framework/use-cases/) ·
+[Security](https://slimboi34.github.io/web_cortex_framework/security/)
+
 A Python web framework with a Rust core, built on one idea:
 
 > **If you declared it, Rust can run it — and an agent can call it.**
