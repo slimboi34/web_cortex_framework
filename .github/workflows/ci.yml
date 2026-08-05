@@ -95,7 +95,10 @@ jobs:
             target: aarch64
           - os: macos-latest
             target: aarch64
-          - os: macos-13
+          # Intel macOS is cross-compiled from the ARM runner: GitHub has retired
+          # the macos-13 Intel runners, and Apple's toolchain targets both
+          # architectures natively, so this needs no cross setup.
+          - os: macos-latest
             target: x86_64
           - os: windows-latest
             target: x64
