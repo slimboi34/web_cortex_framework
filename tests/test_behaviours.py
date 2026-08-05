@@ -21,14 +21,14 @@ from pathlib import Path
 
 import pytest
 
-from rango import Rango
+from webcortex import WebCortex
 
 
 # ---------------------------------------------------------------- declarations
 
 
 def test_behaviour_is_exposed_as_a_tool_by_default():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("summarise")
     def summarise(ctx, input):
@@ -38,7 +38,7 @@ def test_behaviour_is_exposed_as_a_tool_by_default():
 
 
 def test_behaviour_name_defaults_to_the_function_name():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour
     def my_procedure(ctx, input):
@@ -48,7 +48,7 @@ def test_behaviour_name_defaults_to_the_function_name():
 
 
 def test_behaviour_registers_a_route_so_it_gets_the_whole_stack():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("triage")
     def triage(ctx, input):
@@ -61,7 +61,7 @@ def test_behaviour_registers_a_route_so_it_gets_the_whole_stack():
 
 
 def test_behaviour_path_can_be_overridden():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("triage", expose_at="/ops/triage")
     def triage(ctx, input):
@@ -71,7 +71,7 @@ def test_behaviour_path_can_be_overridden():
 
 
 def test_behaviour_docstring_becomes_the_tool_description():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("triage")
     def triage(ctx, input):
@@ -89,7 +89,7 @@ class TriageInput:
 
 
 def test_behaviour_input_schema_comes_from_the_annotation():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("triage")
     def triage(ctx, input: TriageInput):
@@ -101,7 +101,7 @@ def test_behaviour_input_schema_comes_from_the_annotation():
 
 
 def test_unannotated_behaviour_accepts_any_object():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("loose")
     def loose(ctx, input):
@@ -112,7 +112,7 @@ def test_unannotated_behaviour_accepts_any_object():
 
 
 def test_behaviour_declaring_an_unknown_tool_is_a_boot_error():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("bad", tools=["no_such_tool"])
     def bad(ctx, input):
@@ -123,7 +123,7 @@ def test_behaviour_declaring_an_unknown_tool_is_a_boot_error():
 
 
 def test_a_behaviour_may_declare_another_behaviour_as_a_tool():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("inner")
     def inner(ctx, input):
@@ -137,7 +137,7 @@ def test_a_behaviour_may_declare_another_behaviour_as_a_tool():
 
 
 def test_an_agent_may_use_a_behaviour_as_a_tool():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("triage")
     def triage(ctx, input):
@@ -148,7 +148,7 @@ def test_an_agent_may_use_a_behaviour_as_a_tool():
 
 
 def test_duplicate_behaviour_names_are_rejected():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("dup")
     def a(ctx, input):
@@ -163,7 +163,7 @@ def test_duplicate_behaviour_names_are_rejected():
 
 
 def test_zero_step_behaviour_is_rejected():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("useless", max_steps=0)
     def useless(ctx, input):
@@ -174,7 +174,7 @@ def test_zero_step_behaviour_is_rejected():
 
 
 def test_behaviours_appear_in_the_security_report():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("triage", scopes=["ops"], max_steps=10, token_budget=1000)
     def triage(ctx, input):
@@ -187,7 +187,7 @@ def test_behaviours_appear_in_the_security_report():
 
 
 def test_behaviour_endpoint_inherits_its_scopes_as_a_guard():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.behaviour("triage", scopes=["ops"])
     def triage(ctx, input):
@@ -201,9 +201,9 @@ def test_behaviour_endpoint_inherits_its_scopes_as_a_guard():
 
 
 APP = '''
-from rango import Rango
+from webcortex import WebCortex
 
-app = Rango("beh", database="sqlite://./beh.db", port={port})
+app = WebCortex("beh", database="sqlite://./beh.db", port={port})
 
 app.resource(
     "tickets",
@@ -291,14 +291,14 @@ def _free_port() -> int:
 @pytest.fixture(scope="module")
 def beh_server():
     port = _free_port()
-    workdir = Path(tempfile.mkdtemp(prefix="rango-beh-"))
+    workdir = Path(tempfile.mkdtemp(prefix="webcortex-beh-"))
     (workdir / "api.py").write_text(APP.format(port=port))
     log_path = workdir / "server.log"
 
-    env = {**os.environ, "RANGO_LOG": "warn"}
+    env = {**os.environ, "WEBCORTEX_LOG": "warn"}
     with log_path.open("w") as log:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "rango.cli", "run", "api.py"],
+            [sys.executable, "-m", "webcortex.cli", "run", "api.py"],
             cwd=workdir, stdout=log, stderr=subprocess.STDOUT, env=env,
         )
 
@@ -308,7 +308,7 @@ def beh_server():
         if proc.poll() is not None:
             pytest.fail(f"server exited early:\n{log_path.read_text()}")
         try:
-            with urllib.request.urlopen(base + "/_rango/health", timeout=1):
+            with urllib.request.urlopen(base + "/_webcortex/health", timeout=1):
                 break
         except Exception:
             time.sleep(0.1)
@@ -428,7 +428,7 @@ def test_context_exposes_identity_and_declared_tools(beh_server):
 
 def test_behaviours_are_mcp_tools(beh_server):
     req = urllib.request.Request(
-        beh_server + "/_rango/mcp",
+        beh_server + "/_webcortex/mcp",
         data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode(),
         method="POST",
         headers={"content-type": "application/json"},
@@ -440,7 +440,7 @@ def test_behaviours_are_mcp_tools(beh_server):
 
 def test_a_behaviour_is_invocable_as_an_mcp_tool(beh_server):
     req = urllib.request.Request(
-        beh_server + "/_rango/mcp",
+        beh_server + "/_webcortex/mcp",
         data=json.dumps({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "triage", "arguments": {"threshold": 100}},
@@ -455,5 +455,5 @@ def test_a_behaviour_is_invocable_as_an_mcp_tool(beh_server):
 
 
 def test_control_plane_lists_behaviours(beh_server):
-    names = {b["name"] for b in get(beh_server, "/_rango/behaviours")["behaviours"]}
+    names = {b["name"] for b in get(beh_server, "/_webcortex/behaviours")["behaviours"]}
     assert {"triage", "burner", "composer"} <= names

@@ -31,10 +31,10 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p rango-core --all-features
+      - run: cargo test -p webcortex-core --all-features
       # Warnings are errors here: this is where a real defect gets caught for
       # free, and a warning nobody fails on is a warning nobody reads.
-      - run: cargo clippy -p rango-core --all-targets -- -D warnings
+      - run: cargo clippy -p webcortex-core --all-targets -- -D warnings
 
   python:
     name: Python ${{ matrix.python }} (${{ matrix.os }})
@@ -60,7 +60,7 @@ jobs:
           uv pip install maturin pytest
           source .venv/bin/activate
           maturin develop --uv
-          python -c "import rango, sys; print(rango.__version__, 'free_threaded=', rango.free_threaded())"
+          python -c "import webcortex, sys; print(webcortex.__version__, 'free_threaded=', webcortex.free_threaded())"
           pytest tests/ -q
 
   audit:

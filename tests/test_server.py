@@ -22,9 +22,9 @@ import pytest
 
 APP_SOURCE = '''
 from dataclasses import dataclass
-from rango import HTTPError, Rango
+from webcortex import HTTPError, WebCortex
 
-app = Rango("itest", description="integration", database="sqlite://./itest.db", port={port})
+app = WebCortex("itest", description="integration", database="sqlite://./itest.db", port={port})
 
 app.resource("books", fields={{"id": int, "title": str, "author": str}}, tools=True)
 
@@ -91,7 +91,7 @@ class Server:
         payload = {"jsonrpc": "2.0", "id": rid, "method": method}
         if params is not None:
             payload["params"] = params
-        status, body = self.request("/_rango/mcp", "POST", payload)
+        status, body = self.request("/_webcortex/mcp", "POST", payload)
         assert status == 200, f"MCP transport error {status}: {body}"
         return body
 
@@ -99,14 +99,14 @@ class Server:
 @pytest.fixture(scope="module")
 def server():
     port = _free_port()
-    workdir = Path(tempfile.mkdtemp(prefix="rango-itest-"))
+    workdir = Path(tempfile.mkdtemp(prefix="webcortex-itest-"))
     (workdir / "api.py").write_text(APP_SOURCE.format(port=port))
     log_path = workdir / "server.log"
 
-    env = {**os.environ, "RANGO_LOG": "warn"}
+    env = {**os.environ, "WEBCORTEX_LOG": "warn"}
     with log_path.open("w") as log:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "rango.cli", "run", "api.py"],
+            [sys.executable, "-m", "webcortex.cli", "run", "api.py"],
             cwd=workdir, stdout=log, stderr=subprocess.STDOUT, env=env,
         )
 
@@ -116,7 +116,7 @@ def server():
         if proc.poll() is not None:
             pytest.fail(f"server exited early:\n{log_path.read_text()}")
         try:
-            with urllib.request.urlopen(base + "/_rango/health", timeout=1):
+            with urllib.request.urlopen(base + "/_webcortex/health", timeout=1):
                 break
         except Exception:
             time.sleep(0.1)
@@ -137,7 +137,7 @@ def server():
 
 
 def test_health_reports_the_runtime_shape(server):
-    status, body = server.request("/_rango/health")
+    status, body = server.request("/_webcortex/health")
     assert status == 200
     assert body["app"] == "itest"
     assert body["python_workers"] >= 1
@@ -208,11 +208,11 @@ def test_scoped_route_is_refused_over_plain_http(server):
 
 
 def test_openapi_is_served_and_self_describes(server):
-    status, spec = server.request("/_rango/openapi.json")
+    status, spec = server.request("/_webcortex/openapi.json")
     assert status == 200
     assert spec["openapi"] == "3.1.0"
-    assert spec["x-rango"]["mcp_endpoint"] == "/_rango/mcp"
-    assert spec["paths"]["/books"]["get"]["x-rango-op"] == "query"
+    assert spec["x-webcortex"]["mcp_endpoint"] == "/_webcortex/mcp"
+    assert spec["paths"]["/books"]["get"]["x-webcortex-op"] == "query"
 
 
 # ---------------------------------------------------------------- MCP
@@ -291,14 +291,14 @@ def test_mcp_unknown_tool_and_method(server):
 
 def test_mcp_notification_gets_no_body(server):
     status, body = server.request(
-        "/_rango/mcp", "POST", {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        "/_webcortex/mcp", "POST", {"jsonrpc": "2.0", "method": "notifications/initialized"}
     )
     assert status == 202 and body is None
 
 
 def test_mcp_batch(server):
     status, body = server.request(
-        "/_rango/mcp",
+        "/_webcortex/mcp",
         "POST",
         [
             {"jsonrpc": "2.0", "id": 1, "method": "ping"},

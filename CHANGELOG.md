@@ -9,18 +9,20 @@ The first release intended for other people to install.
 
 ### Renamed
 
-The project is now **Rango**. It was developed under the name Pylon, which is
-taken on PyPI.
+The project is now **WebCortex**. It was developed as *Pylon* and briefly carried
+the name *Rango*; both are taken on PyPI.
 
-- Import and CLI: `rango` (`from rango import Rango`, `rango dev`)
-- Distribution on PyPI: **`rango-framework`** — `rango` is held by an abandoned
-  `v0.0.2a` package. The split mirrors `djangorestframework` → `import
-  rest_framework`.
-- Crates: `rango-core`, `rango-py`
-- Environment variables: `PYLON_*` → `RANGO_*`
-- Control plane: `/_pylon/*` → `/_rango/*`
-- Generated API keys: `pyl_…` → `rng_…`
-- OpenAPI extensions: `x-pylon-*` → `x-rango-*`
+- Import and CLI: `webcortex` (`from webcortex import WebCortex`, `webcortex dev`)
+- Distribution on PyPI: **`web-cortex-framework`**. Unlike the earlier names,
+  this one is not forced — both `web-cortex-framework` and `webcortex` are free.
+  The longer distribution name is the project's chosen identity; the shorter
+  import name is for ergonomics, the way `djangorestframework` imports as
+  `rest_framework`.
+- Crates: `webcortex-core`, `webcortex-py`
+- Environment variables: `PYLON_*` → `WEBCORTEX_*`
+- Control plane: `/_pylon/*` → `/_webcortex/*`
+- Generated API keys: `pyl_…` → `wcx_…`
+- OpenAPI extensions: `x-pylon-*` → `x-webcortex-*`
 
 **This is a breaking change for anyone running v0.1–0.2.** No migration path is
 provided; nothing was published, so nothing depends on the old names.
@@ -42,7 +44,7 @@ was *not* tested, in [`SECURITY.md`](SECURITY.md).
   invocation got a fresh step budget, so `max_steps` never bounded the total.
   Bounded now by `server.max_invocation_depth` (default 8).
 - **Medium** — Python tracebacks were returned to clients. Now log-only;
-  `RANGO_DEBUG_ERRORS=1` opts back in.
+  `WEBCORTEX_DEBUG_ERRORS=1` opts back in.
 - **Low** — client input faults surfaced as 500s. `QueryError` now separates
   caller fault (400) from internal fault (500).
 

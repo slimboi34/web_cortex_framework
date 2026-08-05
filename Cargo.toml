@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rango-core", "crates/rango-py"]
+members = ["crates/webcortex-core", "crates/webcortex-py"]
 resolver = "3"
 
 [workspace.package]
@@ -7,9 +7,9 @@ version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.85"
-repository = "https://github.com/slimboi34/rango"
-homepage = "https://github.com/slimboi34/rango"
-documentation = "https://docs.rs/rango-core"
+repository = "https://github.com/slimboi34/web_cortex_framework"
+homepage = "https://github.com/slimboi34/web_cortex_framework"
+documentation = "https://docs.rs/webcortex-core"
 keywords = ["web", "framework", "agent", "mcp", "python"]
 categories = ["web-programming::http-server"]
 

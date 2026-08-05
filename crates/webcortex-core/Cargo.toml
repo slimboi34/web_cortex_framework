@@ -1,5 +1,5 @@
 [package]
-name = "rango-core"
+name = "webcortex-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
-description = "Core runtime for Rango: manifest IR, router, native op executor, MCP + OpenAPI surfaces."
+description = "Core runtime for WebCortex: manifest IR, router, native op executor, MCP + OpenAPI surfaces."
 
 [dependencies]
 tokio.workspace = true

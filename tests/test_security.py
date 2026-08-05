@@ -19,14 +19,14 @@ from pathlib import Path
 
 import pytest
 
-from rango import Rango
+from webcortex import WebCortex
 
 # ---------------------------------------------------------------- declarations
 
 
-def app_with_auth() -> Rango:
-    app = Rango("sec", database="sqlite://:memory:")
-    app.api_key("ADMIN_KEY", id="admin", scopes=["read", "write", "rango:admin"])
+def app_with_auth() -> WebCortex:
+    app = WebCortex("sec", database="sqlite://:memory:")
+    app.api_key("ADMIN_KEY", id="admin", scopes=["read", "write", "webcortex:admin"])
     app.api_key("READER_KEY", id="reader", scopes=["read"])
     return app
 
@@ -37,11 +37,11 @@ def test_api_keys_are_referenced_by_env_var_never_embedded():
     serialized = json.dumps(manifest)
     assert "ADMIN_KEY" in manifest["auth"]["api_keys"]
     # The manifest is logged, diffed, and handed to agents. It must be safe.
-    assert "secret" not in serialized.lower() or "RANGO" in serialized
+    assert "secret" not in serialized.lower() or "WEBCORTEX" in serialized
 
 
 def test_resource_splits_read_and_write_authorization():
-    app = Rango("t", database="sqlite://:memory:")
+    app = WebCortex("t", database="sqlite://:memory:")
     app.resource(
         "items",
         fields={"id": int, "name": str},
@@ -57,7 +57,7 @@ def test_resource_splits_read_and_write_authorization():
 
 
 def test_resource_scopes_shorthand_applies_to_everything():
-    app = Rango("t", database="sqlite://:memory:")
+    app = WebCortex("t", database="sqlite://:memory:")
     app.resource("items", fields={"id": int}, scopes=["all"])
     for r in app.manifest()["routes"]:
         if r["path"].startswith("/items"):
@@ -65,7 +65,7 @@ def test_resource_scopes_shorthand_applies_to_everything():
 
 
 def test_a_resource_with_no_scopes_is_reported_as_public():
-    app = Rango("t", database="sqlite://:memory:")
+    app = WebCortex("t", database="sqlite://:memory:")
     app.resource("items", fields={"id": int, "name": str})
     report = app.security_report()
     assert "POST /items" in report["public_routes"]
@@ -73,7 +73,7 @@ def test_a_resource_with_no_scopes_is_reported_as_public():
 
 
 def test_security_report_lists_gated_tools():
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.post("/danger", tool=True, approval="required")
     def danger() -> dict:
@@ -83,20 +83,20 @@ def test_security_report_lists_gated_tools():
 
 
 def test_cors_wildcard_with_credentials_is_rejected_at_boot():
-    app = Rango("t")
+    app = WebCortex("t")
     app.cors("*", credentials=True)
     with pytest.raises(ValueError, match="allow_credentials"):
         app.check()
 
 
 def test_cors_with_explicit_origins_and_credentials_is_fine():
-    app = Rango("t")
+    app = WebCortex("t")
     app.cors("https://app.test", credentials=True)
     app.check()
 
 
 def test_cors_enabled_without_origins_is_rejected():
-    app = Rango("t")
+    app = WebCortex("t")
     app.cors()
     with pytest.raises(ValueError, match="allow_origins"):
         app.check()
@@ -104,7 +104,7 @@ def test_cors_enabled_without_origins_is_rejected():
 
 def test_approval_gate_on_a_non_tool_route_is_rejected():
     """A gate that can never fire is dead config giving false confidence."""
-    app = Rango("t")
+    app = WebCortex("t")
 
     @app.post("/danger", approval="required")
     def danger() -> dict:
@@ -115,7 +115,7 @@ def test_approval_gate_on_a_non_tool_route_is_rejected():
 
 
 def test_agent_tool_typo_suggests_the_intended_name():
-    app = Rango("t", database="sqlite://:memory:")
+    app = WebCortex("t", database="sqlite://:memory:")
     app.resource("items", fields={"id": int}, tools=True)
     app.agent("a", model="m", tools=["list_item"])  # missing the 's'
     with pytest.raises(ValueError, match="Did you mean"):
@@ -123,7 +123,7 @@ def test_agent_tool_typo_suggests_the_intended_name():
 
 
 def test_duplicate_agent_names_are_rejected():
-    app = Rango("t")
+    app = WebCortex("t")
     app.agent("a", model="m")
     app.agent("a", model="m")
     with pytest.raises(ValueError, match="duplicate agent"):
@@ -131,19 +131,19 @@ def test_duplicate_agent_names_are_rejected():
 
 
 def test_an_agent_that_could_never_act_is_rejected():
-    app = Rango("t")
+    app = WebCortex("t")
     app.agent("a", model="m", max_steps=0)
     with pytest.raises(ValueError, match="never act"):
         app.check()
 
 
 def test_security_headers_are_on_by_default():
-    assert Rango("t").manifest()["security_headers"]["enabled"] is True
+    assert WebCortex("t").manifest()["security_headers"]["enabled"] is True
 
 
 def test_rate_limit_is_off_until_declared():
-    assert Rango("t").manifest()["rate_limit"]["enabled"] is False
-    app = Rango("t")
+    assert WebCortex("t").manifest()["rate_limit"]["enabled"] is False
+    app = WebCortex("t")
     app.rate_limit(10, burst=20)
     assert app.manifest()["rate_limit"] == {
         "enabled": True, "per_second": 10, "burst": 20, "idle_eviction_secs": 300,
@@ -151,20 +151,20 @@ def test_rate_limit_is_off_until_declared():
 
 
 def test_page_without_templates_configured_is_rejected():
-    app = Rango("t")
+    app = WebCortex("t")
     app.page("/x", "x.html", data={"a": 1})
     with pytest.raises(ValueError, match="template"):
         app.check()
 
 
 def test_page_cannot_take_two_data_sources():
-    app = Rango("t", database="sqlite://:memory:", templates="templates")
+    app = WebCortex("t", database="sqlite://:memory:", templates="templates")
     with pytest.raises(ValueError, match="not both"):
         app.page("/x", "x.html", sql="SELECT 1", data={"a": 1})
 
 
 def test_static_files_requires_a_real_directory():
-    app = Rango("t")
+    app = WebCortex("t")
     with pytest.raises(ValueError, match="not a directory"):
         app.static_files("/assets", "/nonexistent/path/xyz")
 
@@ -172,7 +172,7 @@ def test_static_files_requires_a_real_directory():
 def test_default_root_route_yields_to_a_user_defined_one(tmp_path):
     """The framework must never claim a path the user cannot take back."""
     (tmp_path / "home.html").write_text("<h1>mine</h1>")
-    app = Rango("t", templates=str(tmp_path))
+    app = WebCortex("t", templates=str(tmp_path))
     app.page("/", "home.html")
     roots = [r for r in app.manifest()["routes"] if r["path"] == "/"]
     assert len(roots) == 1
@@ -180,7 +180,7 @@ def test_default_root_route_yields_to_a_user_defined_one(tmp_path):
 
 
 def test_default_root_route_appears_when_unused():
-    app = Rango("t")
+    app = WebCortex("t")
     roots = [r for r in app.manifest()["routes"] if r["path"] == "/"]
     assert len(roots) == 1
     assert roots[0]["op"]["kind"] == "static"
@@ -190,11 +190,11 @@ def test_default_root_route_appears_when_unused():
 
 
 APP = '''
-from rango import Rango
+from webcortex import WebCortex
 
-app = Rango("sec", database="sqlite://./sec.db", port={port})
-app.api_key("ADMIN_KEY", id="admin", scopes=["read", "write", "rango:admin"])
-app.api_key("READER_KEY", id="reader", scopes=["read", "rango:admin"])
+app = WebCortex("sec", database="sqlite://./sec.db", port={port})
+app.api_key("ADMIN_KEY", id="admin", scopes=["read", "write", "webcortex:admin"])
+app.api_key("READER_KEY", id="reader", scopes=["read", "webcortex:admin"])
 app.anonymous_scopes()
 app.cors("https://allowed.test")
 
@@ -215,19 +215,19 @@ def _free_port() -> int:
 @pytest.fixture(scope="module")
 def secure_server():
     port = _free_port()
-    workdir = Path(tempfile.mkdtemp(prefix="rango-sec-"))
+    workdir = Path(tempfile.mkdtemp(prefix="webcortex-sec-"))
     (workdir / "api.py").write_text(APP.format(port=port))
     log_path = workdir / "server.log"
 
     env = {
         **os.environ,
-        "RANGO_LOG": "warn",
+        "WEBCORTEX_LOG": "warn",
         "ADMIN_KEY": "admin-secret-key-1234567890",
         "READER_KEY": "reader-secret-key-1234567890",
     }
     with log_path.open("w") as log:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "rango.cli", "run", "api.py"],
+            [sys.executable, "-m", "webcortex.cli", "run", "api.py"],
             cwd=workdir, stdout=log, stderr=subprocess.STDOUT, env=env,
         )
 
@@ -237,7 +237,7 @@ def secure_server():
         if proc.poll() is not None:
             pytest.fail(f"server exited early:\n{log_path.read_text()}")
         try:
-            with urllib.request.urlopen(base + "/_rango/health", timeout=1):
+            with urllib.request.urlopen(base + "/_webcortex/health", timeout=1):
                 break
         except Exception:
             time.sleep(0.1)
@@ -327,17 +327,17 @@ def test_cors_allows_the_declared_origin_only(secure_server):
 
 
 def test_control_plane_requires_admin_scope(secure_server):
-    assert call(secure_server, "/_rango/openapi.json")[0] == 401
-    assert call(secure_server, "/_rango/openapi.json", key=ADMIN)[0] == 200
+    assert call(secure_server, "/_webcortex/openapi.json")[0] == 401
+    assert call(secure_server, "/_webcortex/openapi.json", key=ADMIN)[0] == 200
 
 
 def test_health_stays_reachable_without_a_credential(secure_server):
     """Load balancers cannot present an API key."""
-    assert call(secure_server, "/_rango/health")[0] == 200
+    assert call(secure_server, "/_webcortex/health")[0] == 200
 
 
 def test_security_endpoint_reports_the_public_surface(secure_server):
-    status, body, _ = call(secure_server, "/_rango/security", key=ADMIN)
+    status, body, _ = call(secure_server, "/_webcortex/security", key=ADMIN)
     assert status == 200
     assert body["auth_configured"] is True
     assert "GET /open" in body["public_routes"]

@@ -1,6 +1,6 @@
-"""The Rango application object.
+"""The WebCortex application object.
 
-A Rango app is a *description*, not a server. Importing your `api.py` builds a
+A WebCortex app is a *description*, not a server. Importing your `api.py` builds a
 manifest; the Rust runtime then executes it. That separation is what lets whole
 categories of route — queries, proxies, static responses — run without the
 interpreter being involved in the request path at all.
@@ -20,7 +20,7 @@ from typing import Any, Callable, Iterable, Sequence
 from . import schema as _schema
 from ._bridge import Dispatcher, HTTPError, Request, Response, default_worker_count
 
-__all__ = ["Rango", "Request", "Response", "HTTPError", "Resource"]
+__all__ = ["WebCortex", "Request", "Response", "HTTPError", "Resource"]
 
 _HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
@@ -41,7 +41,7 @@ class Resource:
     route_ids: list[int] = field(default_factory=list)
 
 
-class Rango:
+class WebCortex:
     def __init__(
         self,
         name: str,
@@ -52,7 +52,7 @@ class Rango:
         host: str = "127.0.0.1",
         port: int = 8000,
         workers: int | None = None,
-        control_prefix: str = "/_rango",
+        control_prefix: str = "/_webcortex",
         templates: str | None = None,
         request_timeout: int = 30,
         shutdown_timeout: int = 25,
@@ -247,14 +247,14 @@ class Rango:
 
         `params` names the values bound to each `?` in order; each is resolved
         from the path, then the query string, then the JSON body. The request
-        never reaches Python, so this is the fastest kind of route Rango has.
+        never reaches Python, so this is the fastest kind of route WebCortex has.
         """
         if returns not in ("many", "one", "affected"):
             raise ValueError("returns must be 'many', 'one', or 'affected'")
         if not self.database:
             raise ValueError(
                 f"query route {method} {path} needs a database; "
-                "pass database=... to Rango()"
+                "pass database=... to WebCortex()"
             )
         return self._add_route(
             method,
@@ -313,11 +313,11 @@ class Rango:
         Authorization is split, because reads and writes almost never warrant
         the same scope: `read_scopes` guards list/get, `write_scopes` guards
         create/update/delete. `scopes` sets both at once. Leaving all three
-        unset makes the resource fully public, which `rango security` reports.
+        unset makes the resource fully public, which `webcortex security` reports.
         """
         table = table or name
         if not self.database:
-            raise ValueError(f"resource {name!r} needs a database; pass database=... to Rango()")
+            raise ValueError(f"resource {name!r} needs a database; pass database=... to WebCortex()")
         if primary_key not in fields:
             raise ValueError(f"primary key {primary_key!r} is not among fields for {name!r}")
 
@@ -765,7 +765,7 @@ class Rango:
         a run. They default to the same set, because an endpoint that spends
         tokens and exercises tools should not be less guarded than the tools
         themselves. Passing `expose_scopes=[]` makes the endpoint public — which
-        `rango security` will report.
+        `webcortex security` will report.
 
         A typo in `tools` is a boot error, not a runtime surprise.
         """
@@ -836,8 +836,8 @@ class Rango:
             "version": self.version,
             "description": self.description,
             "server": {
-                "host": os.environ.get("RANGO_HOST", self.host),
-                "port": int(os.environ.get("RANGO_PORT", self.port)),
+                "host": os.environ.get("WEBCORTEX_HOST", self.host),
+                "port": int(os.environ.get("WEBCORTEX_PORT", self.port)),
                 "python_workers": self.workers,
                 "control_prefix": self.control_prefix,
                 "request_timeout_secs": self.request_timeout,
@@ -853,7 +853,7 @@ class Rango:
                 else None
             ),
             "database": (
-                {"url": os.environ.get("RANGO_DATABASE_URL", self.database), "max_connections": 16}
+                {"url": os.environ.get("WEBCORTEX_DATABASE_URL", self.database), "max_connections": 16}
                 if self.database
                 else None
             ),
@@ -891,7 +891,7 @@ class Rango:
     def security_report(self) -> dict:
         """What is reachable without a credential, and what is gated.
 
-        Printed by `rango check` so the public attack surface is something you
+        Printed by `webcortex check` so the public attack surface is something you
         read on every run rather than something you audit once.
         """
         auth_on = bool(self._auth["api_keys"]) or self._auth["jwt"] is not None
@@ -955,7 +955,7 @@ class Rango:
             return
         import sqlite3
 
-        url = os.environ.get("RANGO_DATABASE_URL", self.database)
+        url = os.environ.get("WEBCORTEX_DATABASE_URL", self.database)
         if not url.startswith("sqlite"):
             return
         filename = url.split("://", 1)[-1] if "://" in url else url.split(":", 1)[-1]

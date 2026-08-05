@@ -1,25 +1,24 @@
-# Rango
+# WebCortex
 
 > **Status: pre-release.** Not yet published; build from source. Once released it
-> installs as **`rango-framework`** and imports as **`rango`** — the bare `rango`
-> name on PyPI is held by an unrelated, abandoned package, the same split as
-> `djangorestframework` → `import rest_framework`.
+> installs as **`web-cortex-framework`** and imports as **`webcortex`** — the same
+> split as `djangorestframework` → `import rest_framework`.
 
 A Python web framework with a Rust core, built on one idea:
 
 > **If you declared it, Rust can run it — and an agent can call it.**
 
 Django and Rails were designed when the only client was a browser. Today the
-client is just as likely to be a model. Rango treats that as the primary case
+client is just as likely to be a model. WebCortex treats that as the primary case
 rather than something you bolt on with a second, hand-maintained tool server.
 
 ```python
 # api.py
-from rango import Rango
+from webcortex import WebCortex
 
-app = Rango("bookstore", database="sqlite://./app.db")
+app = WebCortex("bookstore", database="sqlite://./app.db")
 
-app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write"])
+app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write"])
 app.rate_limit(per_second=50)
 app.anonymous_scopes("read")
 
@@ -38,7 +37,7 @@ def blurb(id: int) -> str:
 ```
 
 ```
-$ rango dev
+$ webcortex dev
 ```
 
 You now have a REST API, an OpenAPI 3.1 document, **a live MCP server exposing
@@ -51,13 +50,13 @@ headers. No second file, no schema written twice, no drift.
 
 ```bash
 # Not yet on PyPI — see Status below. For now, build from source:
-git clone https://github.com/slimboi34/rango && cd rango
+git clone https://github.com/slimboi34/web_cortex_framework && cd webcortex
 uv venv --python 3.14 && uv pip install maturin && maturin develop --uv
 
-rango new myapp                # --template api | fullstack | agent | behaviour
+webcortex new myapp                # --template api | fullstack | agent | behaviour
 cd myapp
-export RANGO_API_KEY=$(rango keygen)
-rango dev
+export WEBCORTEX_API_KEY=$(webcortex keygen)
+webcortex dev
 ```
 
 ## Why a Rust core, specifically
@@ -65,14 +64,14 @@ rango dev
 Most Rust-accelerated Python servers put Rust at the socket and call Python for
 every request. You get faster parsing; your handler is still interpreted.
 
-Rango puts the boundary somewhere more useful. **Python is a declaration
+WebCortex puts the boundary somewhere more useful. **Python is a declaration
 language that compiles to a plan the Rust runtime executes.** A route whose work
 is expressible as data — a query, a proxy, a rendered page, a static file, an
 agent invocation — runs entirely in Rust and *never enters the interpreter at
 request time*. In practice that is most of a CRUD API.
 
 ```
-$ rango check
+$ webcortex check
   12 routes, 9 served without touching Python
 ```
 
@@ -81,7 +80,7 @@ interpreter workers (CPython 3.13+/3.14, GIL disabled), each running its own
 event loop. Handlers run in real parallel — **measured at 4.82× vs 1.38× under
 the GIL** ([DESIGN.md](DESIGN.md) has the numbers and their caveats).
 
-Rango runs correctly on a GIL build too, and tells you which mode it is in.
+WebCortex runs correctly on a GIL build too, and tells you which mode it is in.
 
 ## Behaviours
 
@@ -149,7 +148,7 @@ can call. Composition is just a tool call, so budgets and scopes still apply.
 - Scopes are delegated by intersection, never unioned.
 
 ```bash
-rango new myapp --template behaviour
+webcortex new myapp --template behaviour
 ```
 
 ## The seven kinds of route
@@ -212,7 +211,7 @@ each provider call. A looping model costs a bounded amount.
 **Scope-filtered tool lists.** `tools/list` shows only what *that caller* can
 invoke. A reader sees three tools where an admin sees six.
 
-**A full audit trail**, including refused calls, at `GET /_rango/audit`.
+**A full audit trail**, including refused calls, at `GET /_webcortex/audit`.
 
 ## Security defaults
 
@@ -223,10 +222,10 @@ Per-principal token-bucket rate limiting. Security headers on every response.
 CORS that refuses `*` with credentials *at boot*. Path traversal, symlink
 escapes, and dotfiles refused by the static server.
 
-`rango security` prints exactly what is reachable without a credential:
+`webcortex security` prints exactly what is reachable without a credential:
 
 ```
-$ rango security
+$ webcortex security
 {"auth_configured": true, "public_routes": ["GET /"], "gated_tools": ["DELETE /books/all"]}
 ```
 
@@ -249,7 +248,7 @@ Python handler. Autoescaping is on and derived from the file extension.
 **A typed TypeScript client** for SPA frontends, from the same route table:
 
 ```bash
-$ rango typegen          # writes client/api.ts
+$ webcortex typegen          # writes client/api.ts
 ```
 
 Zero dependencies, `fetch`-based, with auth built in. Pages and static mounts
@@ -258,20 +257,20 @@ are excluded — they are not part of the JSON API surface.
 ## Commands
 
 ```
-rango new <name>      scaffold a project (api | fullstack | agent | behaviour)
-rango dev             run with a startup report
-rango check           routes, tools, and the public attack surface
-rango security        what is reachable without a credential
-rango tools           the agent tool manifest
-rango typegen         generate a typed TypeScript client
-rango openapi         the OpenAPI 3.1 document
-rango sql             DDL for declared resources
-rango keygen          mint an API key
+webcortex new <name>      scaffold a project (api | fullstack | agent | behaviour)
+webcortex dev             run with a startup report
+webcortex check           routes, tools, and the public attack surface
+webcortex security        what is reachable without a credential
+webcortex tools           the agent tool manifest
+webcortex typegen         generate a typed TypeScript client
+webcortex openapi         the OpenAPI 3.1 document
+webcortex sql             DDL for declared resources
+webcortex keygen          mint an API key
 ```
 
 ## Security
 
-Rango has been through an adversarial review of its own controls — auth,
+WebCortex has been through an adversarial review of its own controls — auth,
 authorization, injection, traversal, SSRF, exhaustion, disclosure — plus stress
 and soak testing. **Six issues were found and fixed**, each with a regression
 test in `tests/test_pentest.py`:

@@ -8,7 +8,7 @@ from typing import Literal, Optional
 
 import pytest
 
-from rango.schema import coerce, json_schema_for, schema_from_signature
+from webcortex.schema import coerce, json_schema_for, schema_from_signature
 
 
 def test_primitives():

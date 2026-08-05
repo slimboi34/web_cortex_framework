@@ -32,7 +32,7 @@ __all__ = ["Dispatcher", "free_threaded", "default_worker_count"]
 # Tracebacks go to the log always, and to the client only when explicitly
 # enabled. A stack trace in an HTTP response hands an attacker your file layout,
 # dependency versions, and code structure for free.
-_EXPOSE_TRACEBACKS = os.environ.get("RANGO_DEBUG_ERRORS", "").lower() in {"1", "true", "yes"}
+_EXPOSE_TRACEBACKS = os.environ.get("WEBCORTEX_DEBUG_ERRORS", "").lower() in {"1", "true", "yes"}
 
 
 def free_threaded() -> bool:
@@ -59,7 +59,7 @@ class _LoopWorker:
         self.loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, name=f"rango-loop-{index}", daemon=True
+            target=self._run, name=f"webcortex-loop-{index}", daemon=True
         )
         self._thread.start()
         self._ready.wait()
@@ -102,7 +102,7 @@ class Dispatcher:
 
         self._threads = ThreadPoolExecutor(
             max_workers=count * 4,
-            thread_name_prefix="rango-sync",
+            thread_name_prefix="webcortex-sync",
         )
         self.worker_count = count
 
@@ -323,7 +323,7 @@ def _deliver_exception(exc: BaseException, completer: Any) -> None:
 
     detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     # Always logged in full, so nothing is lost by not returning it.
-    print(f"[rango] unhandled handler exception:\n{detail}", file=sys.stderr, flush=True)
+    print(f"[webcortex] unhandled handler exception:\n{detail}", file=sys.stderr, flush=True)
     _fail(completer, detail if _EXPOSE_TRACEBACKS else "internal error")
 
 
@@ -342,14 +342,14 @@ def _settle_behaviour(future: Any, completer: Any) -> None:
                 traceback.print_exc()
                 return
         detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        print(f"[rango] behaviour failed:\n{detail}", file=sys.stderr, flush=True)
+        print(f"[webcortex] behaviour failed:\n{detail}", file=sys.stderr, flush=True)
         _fail(completer, detail if _EXPOSE_TRACEBACKS else "behaviour failed")
         return
     try:
         completer.complete(future.result())
     except Exception:
         detail = traceback.format_exc()
-        print(f"[rango] behaviour returned an unconvertible value:\n{detail}",
+        print(f"[webcortex] behaviour returned an unconvertible value:\n{detail}",
               file=sys.stderr, flush=True)
         _fail(completer, detail if _EXPOSE_TRACEBACKS else
               "behaviour returned a value that could not be serialised")

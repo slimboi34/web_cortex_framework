@@ -1,6 +1,6 @@
 # Security review — v0.3
 
-An adversarial review of Rango conducted against its own controls: authentication,
+An adversarial review of WebCortex conducted against its own controls: authentication,
 authorization, injection, traversal, SSRF, resource exhaustion, and information
 disclosure, plus stress and soak testing.
 
@@ -70,7 +70,7 @@ request could permanently deny every Python-backed route in the application.
 The 30-second request timeout returned a 504 to the *caller* but did not stop
 the work, so the leak persisted after the client gave up.
 
-**Fix:** `RangoRequest` now carries an invocation `depth`, incremented on every
+**Fix:** `WebCortexRequest` now carries an invocation `depth`, incremented on every
 in-process tool call and enforced against `server.max_invocation_depth`
 (default 8) before a behaviour or agent op runs. Exceeding it returns 508 Loop
 Detected, surfaced to the behaviour as a clean halt. After the fix the bomb is
@@ -83,7 +83,7 @@ the response body, disclosing absolute file paths, dependency versions, and code
 structure.
 
 **Fix:** tracebacks are always written to the server log and never to the
-response. Set `RANGO_DEBUG_ERRORS=1` to opt back in during development.
+response. Set `WEBCORTEX_DEBUG_ERRORS=1` to opt back in during development.
 
 ### 6. Client input faults reported as server faults — **Low**, fixed
 
@@ -185,7 +185,7 @@ marketing.
 
 - **Self-review.** Same author, same blind spots. Findings 1 and 4 were missed by
   the original suite for exactly that reason.
-- **Not tested:** TLS termination (Rango serves plaintext and expects a
+- **Not tested:** TLS termination (WebCortex serves plaintext and expects a
   terminating proxy), HTTP/2-specific attacks, request smuggling, slowloris and
   header-read timeouts, timing side channels measured statistically rather than
   by construction, and the live Anthropic provider path.
@@ -209,14 +209,14 @@ marketing.
 **RUSTSEC-2023-0071 — Marvin Attack in `rsa` 0.9.x** (medium, 5.9). Reached
 transitively via `jsonwebtoken`. No upstream fix exists.
 
-**Assessed as not exploitable in Rango**, and the exception is recorded with its
+**Assessed as not exploitable in WebCortex**, and the exception is recorded with its
 reasoning in [`.cargo/audit.toml`](.cargo/audit.toml) rather than silenced on a
 command line. The advisory concerns RSA *private key* operations — PKCS#1 v1.5
-decryption and signing. Rango only ever constructs `DecodingKey` and only ever
+decryption and signing. WebCortex only ever constructs `DecodingKey` and only ever
 *verifies* JWT signatures, which is a public-key operation. It never issues or
 signs tokens; there is no `EncodingKey` in the codebase.
 
-The exception must be revisited if Rango gains token-issuing capability, and can
+The exception must be revisited if WebCortex gains token-issuing capability, and can
 be dropped entirely if `jsonwebtoken` is switched to the `aws_lc_rs` provider,
 which does not depend on the `rsa` crate. That switch was not taken here because
 it introduces a C toolchain dependency into the cross-platform wheel build.

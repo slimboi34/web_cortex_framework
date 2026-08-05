@@ -1,6 +1,6 @@
-//! Rango core runtime.
+//! WebCortex core runtime.
 //!
-//! A Rango application is declared in Python, compiled to a [`manifest::Manifest`],
+//! A WebCortex application is declared in Python, compiled to a [`manifest::Manifest`],
 //! and executed here. Routes whose work is expressible as data — queries,
 //! proxies, static responses, agent invocations — never re-enter the
 //! interpreter. Only [`manifest::Op::Python`] routes cross the bridge.
@@ -29,13 +29,13 @@ pub use app::App;
 pub use audit::{AuditSink, MemoryAudit, TracingAudit};
 pub use auth::{Principal, PrincipalKind};
 pub use bridge::{NoBridge, PyBridge};
-pub use http::{RangoRequest, RangoResponse};
+pub use http::{WebCortexRequest, WebCortexResponse};
 pub use manifest::Manifest;
 
 /// Install the default tracing subscriber unless the host already did.
 pub fn init_tracing(default_level: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
-    let filter = EnvFilter::try_from_env("RANGO_LOG")
+    let filter = EnvFilter::try_from_env("WEBCORTEX_LOG")
         .unwrap_or_else(|_| EnvFilter::new(default_level));
     let _ = fmt().with_env_filter(filter).with_target(false).try_init();
 }
@@ -66,7 +66,7 @@ mod tests {
             "op": {"kind": "static", "body": {"pong": true}}
         }]));
         let app = App::build_without_python(m).await.expect("app builds");
-        let res = app.dispatch(RangoRequest::synthetic("GET", "/ping")).await;
+        let res = app.dispatch(WebCortexRequest::synthetic("GET", "/ping")).await;
         assert_eq!(res.status, 200);
         assert_eq!(res.json_value(), serde_json::json!({"pong": true}));
     }
@@ -78,8 +78,8 @@ mod tests {
             "op": {"kind": "static", "body": {}}
         }]));
         let app = App::build_without_python(m).await.expect("app builds");
-        assert_eq!(app.dispatch(RangoRequest::synthetic("GET", "/nope")).await.status, 404);
-        assert_eq!(app.dispatch(RangoRequest::synthetic("POST", "/ping")).await.status, 405);
+        assert_eq!(app.dispatch(WebCortexRequest::synthetic("GET", "/nope")).await.status, 404);
+        assert_eq!(app.dispatch(WebCortexRequest::synthetic("POST", "/ping")).await.status, 405);
     }
 
     #[tokio::test]
@@ -120,11 +120,11 @@ mod tests {
         let app = App::build_without_python(m).await.expect("app builds");
 
         // Anonymous gets 401: the client can fix this by authenticating.
-        assert_eq!(app.dispatch(RangoRequest::synthetic("GET", "/secret")).await.status, 401);
+        assert_eq!(app.dispatch(WebCortexRequest::synthetic("GET", "/secret")).await.status, 401);
 
         // A known principal holding the wrong scope gets 403: authenticating
         // again will not help, and conflating the two makes auth bugs opaque.
-        let wrong_scope = RangoRequest::synthetic_with_scopes("GET", "/secret", &["reader"]);
+        let wrong_scope = WebCortexRequest::synthetic_with_scopes("GET", "/secret", &["reader"]);
         assert_eq!(app.dispatch(wrong_scope).await.status, 403);
 
         assert!(

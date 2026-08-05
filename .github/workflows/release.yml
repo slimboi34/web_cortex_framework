@@ -77,7 +77,7 @@ jobs:
     needs: [build, sdist]
     runs-on: ubuntu-latest
     # Trusted publishing: no API token stored anywhere. Configure the publisher
-    # at https://pypi.org/manage/project/rango-framework/settings/publishing/
+    # at https://pypi.org/manage/project/web-cortex-framework/settings/publishing/
     environment: pypi
     permissions:
       id-token: write

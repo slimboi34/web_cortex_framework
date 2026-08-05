@@ -1,10 +1,10 @@
 //! The seam between the runtime and any embedded interpreter.
 //!
-//! `rango-core` never links against Python. It talks to this trait, which the
-//! `rango-py` crate implements over PyO3. That keeps the runtime testable
+//! `webcortex-core` never links against Python. It talks to this trait, which the
+//! `webcortex-py` crate implements over PyO3. That keeps the runtime testable
 //! without an interpreter and leaves room for other host languages later.
 
-use crate::http::{RangoRequest, RangoResponse};
+use crate::http::{WebCortexRequest, WebCortexResponse};
 use futures::future::BoxFuture;
 
 pub trait PyBridge: Send + Sync + 'static {
@@ -14,8 +14,8 @@ pub trait PyBridge: Send + Sync + 'static {
     fn call<'a>(
         &'a self,
         handler: u32,
-        req: RangoRequest,
-    ) -> BoxFuture<'a, Result<RangoResponse, String>>;
+        req: WebCortexRequest,
+    ) -> BoxFuture<'a, Result<WebCortexResponse, String>>;
 
     /// Run a Behaviour.
     ///
@@ -52,8 +52,8 @@ impl PyBridge for NoBridge {
     fn call<'a>(
         &'a self,
         handler: u32,
-        _req: RangoRequest,
-    ) -> BoxFuture<'a, Result<RangoResponse, String>> {
+        _req: WebCortexRequest,
+    ) -> BoxFuture<'a, Result<WebCortexResponse, String>> {
         Box::pin(async move {
             Err(format!(
                 "route requires Python handler {handler}, but this runtime was built without an interpreter"

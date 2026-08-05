@@ -11,7 +11,7 @@ use crate::audit::{AuditSink, MemoryAudit};
 use crate::auth::{Authenticator, Principal};
 use crate::bridge::{NoBridge, PyBridge};
 use crate::files::FileServer;
-use crate::http::{RangoRequest, RangoResponse};
+use crate::http::{WebCortexRequest, WebCortexResponse};
 use crate::manifest::{Manifest, Op, PageData, Route};
 use crate::middleware::{Cors, RateLimiter};
 use crate::router::{MatchError, Router};
@@ -205,7 +205,7 @@ impl App {
         Self::build(manifest, Arc::new(NoBridge)).await
     }
 
-    /// Swap in a deterministic provider. Used by tests and `rango dev --offline`.
+    /// Swap in a deterministic provider. Used by tests and `webcortex dev --offline`.
     pub fn with_agent_runtime(mut self, rt: AgentRuntime) -> Self {
         self.agent_runtime = Some(rt);
         self
@@ -245,15 +245,15 @@ impl App {
         all
     }
 
-    pub async fn dispatch(&self, mut req: RangoRequest) -> RangoResponse {
+    pub async fn dispatch(&self, mut req: WebCortexRequest) -> WebCortexResponse {
         let matched = match self.router.find(&req.method, &req.path) {
             Ok(m) => m,
             Err(MatchError::NotFound) => {
-                return RangoResponse::error(404, format!("no route for {} {}", req.method, req.path));
+                return WebCortexResponse::error(404, format!("no route for {} {}", req.method, req.path));
             }
             Err(MatchError::MethodNotAllowed) => {
                 let allowed = self.router.allowed_methods(&req.path).join(", ");
-                let mut res = RangoResponse::error(
+                let mut res = WebCortexResponse::error(
                     405,
                     format!("{} not allowed on {}; try: {}", req.method, req.path, allowed),
                 );
@@ -266,7 +266,7 @@ impl App {
         req.route_id = Some(matched.route_id);
 
         let Some(route) = self.routes_by_id.get(&matched.route_id) else {
-            return RangoResponse::error(500, "router matched an unknown route id");
+            return WebCortexResponse::error(500, "router matched an unknown route id");
         };
 
         let required = Self::required_scopes(route);
@@ -277,7 +277,7 @@ impl App {
                 // logging in); 403 when a known principal simply lacks the
                 // scope. Collapsing both to 403 makes auth bugs hard to debug.
                 let status = if req.principal.is_anonymous() { 401 } else { 403 };
-                return RangoResponse::error(
+                return WebCortexResponse::error(
                     status,
                     format!("missing required scope(s): {}", missing.join(", ")),
                 );
@@ -286,13 +286,13 @@ impl App {
 
         match self.execute(&route.op, req).await {
             Ok(res) => res,
-            Err(e) => RangoResponse::error(500, e),
+            Err(e) => WebCortexResponse::error(500, e),
         }
     }
 
-    async fn execute(&self, op: &Op, req: RangoRequest) -> Result<RangoResponse, String> {
+    async fn execute(&self, op: &Op, req: WebCortexRequest) -> Result<WebCortexResponse, String> {
         match op {
-            Op::Static { status, body } => Ok(RangoResponse::json(*status, body)),
+            Op::Static { status, body } => Ok(WebCortexResponse::json(*status, body)),
 
             Op::Python { handler } => self.bridge.call(*handler, req).await,
 
@@ -306,12 +306,12 @@ impl App {
                         .collect();
                     let value = match db.run(sql, &bindings, *returns).await {
                         Ok(v) => v,
-                        Err(e) => return Ok(RangoResponse::error(e.status(), e.message())),
+                        Err(e) => return Ok(WebCortexResponse::error(e.status(), e.message())),
                     };
                     if value.is_null() && *returns == crate::manifest::QueryReturns::One {
-                        return Ok(RangoResponse::error(404, "not found"));
+                        return Ok(WebCortexResponse::error(404, "not found"));
                     }
-                    Ok(RangoResponse::json(200, &value))
+                    Ok(WebCortexResponse::json(200, &value))
                 }
                 #[cfg(not(feature = "sqlite"))]
                 {
@@ -357,7 +357,7 @@ impl App {
     ///
     /// Checked only for behaviour and agent ops, because those are the ones that
     /// can re-enter the dispatcher and form a cycle.
-    fn depth_exceeded(&self, req: &RangoRequest) -> Option<RangoResponse> {
+    fn depth_exceeded(&self, req: &WebCortexRequest) -> Option<WebCortexResponse> {
         let max = self.manifest.server.max_invocation_depth;
         if req.depth < max {
             return None;
@@ -370,7 +370,7 @@ impl App {
             "refused an invocation past the nesting ceiling; likely a recursive behaviour"
         );
         // 508 Loop Detected says precisely what happened.
-        Some(RangoResponse::error(
+        Some(WebCortexResponse::error(
             508,
             format!(
                 "invocation nested {} deep, exceeding the ceiling of {max}; \
@@ -383,8 +383,8 @@ impl App {
     async fn run_behaviour(
         &self,
         name: &str,
-        req: RangoRequest,
-    ) -> Result<RangoResponse, String> {
+        req: WebCortexRequest,
+    ) -> Result<WebCortexResponse, String> {
         let def = self
             .behaviours
             .get(name)
@@ -410,7 +410,7 @@ impl App {
             .call_behaviour(app, def.clone(), input, actor.clone(), req.depth + 1)
             .await
         {
-            Ok(value) => Ok(RangoResponse::json(200, &value)),
+            Ok(value) => Ok(WebCortexResponse::json(200, &value)),
             Err(e) => {
                 self.audit.record(crate::audit::AuditEvent {
                     kind: "behaviour_failed".into(),
@@ -419,7 +419,7 @@ impl App {
                     tool: Some(name.to_string()),
                     detail: serde_json::json!({"error": &e}),
                 });
-                Ok(RangoResponse::error(500, e))
+                Ok(WebCortexResponse::error(500, e))
             }
         }
     }
@@ -429,8 +429,8 @@ impl App {
         template: &str,
         data: &PageData,
         status: u16,
-        req: RangoRequest,
-    ) -> Result<RangoResponse, String> {
+        req: WebCortexRequest,
+    ) -> Result<WebCortexResponse, String> {
         let templates = self.templates.as_ref().ok_or("no templates configured")?;
 
         // Resolve data *before* rendering. The template never gets a handle to
@@ -451,10 +451,10 @@ impl App {
                         .collect();
                     let value = match db.run(sql, &bindings, *returns).await {
                         Ok(v) => v,
-                        Err(e) => return Ok(RangoResponse::error(e.status(), e.message())),
+                        Err(e) => return Ok(WebCortexResponse::error(e.status(), e.message())),
                     };
                     if value.is_null() && *returns == crate::manifest::QueryReturns::One {
-                        return Ok(RangoResponse::error(404, "not found"));
+                        return Ok(WebCortexResponse::error(404, "not found"));
                     }
                     context.insert(bind.clone(), value);
                 }
@@ -495,9 +495,9 @@ impl App {
         Ok(templates.render(template, &serde_json::Value::Object(context), status))
     }
 
-    async fn run_agent(&self, name: &str, req: RangoRequest) -> Result<RangoResponse, String> {
+    async fn run_agent(&self, name: &str, req: WebCortexRequest) -> Result<WebCortexResponse, String> {
         let Some(runtime) = &self.agent_runtime else {
-            return Ok(RangoResponse::error(
+            return Ok(WebCortexResponse::error(
                 503,
                 "agent runtime is unavailable; set ANTHROPIC_API_KEY to enable agents",
             ));
@@ -517,7 +517,7 @@ impl App {
             crate::agent::RunStatus::AwaitingApproval => 202,
             _ => 200,
         };
-        Ok(RangoResponse::json(
+        Ok(WebCortexResponse::json(
             status,
             &serde_json::to_value(&result).map_err(|e| e.to_string())?,
         ))
@@ -542,8 +542,8 @@ impl App {
         &self,
         upstream_name: &str,
         rewrite: Option<&str>,
-        req: RangoRequest,
-    ) -> Result<RangoResponse, String> {
+        req: WebCortexRequest,
+    ) -> Result<WebCortexResponse, String> {
         let up = self
             .manifest
             .upstreams
@@ -561,7 +561,7 @@ impl App {
                     upstream = %upstream_name, param = %name,
                     "rejected proxy request whose path parameter contained traversal"
                 );
-                return Ok(RangoResponse::error(400, "invalid path parameter"));
+                return Ok(WebCortexResponse::error(400, "invalid path parameter"));
             }
         }
 
@@ -573,7 +573,7 @@ impl App {
         // Belt and braces: even with clean parameters, the assembled tail must
         // not contain a traversal segment.
         if tail.split('/').any(|seg| seg == ".." || seg == ".") {
-            return Ok(RangoResponse::error(400, "invalid upstream path"));
+            return Ok(WebCortexResponse::error(400, "invalid upstream path"));
         }
 
         let url = format!("{}{}", up.base_url.trim_end_matches('/'), tail);
@@ -623,7 +623,7 @@ impl App {
             .await
             .map_err(|e| format!("upstream {upstream_name} body read failed: {e}"))?;
 
-        Ok(RangoResponse {
+        Ok(WebCortexResponse {
             status,
             headers: vec![("content-type".into(), content_type)],
             body,
@@ -705,7 +705,7 @@ impl App {
             }
         }
 
-        let req = RangoRequest {
+        let req = WebCortexRequest {
             method: route.method.clone(),
             path: concrete_path,
             path_params,

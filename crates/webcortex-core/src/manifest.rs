@@ -339,7 +339,7 @@ fn default_port() -> u16 {
     8000
 }
 fn default_control_prefix() -> String {
-    "/_rango".into()
+    "/_webcortex".into()
 }
 
 impl Default for ServerConfig {
@@ -642,7 +642,7 @@ impl Manifest {
                 Op::Page { .. } if self.templates.is_none() => {
                     return Err(format!(
                         "route {} {} renders a template but no template directory is configured; \
-                         pass templates=... to Rango()",
+                         pass templates=... to WebCortex()",
                         r.method, r.path
                     ));
                 }
@@ -684,7 +684,7 @@ impl Manifest {
         }
 
         // Two routes answering to one tool name would make a model's tool call
-        // ambiguous. Caught here rather than at bind time so `rango check`
+        // ambiguous. Caught here rather than at bind time so `webcortex check`
         // reports it.
         let mut tool_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for r in self.routes.iter().filter(|r| r.tool.expose) {
@@ -750,7 +750,7 @@ impl Manifest {
         Ok(())
     }
 
-    /// Routes reachable without any credential. Surfaced by `rango check` so an
+    /// Routes reachable without any credential. Surfaced by `webcortex check` so an
     /// operator can see their public attack surface on one screen.
     pub fn public_routes(&self) -> Vec<&Route> {
         self.routes

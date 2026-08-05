@@ -1,4 +1,4 @@
-"""Project starters for `rango new`.
+"""Project starters for `webcortex new`.
 
 Three shapes, because they are genuinely different applications rather than the
 same one with features toggled:
@@ -25,8 +25,8 @@ client/
 
 ENV_EXAMPLE = """\
 # Copy to .env and fill in. Never commit the real file.
-RANGO_API_KEY=replace-me-run-rango-keygen
-RANGO_JWT_SECRET=replace-me-at-least-32-bytes-long-abcdefgh
+WEBCORTEX_API_KEY=replace-me-run-webcortex-keygen
+WEBCORTEX_JWT_SECRET=replace-me-at-least-32-bytes-long-abcdefgh
 # Needed only for the agent starter.
 # ANTHROPIC_API_KEY=sk-ant-...
 """
@@ -34,35 +34,35 @@ RANGO_JWT_SECRET=replace-me-at-least-32-bytes-long-abcdefgh
 README = """\
 # {name}
 
-Built with [Rango](https://github.com/slimboi34/rango).
+Built with [WebCortex](https://github.com/slimboi34/web_cortex_framework).
 
 ## Run
 
 ```bash
-export RANGO_API_KEY=$(rango keygen)
-rango dev
+export WEBCORTEX_API_KEY=$(webcortex keygen)
+webcortex dev
 ```
 
 - API: http://127.0.0.1:8000
-- OpenAPI: http://127.0.0.1:8000/_rango/openapi.json
-- MCP endpoint: http://127.0.0.1:8000/_rango/mcp
+- OpenAPI: http://127.0.0.1:8000/_webcortex/openapi.json
+- MCP endpoint: http://127.0.0.1:8000/_webcortex/mcp
 
 ## Inspect
 
 ```bash
-rango check      # routes, tools, and the public attack surface
-rango security   # what is reachable without a credential
-rango tools      # the agent tool manifest
-rango typegen    # generate client/api.ts
+webcortex check      # routes, tools, and the public attack surface
+webcortex security   # what is reachable without a credential
+webcortex tools      # the agent tool manifest
+webcortex typegen    # generate client/api.ts
 ```
 """
 
 API = '''\
 """{name} — a JSON API that is also an MCP server."""
 
-from rango import HTTPError, Rango
+from webcortex import HTTPError, WebCortex
 
-app = Rango(
+app = WebCortex(
     "{name}",
     description="{description}",
     database="sqlite://./{name}.db",
@@ -72,7 +72,7 @@ app = Rango(
 # Configured up front deliberately: everything below is deny-by-default, and
 # opening a route up is an explicit act.
 
-app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
+app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write", "webcortex:admin"])
 app.rate_limit(per_second=50, burst=100)
 
 # Reads are public; writes require the "write" scope.
@@ -105,16 +105,16 @@ def summarize(id: int, style: str = "short") -> dict:
 FULLSTACK_API = '''\
 """{name} — API, server-rendered pages, and an MCP tool surface."""
 
-from rango import HTTPError, Rango
+from webcortex import HTTPError, WebCortex
 
-app = Rango(
+app = WebCortex(
     "{name}",
     description="{description}",
     database="sqlite://./{name}.db",
     templates="templates",
 )
 
-app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
+app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write", "webcortex:admin"])
 app.rate_limit(per_second=50, burst=100)
 app.anonymous_scopes("read")
 
@@ -161,19 +161,19 @@ def summarize(id: int, style: str = "short") -> dict:
 AGENT_API = '''\
 """{name} — an agent-native application.
 
-Shows the three things that make Rango agents safe to point at production:
+Shows the three things that make WebCortex agents safe to point at production:
 delegated authority, runtime-enforced budgets, and human approval gates.
 """
 
-from rango import HTTPError, Rango
+from webcortex import HTTPError, WebCortex
 
-app = Rango(
+app = WebCortex(
     "{name}",
     description="{description}",
     database="sqlite://./{name}.db",
 )
 
-app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
+app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write", "webcortex:admin"])
 app.rate_limit(per_second=50, burst=100)
 app.anonymous_scopes("read")
 
@@ -236,7 +236,7 @@ INDEX_HTML = """\
   {% else %}
     <p class="empty">No items yet. Create one:</p>
     <pre>curl -X POST localhost:8000/items \\
-  -H 'x-api-key: $RANGO_API_KEY' \\
+  -H 'x-api-key: $WEBCORTEX_API_KEY' \\
   -H 'content-type: application/json' \\
   -d '{"name":"First","note":"hello"}'</pre>
   {% endif %}
@@ -249,7 +249,7 @@ BASE_HTML = """\
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{% block title %}Rango{% endblock %}</title>
+    <title>{% block title %}WebCortex{% endblock %}</title>
     <link rel="stylesheet" href="/assets/style.css" />
   </head>
   <body>
@@ -355,15 +355,15 @@ procedure with deterministic structure and probabilistic steps, rather than a
 probabilistic procedure.
 """
 
-from rango import Rango
+from webcortex import WebCortex
 
-app = Rango(
+app = WebCortex(
     "{name}",
     description="{description}",
     database="sqlite://./{name}.db",
 )
 
-app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
+app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write", "webcortex:admin"])
 app.rate_limit(per_second=50, burst=100)
 app.anonymous_scopes("read")
 

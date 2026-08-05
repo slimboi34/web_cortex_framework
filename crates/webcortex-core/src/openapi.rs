@@ -31,7 +31,7 @@ pub fn generate(m: &Manifest) -> Value {
         "paths": Value::Object(paths),
         // Non-standard but harmless, and it lets an agent discover the MCP
         // endpoint straight from the spec it already fetched.
-        "x-rango": {
+        "x-webcortex": {
             "mcp_endpoint": format!("{}/mcp", m.server.control_prefix),
             "tools": m.routes.iter().filter(|r| r.tool.expose).map(|r| r.tool_name()).collect::<Vec<_>>(),
             "agents": m.agents.iter().map(|a| &a.name).collect::<Vec<_>>(),
@@ -67,8 +67,8 @@ fn operation(r: &Route) -> Value {
                 }
             }
         },
-        "x-rango-op": op_kind(&r.op),
-        "x-rango-tool": r.tool.expose,
+        "x-webcortex-op": op_kind(&r.op),
+        "x-webcortex-tool": r.tool.expose,
     });
 
     // Only methods with a body get a requestBody, and path params are stripped

@@ -1613,51 +1613,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rango-core"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "base64 0.23.1",
- "bytes",
- "futures",
- "hmac 0.13.0",
- "http-body-util",
- "hyper",
- "hyper-util",
- "jsonwebtoken",
- "matchit",
- "mime_guess",
- "minijinja",
- "pin-project-lite",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "sqlx",
- "subtle",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "rango-py"
-version = "0.3.0"
-dependencies = [
- "bytes",
- "futures",
- "pyo3",
- "rango-core",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2755,6 +2710,51 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webcortex-core"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "hmac 0.13.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "jsonwebtoken",
+ "matchit",
+ "mime_guess",
+ "minijinja",
+ "pin-project-lite",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "webcortex-py"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "pyo3",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+ "webcortex-core",
 ]
 
 [[package]]

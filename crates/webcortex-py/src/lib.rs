@@ -1,4 +1,4 @@
-//! `rango._core` — the Python-facing surface of the runtime.
+//! `webcortex._core` — the Python-facing surface of the runtime.
 //!
 //! Python's job is to describe the application and to supply handler callables.
 //! Rust owns the event loop, the socket, and the router. When a `Python` op
@@ -8,7 +8,7 @@
 mod behaviour;
 
 use behaviour::{BehaviourContext, BehaviourHalted, json_to_py, py_to_json};
-use rango_core::{App, Manifest, RangoRequest, RangoResponse, PyBridge};
+use webcortex_core::{App, Manifest, WebCortexRequest, WebCortexResponse, PyBridge};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 /// resolves the pending Rust future.
 #[pyclass]
 struct Completer {
-    tx: Mutex<Option<tokio::sync::oneshot::Sender<Result<RangoResponse, String>>>>,
+    tx: Mutex<Option<tokio::sync::oneshot::Sender<Result<WebCortexResponse, String>>>>,
 }
 
 #[pymethods]
@@ -36,7 +36,7 @@ impl Completer {
         if let Some(extra) = headers {
             hs.extend(extra);
         }
-        self.send(Ok(RangoResponse {
+        self.send(Ok(WebCortexResponse {
             status,
             headers: hs,
             body: bytes::Bytes::copy_from_slice(body),
@@ -52,7 +52,7 @@ impl Completer {
 }
 
 impl Completer {
-    fn send(&self, value: Result<RangoResponse, String>) -> PyResult<()> {
+    fn send(&self, value: Result<WebCortexResponse, String>) -> PyResult<()> {
         let mut guard = self
             .tx
             .lock()
@@ -81,8 +81,8 @@ impl PyBridge for PythonBridge {
     fn call<'a>(
         &'a self,
         handler: u32,
-        req: RangoRequest,
-    ) -> futures::future::BoxFuture<'a, Result<RangoResponse, String>> {
+        req: WebCortexRequest,
+    ) -> futures::future::BoxFuture<'a, Result<WebCortexResponse, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         let submitted = Python::attach(|py| -> PyResult<()> {
@@ -113,9 +113,9 @@ impl PyBridge for PythonBridge {
     fn call_behaviour<'a>(
         &'a self,
         app: Arc<App>,
-        def: rango_core::manifest::BehaviourDef,
+        def: webcortex_core::manifest::BehaviourDef,
         input: serde_json::Value,
-        principal: rango_core::auth::Principal,
+        principal: webcortex_core::auth::Principal,
         depth: u32,
     ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -201,7 +201,7 @@ impl ValueCompleter {
     }
 }
 
-fn request_to_py<'py>(py: Python<'py>, req: &RangoRequest) -> PyResult<Bound<'py, PyDict>> {
+fn request_to_py<'py>(py: Python<'py>, req: &WebCortexRequest) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("method", &req.method)?;
     d.set_item("path", &req.path)?;
@@ -245,7 +245,7 @@ fn serve(py: Python<'_>, manifest_json: &str, dispatcher: Py<PyAny>, workers: us
     let manifest: Manifest = serde_json::from_str(manifest_json)
         .map_err(|e| PyValueError::new_err(format!("invalid manifest: {e}")))?;
 
-    rango_core::init_tracing("info");
+    webcortex_core::init_tracing("info");
 
     let bridge = Arc::new(PythonBridge { dispatcher, workers });
 
@@ -261,7 +261,7 @@ fn serve(py: Python<'_>, manifest_json: &str, dispatcher: Py<PyAny>, workers: us
                 .map_err(PyRuntimeError::new_err)?;
             // `into_arc` rather than `Arc::new`: behaviours need the App's own
             // Arc in order to call tools.
-            rango_core::server::serve(app.into_arc())
+            webcortex_core::server::serve(app.into_arc())
                 .await
                 .map_err(PyRuntimeError::new_err)
         })
@@ -269,7 +269,7 @@ fn serve(py: Python<'_>, manifest_json: &str, dispatcher: Py<PyAny>, workers: us
 }
 
 /// Validate a manifest and return the derived route/tool table without binding
-/// a socket. Used by `rango check` and by tests.
+/// a socket. Used by `webcortex check` and by tests.
 #[pyfunction]
 fn inspect_manifest(manifest_json: &str) -> PyResult<String> {
     let manifest: Manifest = serde_json::from_str(manifest_json)
@@ -282,12 +282,12 @@ fn inspect_manifest(manifest_json: &str) -> PyResult<String> {
         "name": manifest.name,
         "routes": manifest.routes.len(),
         "native_routes": manifest.routes.iter()
-            .filter(|r| !matches!(r.op, rango_core::manifest::Op::Python { .. }))
+            .filter(|r| !matches!(r.op, webcortex_core::manifest::Op::Python { .. }))
             .count(),
         "tools": manifest.routes.iter().filter(|r| r.tool.expose)
             .map(|r| r.tool_name()).collect::<Vec<_>>(),
         "agents": manifest.agents.iter().map(|a| &a.name).collect::<Vec<_>>(),
-        "openapi": rango_core::openapi::generate(&manifest),
+        "openapi": webcortex_core::openapi::generate(&manifest),
     });
     Ok(report.to_string())
 }
@@ -297,7 +297,7 @@ fn inspect_manifest(manifest_json: &str) -> PyResult<String> {
 fn openapi_for(manifest_json: &str) -> PyResult<String> {
     let manifest: Manifest = serde_json::from_str(manifest_json)
         .map_err(|e| PyValueError::new_err(format!("invalid manifest: {e}")))?;
-    Ok(rango_core::openapi::generate(&manifest).to_string())
+    Ok(webcortex_core::openapi::generate(&manifest).to_string())
 }
 
 /// Generate a dependency-free typed TypeScript client.
@@ -308,13 +308,13 @@ fn typescript_client(manifest_json: &str) -> PyResult<String> {
     manifest
         .validate()
         .map_err(|e| PyValueError::new_err(format!("invalid application: {e}")))?;
-    Ok(rango_core::typegen::generate(&manifest))
+    Ok(webcortex_core::typegen::generate(&manifest))
 }
 
 /// Mint an API key suitable for handing to a client.
 #[pyfunction]
 fn generate_api_key() -> String {
-    rango_core::auth::generate_api_key()
+    webcortex_core::auth::generate_api_key()
 }
 
 // `gil_used = false` marks this extension as free-threading compatible, which is

@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import pytest
 
-from rango import Rango
+from webcortex import WebCortex
 
 
-def make_app(**kw) -> Rango:
-    return Rango("t", database="sqlite://:memory:", **kw)
+def make_app(**kw) -> WebCortex:
+    return WebCortex("t", database="sqlite://:memory:", **kw)
 
 
 def test_resource_generates_five_routes_and_five_tools():
@@ -111,13 +111,13 @@ def test_two_routes_cannot_claim_the_same_tool_name():
 
 
 def test_query_route_without_a_database_is_rejected():
-    app = Rango("t")  # no database
+    app = WebCortex("t")  # no database
     with pytest.raises(ValueError, match="database"):
         app.query("GET", "/x", "SELECT 1")
 
 
 def test_resource_without_a_database_is_rejected():
-    app = Rango("t")
+    app = WebCortex("t")
     with pytest.raises(ValueError, match="database"):
         app.resource("books", fields={"id": int})
 
@@ -154,9 +154,9 @@ def test_openapi_documents_which_engine_serves_each_route():
 
     spec = app.openapi()
     assert spec["openapi"] == "3.1.0"
-    assert spec["paths"]["/books"]["get"]["x-rango-op"] == "query"
-    assert spec["paths"]["/custom"]["get"]["x-rango-op"] == "python"
-    assert spec["x-rango"]["mcp_endpoint"] == "/_rango/mcp"
+    assert spec["paths"]["/books"]["get"]["x-webcortex-op"] == "query"
+    assert spec["paths"]["/custom"]["get"]["x-webcortex-op"] == "python"
+    assert spec["x-webcortex"]["mcp_endpoint"] == "/_webcortex/mcp"
 
 
 def test_openapi_strips_path_params_from_the_request_body():

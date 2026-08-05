@@ -10,7 +10,7 @@
 //! Data comes from one of three declared sources — constant, SQL, or a Python
 //! handler returning a dict — resolved *before* rendering begins.
 
-use crate::http::RangoResponse;
+use crate::http::WebCortexResponse;
 use crate::manifest::TemplateConfig;
 use minijinja::Environment;
 use serde_json::Value;
@@ -61,17 +61,17 @@ impl Templates {
         Ok(())
     }
 
-    pub fn render(&self, name: &str, context: &Value, status: u16) -> RangoResponse {
+    pub fn render(&self, name: &str, context: &Value, status: u16) -> WebCortexResponse {
         let tmpl = match self.env.get_template(name) {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(template = %name, error = %e, "template not found");
-                return RangoResponse::error(500, format!("template {name:?} is unavailable"));
+                return WebCortexResponse::error(500, format!("template {name:?} is unavailable"));
             }
         };
 
         match tmpl.render(context) {
-            Ok(html) => RangoResponse {
+            Ok(html) => WebCortexResponse {
                 status,
                 headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
                 body: bytes::Bytes::from(html),
@@ -80,7 +80,7 @@ impl Templates {
                 // Template errors carry source snippets; those belong in the log,
                 // never in a response body where they leak app internals.
                 tracing::error!(template = %name, error = %e, "template render failed");
-                RangoResponse::error(500, format!("failed to render {name:?}"))
+                WebCortexResponse::error(500, format!("failed to render {name:?}"))
             }
         }
     }
@@ -126,7 +126,7 @@ mod tests {
         impl TempDirLike {
             pub fn new() -> Self {
                 let base = std::env::temp_dir().join(format!(
-                    "rango-tmpl-{}",
+                    "webcortex-tmpl-{}",
                     uuid::Uuid::new_v4()
                 ));
                 std::fs::create_dir_all(&base).expect("create temp dir");

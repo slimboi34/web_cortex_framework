@@ -1,16 +1,16 @@
-"""A complete Rango application, exercising every subsystem.
+"""A complete WebCortex application, exercising every subsystem.
 
-    export RANGO_API_KEY=$(rango keygen)
-    rango dev examples/hello/api.py
+    export WEBCORTEX_API_KEY=$(webcortex keygen)
+    webcortex dev examples/hello/api.py
 
-Then point any MCP client at http://127.0.0.1:8000/_rango/mcp
+Then point any MCP client at http://127.0.0.1:8000/_webcortex/mcp
 """
 
 from dataclasses import dataclass
 
-from rango import HTTPError, Rango
+from webcortex import HTTPError, WebCortex
 
-app = Rango(
+app = WebCortex(
     "bookstore",
     description="A bookstore that is also an MCP server.",
     database="sqlite://./bookstore.db",
@@ -21,7 +21,7 @@ app = Rango(
 # 1. Security, declared first because everything below inherits from it.
 # ---------------------------------------------------------------------------
 
-app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
+app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write", "webcortex:admin"])
 app.rate_limit(per_second=50, burst=100)
 app.cors("http://localhost:3000")
 
