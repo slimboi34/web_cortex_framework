@@ -1,4 +1,4 @@
-# Pylon — design and feasibility
+# Rango — design and feasibility
 
 This document is the honest version. It states the bet, reports what has been
 measured rather than hoped for, and grades every remaining piece by risk. Where
@@ -13,7 +13,7 @@ Django's execution model assumes the client is a browser and the server is a
 single interpreted process. Both assumptions are now shaky. The client is
 increasingly a model, and CPython since 3.13 can run without a GIL.
 
-Pylon's bet is one sentence:
+Rango's bet is one sentence:
 
 > **Most of a web API is declarative, and declarative things can be executed by
 > Rust and read by agents.**
@@ -22,7 +22,7 @@ Two consequences follow, and they are the entire architecture.
 
 **Consequence A — the boundary moves.** Existing Rust-accelerated Python servers
 (Granian, Robyn, Socketify) put Rust at the socket and call Python once per
-request. The handler is still interpreted, so the ceiling is Python's. Pylon
+request. The handler is still interpreted, so the ceiling is Python's. Rango
 instead treats Python as a *build-time* declaration language that emits a
 manifest; Rust compiles that manifest into a router and a set of executable ops.
 A route that is a query, a proxy, a static response, or an agent invocation is
@@ -30,7 +30,7 @@ executed entirely in Rust and never enters the interpreter at request time.
 
 **Consequence B — the tool surface is not a separate artifact.** Every framework
 bolting MCP onto an existing app maintains two descriptions of the same
-endpoint: the route, and the tool. They drift. In Pylon the route *is* the tool.
+endpoint: the route, and the tool. They drift. In Rango the route *is* the tool.
 `tools/list` is a projection of the route table, and a tool call re-enters the
 same dispatcher an HTTP request would, in-process.
 
@@ -76,7 +76,7 @@ clean:
 **Developer surface**
 - OpenAPI 3.1, MCP (`initialize`, `tools/list`, `tools/call`, batching,
   notifications), TypeScript client generation
-- `pylon` CLI: `new`, `dev`, `run`, `check`, `security`, `openapi`, `tools`,
+- `rango` CLI: `new`, `dev`, `run`, `check`, `security`, `openapi`, `tools`,
   `typegen`, `sql`, `keygen`
 
 ### Measured numbers
@@ -172,14 +172,14 @@ The cost is ecosystem maturity: any C extension without free-threading support
 will either fail to import or silently re-enable the GIL. Pure-Python and
 Rust-backed packages are fine; the long tail of older C extensions is not.
 
-**Mitigation, and it matters:** Pylon runs correctly on a GIL build. The
+**Mitigation, and it matters:** Rango runs correctly on a GIL build. The
 dispatcher checks `sys._is_gil_enabled()`, sizes its pools accordingly, and
 prints which mode it is in at startup. Free-threading is the fast path, not a
 hard requirement — so adoption is never blocked on a dependency.
 
 ---
 
-## 5. What Pylon should deliberately not build
+## 5. What Rango should deliberately not build
 
 Scope discipline is the difference between this shipping and this becoming
 another abandoned framework.
@@ -187,7 +187,7 @@ another abandoned framework.
 **Do not build an ORM.** This is the single biggest trap. SQLAlchemy is
 twenty years of accumulated correctness around identity maps, lazy loading, and
 transaction boundaries. Competing with it is a multi-year project that is
-orthogonal to everything interesting here. Pylon's `Query` op is deliberately
+orthogonal to everything interesting here. Rango's `Query` op is deliberately
 *not* an ORM — it is a way to bind a route to SQL so Rust can execute it. When a
 developer needs real object mapping, they should use SQLAlchemy inside a Python
 handler. The framework's value is the routing, tool, and agent layer.
@@ -231,7 +231,7 @@ Ordered by what unblocks the most.
 
 **v0.5 — operational depth**
 9. Local model *supervision* (sidecar process management + routing).
-10. `pylon.toml` for environment/deploy configuration.
+10. `rango.toml` for environment/deploy configuration.
 11. A real load benchmark against Django and FastAPI (see §2).
 
 **Later, if warranted**
@@ -251,7 +251,7 @@ but each nested invocation received a fresh budget — so recursion was unbounde
 even though every individual frame was capped. The lesson generalises: a
 per-invocation limit is not a per-request limit, and anything that can re-enter
 the dispatcher needs a counter that travels *with the request* rather than with
-the frame. `PylonRequest.depth` is that counter.
+the frame. `RangoRequest.depth` is that counter.
 
 **A panic was indistinguishable from a network fault.** A dependency panicking
 in the auth path severed the connection with no status line. The framework had

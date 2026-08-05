@@ -1,4 +1,4 @@
-"""Project starters for `pylon new`.
+"""Project starters for `rango new`.
 
 Three shapes, because they are genuinely different applications rather than the
 same one with features toggled:
@@ -25,8 +25,8 @@ client/
 
 ENV_EXAMPLE = """\
 # Copy to .env and fill in. Never commit the real file.
-PYLON_API_KEY=replace-me-run-pylon-keygen
-PYLON_JWT_SECRET=replace-me-at-least-32-bytes-long-abcdefgh
+RANGO_API_KEY=replace-me-run-rango-keygen
+RANGO_JWT_SECRET=replace-me-at-least-32-bytes-long-abcdefgh
 # Needed only for the agent starter.
 # ANTHROPIC_API_KEY=sk-ant-...
 """
@@ -34,35 +34,35 @@ PYLON_JWT_SECRET=replace-me-at-least-32-bytes-long-abcdefgh
 README = """\
 # {name}
 
-Built with [Pylon](https://github.com/slimboi34/pylon).
+Built with [Rango](https://github.com/slimboi34/rango).
 
 ## Run
 
 ```bash
-export PYLON_API_KEY=$(pylon keygen)
-pylon dev
+export RANGO_API_KEY=$(rango keygen)
+rango dev
 ```
 
 - API: http://127.0.0.1:8000
-- OpenAPI: http://127.0.0.1:8000/_pylon/openapi.json
-- MCP endpoint: http://127.0.0.1:8000/_pylon/mcp
+- OpenAPI: http://127.0.0.1:8000/_rango/openapi.json
+- MCP endpoint: http://127.0.0.1:8000/_rango/mcp
 
 ## Inspect
 
 ```bash
-pylon check      # routes, tools, and the public attack surface
-pylon security   # what is reachable without a credential
-pylon tools      # the agent tool manifest
-pylon typegen    # generate client/api.ts
+rango check      # routes, tools, and the public attack surface
+rango security   # what is reachable without a credential
+rango tools      # the agent tool manifest
+rango typegen    # generate client/api.ts
 ```
 """
 
 API = '''\
 """{name} — a JSON API that is also an MCP server."""
 
-from pylon import HTTPError, Pylon
+from rango import HTTPError, Rango
 
-app = Pylon(
+app = Rango(
     "{name}",
     description="{description}",
     database="sqlite://./{name}.db",
@@ -72,7 +72,7 @@ app = Pylon(
 # Configured up front deliberately: everything below is deny-by-default, and
 # opening a route up is an explicit act.
 
-app.api_key("PYLON_API_KEY", id="service", scopes=["read", "write", "pylon:admin"])
+app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
 app.rate_limit(per_second=50, burst=100)
 
 # Reads are public; writes require the "write" scope.
@@ -105,16 +105,16 @@ def summarize(id: int, style: str = "short") -> dict:
 FULLSTACK_API = '''\
 """{name} — API, server-rendered pages, and an MCP tool surface."""
 
-from pylon import HTTPError, Pylon
+from rango import HTTPError, Rango
 
-app = Pylon(
+app = Rango(
     "{name}",
     description="{description}",
     database="sqlite://./{name}.db",
     templates="templates",
 )
 
-app.api_key("PYLON_API_KEY", id="service", scopes=["read", "write", "pylon:admin"])
+app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
 app.rate_limit(per_second=50, burst=100)
 app.anonymous_scopes("read")
 
@@ -161,19 +161,19 @@ def summarize(id: int, style: str = "short") -> dict:
 AGENT_API = '''\
 """{name} — an agent-native application.
 
-Shows the three things that make Pylon agents safe to point at production:
+Shows the three things that make Rango agents safe to point at production:
 delegated authority, runtime-enforced budgets, and human approval gates.
 """
 
-from pylon import HTTPError, Pylon
+from rango import HTTPError, Rango
 
-app = Pylon(
+app = Rango(
     "{name}",
     description="{description}",
     database="sqlite://./{name}.db",
 )
 
-app.api_key("PYLON_API_KEY", id="service", scopes=["read", "write", "pylon:admin"])
+app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
 app.rate_limit(per_second=50, burst=100)
 app.anonymous_scopes("read")
 
@@ -236,7 +236,7 @@ INDEX_HTML = """\
   {% else %}
     <p class="empty">No items yet. Create one:</p>
     <pre>curl -X POST localhost:8000/items \\
-  -H 'x-api-key: $PYLON_API_KEY' \\
+  -H 'x-api-key: $RANGO_API_KEY' \\
   -H 'content-type: application/json' \\
   -d '{"name":"First","note":"hello"}'</pre>
   {% endif %}
@@ -249,7 +249,7 @@ BASE_HTML = """\
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{% block title %}Pylon{% endblock %}</title>
+    <title>{% block title %}Rango{% endblock %}</title>
     <link rel="stylesheet" href="/assets/style.css" />
   </head>
   <body>
@@ -355,15 +355,15 @@ procedure with deterministic structure and probabilistic steps, rather than a
 probabilistic procedure.
 """
 
-from pylon import Pylon
+from rango import Rango
 
-app = Pylon(
+app = Rango(
     "{name}",
     description="{description}",
     database="sqlite://./{name}.db",
 )
 
-app.api_key("PYLON_API_KEY", id="service", scopes=["read", "write", "pylon:admin"])
+app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
 app.rate_limit(per_second=50, burst=100)
 app.anonymous_scopes("read")
 

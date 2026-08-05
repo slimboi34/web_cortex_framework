@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from pylon import Pylon
-from pylon import starters
+from rango import Rango
+from rango import starters
 
 
 # ---------------------------------------------------------------- starters
@@ -31,9 +31,9 @@ def test_every_starter_produces_a_valid_app(template, tmp_path, monkeypatch):
         path.write_text(contents)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PYLON_API_KEY", "test-key-abcdefghijklmnop")
+    monkeypatch.setenv("RANGO_API_KEY", "test-key-abcdefghijklmnop")
 
-    from pylon.cli import _load_app
+    from rango.cli import _load_app
 
     app = _load_app("api.py")
     report = app.check()  # raises if the manifest is invalid
@@ -51,9 +51,9 @@ def test_every_starter_is_secure_by_default(template, tmp_path, monkeypatch):
         path.write_text(contents)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PYLON_API_KEY", "test-key-abcdefghijklmnop")
+    monkeypatch.setenv("RANGO_API_KEY", "test-key-abcdefghijklmnop")
 
-    from pylon.cli import _load_app
+    from rango.cli import _load_app
 
     report = _load_app("api.py").security_report()
     assert report["auth_configured"] is True
@@ -74,20 +74,20 @@ def test_unknown_starter_is_rejected():
 
 
 def test_typescript_client_covers_every_api_route():
-    app = Pylon("t", database="sqlite://:memory:")
+    app = Rango("t", database="sqlite://:memory:")
     app.resource("books", fields={"id": int, "title": str}, tools=True)
 
     ts = app.typescript_client()
     for method in ("listBooks", "getBooks", "createBooks", "updateBooks", "deleteBooks"):
         assert f"{method}(" in ts, f"missing {method}:\n{ts[:500]}"
-    assert "export class PylonClient" in ts
+    assert "export class RangoClient" in ts
     assert "x-api-key" in ts, "the client must be able to authenticate"
 
 
 def test_typescript_client_omits_pages_and_static(tmp_path):
     (tmp_path / "home.html").write_text("<h1>hi</h1>")
     (tmp_path / "assets").mkdir()
-    app = Pylon("t", templates=str(tmp_path))
+    app = Rango("t", templates=str(tmp_path))
     app.page("/home", "home.html")
     app.static_files("/assets", str(tmp_path / "assets"))
     app.static("GET", "/api/thing", {"ok": True})
@@ -100,7 +100,7 @@ def test_typescript_client_omits_pages_and_static(tmp_path):
 
 def test_typescript_signatures_never_wrap():
     """Multi-line types spliced into a signature produce invalid TypeScript."""
-    app = Pylon("t", database="sqlite://:memory:")
+    app = Rango("t", database="sqlite://:memory:")
     app.resource("books", fields={"id": int, "title": str, "author": str})
     ts = app.typescript_client()
     for line in ts.splitlines():
@@ -114,9 +114,9 @@ def test_typescript_signatures_never_wrap():
 
 
 APP = '''
-from pylon import Pylon
+from rango import Rango
 
-app = Pylon("fs", database="sqlite://./fs.db", templates="templates", port={port})
+app = Rango("fs", database="sqlite://./fs.db", templates="templates", port={port})
 
 app.resource("items", fields={{"id": int, "name": str}}, tools=True)
 
@@ -147,7 +147,7 @@ def _free_port() -> int:
 @pytest.fixture(scope="module")
 def page_server():
     port = _free_port()
-    workdir = Path(tempfile.mkdtemp(prefix="pylon-fs-"))
+    workdir = Path(tempfile.mkdtemp(prefix="rango-fs-"))
     (workdir / "templates").mkdir()
     (workdir / "static").mkdir()
     (workdir / "api.py").write_text(APP.format(port=port))
@@ -158,10 +158,10 @@ def page_server():
     (workdir / "static/.secret").write_text("do not serve me")
     log_path = workdir / "server.log"
 
-    env = {**os.environ, "PYLON_LOG": "warn"}
+    env = {**os.environ, "RANGO_LOG": "warn"}
     with log_path.open("w") as log:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "pylon.cli", "run", "api.py"],
+            [sys.executable, "-m", "rango.cli", "run", "api.py"],
             cwd=workdir, stdout=log, stderr=subprocess.STDOUT, env=env,
         )
 
@@ -171,7 +171,7 @@ def page_server():
         if proc.poll() is not None:
             pytest.fail(f"server exited early:\n{log_path.read_text()}")
         try:
-            with urllib.request.urlopen(base + "/_pylon/health", timeout=1):
+            with urllib.request.urlopen(base + "/_rango/health", timeout=1):
                 break
         except Exception:
             time.sleep(0.1)
@@ -259,7 +259,7 @@ def test_static_traversal_is_blocked(page_server):
 
 
 def test_pages_are_absent_from_the_openapi_document(page_server):
-    _, body, _ = fetch(page_server, "/_pylon/openapi.json")
+    _, body, _ = fetch(page_server, "/_rango/openapi.json")
     spec = json.loads(body)
     assert "/about" not in spec["paths"]
     assert "/items" in spec["paths"]

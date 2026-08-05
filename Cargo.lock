@@ -1429,51 +1429,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pylon-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "base64 0.23.1",
- "bytes",
- "futures",
- "hmac 0.13.0",
- "http-body-util",
- "hyper",
- "hyper-util",
- "jsonwebtoken",
- "matchit",
- "mime_guess",
- "minijinja",
- "pin-project-lite",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "sqlx",
- "subtle",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "pylon-py"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures",
- "pylon-core",
- "pyo3",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "pyo3"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1655,6 +1610,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rango-core"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "hmac 0.13.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "jsonwebtoken",
+ "matchit",
+ "mime_guess",
+ "minijinja",
+ "pin-project-lite",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "rango-py"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "pyo3",
+ "rango-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

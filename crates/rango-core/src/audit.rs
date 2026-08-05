@@ -131,7 +131,7 @@ pub struct TracingAudit;
 impl AuditSink for TracingAudit {
     fn record(&self, event: AuditEvent) {
         tracing::info!(
-            target: "pylon::audit",
+            target: "rango::audit",
             kind = %event.kind,
             run_id = %event.run_id,
             actor = event.actor.as_deref().unwrap_or("-"),
@@ -143,7 +143,7 @@ impl AuditSink for TracingAudit {
 }
 
 /// Keeps a bounded in-memory ring, in addition to logging. Powers
-/// `GET /_pylon/audit` so an operator can see agent activity without shipping
+/// `GET /_rango/audit` so an operator can see agent activity without shipping
 /// logs anywhere first.
 pub struct MemoryAudit {
     events: Mutex<std::collections::VecDeque<AuditEvent>>,

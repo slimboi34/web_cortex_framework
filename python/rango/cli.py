@@ -1,4 +1,4 @@
-"""The `pylon` command line.
+"""The `rango` command line.
 
 Convention over configuration: every command defaults to `api.py` in the current
 directory and expects it to define `app`.
@@ -37,7 +37,7 @@ def _load_app(target: str) -> Any:
             sys.path.insert(0, directory)
         spec = importlib.util.spec_from_file_location(path.stem, path)
         if spec is None or spec.loader is None:
-            raise SystemExit(f"pylon: cannot load {path}")
+            raise SystemExit(f"rango: cannot load {path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[path.stem] = module
         spec.loader.exec_module(module)
@@ -46,8 +46,8 @@ def _load_app(target: str) -> Any:
 
     if not hasattr(module, attr):
         raise SystemExit(
-            f"pylon: {module_part} does not define {attr!r}. "
-            f"Define `{attr} = Pylon(...)` or pass module:name."
+            f"rango: {module_part} does not define {attr!r}. "
+            f"Define `{attr} = Rango(...)` or pass module:name."
         )
     return getattr(module, attr)
 
@@ -72,7 +72,7 @@ def _banner(app: Any) -> None:
     security = app.security_report()
     gil = "free-threaded" if free_threaded() else "GIL-enabled"
 
-    print(f"  pylon {app.version}  ·  {app.name}")
+    print(f"  rango {app.version}  ·  {app.name}")
     print(f"  python {sys.version.split()[0]} ({gil})")
     print(f"  {report['routes']} routes, {report['native_routes']} served without touching Python")
 
@@ -100,7 +100,7 @@ def _banner(app: Any) -> None:
     # unintentionally public route is the failure that actually happens.
     if security["auth_configured"] and security["public_routes"]:
         print(f"  ⚠ {len(security['public_routes'])} route(s) need no credential "
-              f"(run `pylon security` to list them)")
+              f"(run `rango security` to list them)")
     if security["gated_tools"]:
         print(f"  approval-gated tools: {', '.join(security['gated_tools'])}")
 
@@ -115,12 +115,12 @@ def _cmd_new(args: argparse.Namespace) -> int:
     name = args.name
     target = Path(args.directory or name)
     if target.exists() and any(target.iterdir()):
-        raise SystemExit(f"pylon: {target}/ already exists and is not empty")
+        raise SystemExit(f"rango: {target}/ already exists and is not empty")
 
     try:
-        files = starters.files_for(args.template, name, args.description or f"A Pylon app: {name}")
+        files = starters.files_for(args.template, name, args.description or f"A Rango app: {name}")
     except ValueError as e:
-        raise SystemExit(f"pylon: {e}")
+        raise SystemExit(f"rango: {e}")
 
     for relative, contents in files.items():
         path = target / relative
@@ -133,14 +133,14 @@ def _cmd_new(args: argparse.Namespace) -> int:
     print(
         f"\nNext:\n"
         f"  cd {target}\n"
-        f"  export PYLON_API_KEY=$(pylon keygen)\n"
-        f"  pylon dev\n"
+        f"  export RANGO_API_KEY=$(rango keygen)\n"
+        f"  rango dev\n"
     )
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="pylon", description=__doc__)
+    parser = argparse.ArgumentParser(prog="rango", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
     new = sub.add_parser("new", help="scaffold a new project")
@@ -198,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.workers:
             app.workers = args.workers
         if args.command == "dev":
-            os.environ.setdefault("PYLON_LOG", "info")
+            os.environ.setdefault("RANGO_LOG", "info")
         _banner(app)
         app.run()
         return 0
@@ -219,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         if not s["auth_configured"]:
             print(
                 "\n⚠ No authentication is configured. Every route is public.\n"
-                "  Add: app.api_key('PYLON_API_KEY', id='service', scopes=['read'])",
+                "  Add: app.api_key('RANGO_API_KEY', id='service', scopes=['read'])",
                 file=sys.stderr,
             )
         return 0
@@ -230,13 +230,13 @@ def main(argv: list[str] | None = None) -> int:
         out = []
         for path, methods in spec["paths"].items():
             for method, op in methods.items():
-                if op.get("x-pylon-tool"):
+                if op.get("x-rango-tool"):
                     out.append({
                         "name": op["operationId"],
                         "method": method.upper(),
                         "path": path,
                         "description": op.get("description") or op.get("summary"),
-                        "executed_by": op.get("x-pylon-op"),
+                        "executed_by": op.get("x-rango-op"),
                     })
         print(json.dumps({"tools": out, "agents": report["agents"]}, indent=2))
         return 0

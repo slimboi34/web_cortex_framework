@@ -20,11 +20,11 @@
 //! runtime without the reentrancy panic that calling it from inside a tokio
 //! worker would cause.
 
-use pylon_core::agent::provider::ModelProvider;
-use pylon_core::agent::{Conversation, Message, ToolSpec};
-use pylon_core::auth::Principal;
-use pylon_core::manifest::AgentDef;
-use pylon_core::App;
+use rango_core::agent::provider::ModelProvider;
+use rango_core::agent::{Conversation, Message, ToolSpec};
+use rango_core::auth::Principal;
+use rango_core::manifest::AgentDef;
+use rango_core::App;
 use pyo3::exceptions::{PyPermissionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -183,7 +183,7 @@ impl BehaviourContext {
         // An approval gate must stop a behaviour just as it stops an agent,
         // otherwise wrapping a gated tool in a behaviour would launder it.
         if let Some(route) = self.app.route_for_tool(tool) {
-            if route.approval == pylon_core::manifest::Approval::Required {
+            if route.approval == rango_core::manifest::Approval::Required {
                 return Err(BehaviourHalted::new_err(format!(
                     "tool {tool:?} requires human approval and cannot run unattended \
                      inside a behaviour"
@@ -353,7 +353,7 @@ impl BehaviourContext {
     /// Emit a line into the behaviour's trace and the server log.
     fn log(&self, message: &str) {
         tracing::info!(
-            target: "pylon::behaviour",
+            target: "rango::behaviour",
             run_id = %self.run_id,
             behaviour = %self.behaviour,
             "{message}"

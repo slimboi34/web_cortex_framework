@@ -8,13 +8,13 @@
 
 use crate::app::App;
 use crate::auth::Principal;
-use crate::http::PylonResponse;
+use crate::http::RangoResponse;
 use serde_json::{Value, json};
 
 /// The MCP revision this server implements.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
-pub async fn handle(app: &App, body: &[u8], caller: &Principal) -> PylonResponse {
+pub async fn handle(app: &App, body: &[u8], caller: &Principal) -> RangoResponse {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -66,7 +66,7 @@ async fn handle_one(app: &App, req: Value, caller: &Principal) -> Option<Value> 
                 "version": app.manifest.version,
             },
             "instructions": if app.manifest.description.is_empty() {
-                format!("Tools exposed by the {} Pylon application.", app.manifest.name)
+                format!("Tools exposed by the {} Rango application.", app.manifest.name)
             } else {
                 app.manifest.description.clone()
             },
@@ -171,12 +171,12 @@ fn error_obj(id: Value, code: i64, message: String) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-fn jsonrpc_response(value: Value) -> PylonResponse {
-    PylonResponse::json(200, &value)
+fn jsonrpc_response(value: Value) -> RangoResponse {
+    RangoResponse::json(200, &value)
 }
 
-fn accepted() -> PylonResponse {
-    PylonResponse {
+fn accepted() -> RangoResponse {
+    RangoResponse {
         status: 202,
         headers: vec![],
         body: bytes::Bytes::new(),

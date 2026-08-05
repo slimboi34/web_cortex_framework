@@ -325,7 +325,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Generate an API key suitable for handing to a client. Used by `pylon keygen`.
+/// Generate an API key suitable for handing to a client. Used by `rango keygen`.
 pub fn generate_api_key() -> String {
     let raw = uuid::Uuid::new_v4();
     let second = uuid::Uuid::new_v4();
@@ -333,7 +333,7 @@ pub fn generate_api_key() -> String {
     bytes.extend_from_slice(raw.as_bytes());
     bytes.extend_from_slice(second.as_bytes());
     format!(
-        "pyl_{}",
+        "rng_{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     )
 }
@@ -390,7 +390,7 @@ mod tests {
     fn generated_keys_are_prefixed_and_unique() {
         let a = generate_api_key();
         let b = generate_api_key();
-        assert!(a.starts_with("pyl_") && a.len() > 40);
+        assert!(a.starts_with("rng_") && a.len() > 40);
         assert_ne!(a, b);
     }
 }

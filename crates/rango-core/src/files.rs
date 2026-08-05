@@ -4,7 +4,7 @@
 //! that turns a request string into a filesystem path, and it is the single most
 //! commonly exploited feature in any web framework.
 
-use crate::http::PylonResponse;
+use crate::http::RangoResponse;
 use std::path::{Component, Path, PathBuf};
 
 pub struct FileServer {
@@ -23,17 +23,17 @@ impl FileServer {
         Ok(Self { root, index, cache_secs })
     }
 
-    pub fn serve(&self, relative: &str, if_none_match: Option<&str>) -> PylonResponse {
+    pub fn serve(&self, relative: &str, if_none_match: Option<&str>) -> RangoResponse {
         let Some(safe) = self.resolve(relative) else {
             // Deliberately 404, not 403: a traversal attempt should learn
             // nothing about what does or does not exist outside the root.
-            return PylonResponse::error(404, "not found");
+            return RangoResponse::error(404, "not found");
         };
 
         let target = if safe.is_dir() {
             match &self.index {
                 Some(name) => safe.join(name),
-                None => return PylonResponse::error(404, "not found"),
+                None => return RangoResponse::error(404, "not found"),
             }
         } else {
             safe
@@ -41,12 +41,12 @@ impl FileServer {
 
         let bytes = match std::fs::read(&target) {
             Ok(b) => b,
-            Err(_) => return PylonResponse::error(404, "not found"),
+            Err(_) => return RangoResponse::error(404, "not found"),
         };
 
         let etag = weak_etag(&bytes);
         if if_none_match.is_some_and(|v| v == etag) {
-            return PylonResponse {
+            return RangoResponse {
                 status: 304,
                 headers: vec![("etag".into(), etag)],
                 body: bytes::Bytes::new(),
@@ -57,7 +57,7 @@ impl FileServer {
             .first_or_octet_stream()
             .to_string();
 
-        PylonResponse {
+        RangoResponse {
             status: 200,
             headers: vec![
                 ("content-type".into(), mime),
@@ -157,7 +157,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("pylon-files-{}", uuid::Uuid::new_v4()));
+            let dir = std::env::temp_dir().join(format!("rango-files-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(dir.join("sub")).expect("mkdir");
             std::fs::write(dir.join("index.html"), b"<h1>home</h1>").expect("write");
             std::fs::write(dir.join("app.js"), b"console.log(1)").expect("write");

@@ -1,16 +1,16 @@
-"""A complete Pylon application, exercising every subsystem.
+"""A complete Rango application, exercising every subsystem.
 
-    export PYLON_API_KEY=$(pylon keygen)
-    pylon dev examples/hello/api.py
+    export RANGO_API_KEY=$(rango keygen)
+    rango dev examples/hello/api.py
 
-Then point any MCP client at http://127.0.0.1:8000/_pylon/mcp
+Then point any MCP client at http://127.0.0.1:8000/_rango/mcp
 """
 
 from dataclasses import dataclass
 
-from pylon import HTTPError, Pylon
+from rango import HTTPError, Rango
 
-app = Pylon(
+app = Rango(
     "bookstore",
     description="A bookstore that is also an MCP server.",
     database="sqlite://./bookstore.db",
@@ -21,7 +21,7 @@ app = Pylon(
 # 1. Security, declared first because everything below inherits from it.
 # ---------------------------------------------------------------------------
 
-app.api_key("PYLON_API_KEY", id="service", scopes=["read", "write", "pylon:admin"])
+app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write", "rango:admin"])
 app.rate_limit(per_second=50, burst=100)
 app.cors("http://localhost:3000")
 

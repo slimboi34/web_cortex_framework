@@ -1,20 +1,25 @@
-# Pylon
+# Rango
+
+> **Status: pre-release.** Not yet published; build from source. Once released it
+> installs as **`rango-framework`** and imports as **`rango`** — the bare `rango`
+> name on PyPI is held by an unrelated, abandoned package, the same split as
+> `djangorestframework` → `import rest_framework`.
 
 A Python web framework with a Rust core, built on one idea:
 
 > **If you declared it, Rust can run it — and an agent can call it.**
 
 Django and Rails were designed when the only client was a browser. Today the
-client is just as likely to be a model. Pylon treats that as the primary case
+client is just as likely to be a model. Rango treats that as the primary case
 rather than something you bolt on with a second, hand-maintained tool server.
 
 ```python
 # api.py
-from pylon import Pylon
+from rango import Rango
 
-app = Pylon("bookstore", database="sqlite://./app.db")
+app = Rango("bookstore", database="sqlite://./app.db")
 
-app.api_key("PYLON_API_KEY", id="service", scopes=["read", "write"])
+app.api_key("RANGO_API_KEY", id="service", scopes=["read", "write"])
 app.rate_limit(per_second=50)
 app.anonymous_scopes("read")
 
@@ -33,7 +38,7 @@ def blurb(id: int) -> str:
 ```
 
 ```
-$ pylon dev
+$ rango dev
 ```
 
 You now have a REST API, an OpenAPI 3.1 document, **a live MCP server exposing
@@ -45,11 +50,14 @@ headers. No second file, no schema written twice, no drift.
 ## Start here
 
 ```bash
-pip install pylon              # or: uv pip install pylon
-pylon new myapp                # --template api | fullstack | agent | behaviour
+# Not yet on PyPI — see Status below. For now, build from source:
+git clone https://github.com/slimboi34/rango && cd rango
+uv venv --python 3.14 && uv pip install maturin && maturin develop --uv
+
+rango new myapp                # --template api | fullstack | agent | behaviour
 cd myapp
-export PYLON_API_KEY=$(pylon keygen)
-pylon dev
+export RANGO_API_KEY=$(rango keygen)
+rango dev
 ```
 
 ## Why a Rust core, specifically
@@ -57,14 +65,14 @@ pylon dev
 Most Rust-accelerated Python servers put Rust at the socket and call Python for
 every request. You get faster parsing; your handler is still interpreted.
 
-Pylon puts the boundary somewhere more useful. **Python is a declaration
+Rango puts the boundary somewhere more useful. **Python is a declaration
 language that compiles to a plan the Rust runtime executes.** A route whose work
 is expressible as data — a query, a proxy, a rendered page, a static file, an
 agent invocation — runs entirely in Rust and *never enters the interpreter at
 request time*. In practice that is most of a CRUD API.
 
 ```
-$ pylon check
+$ rango check
   12 routes, 9 served without touching Python
 ```
 
@@ -73,7 +81,7 @@ interpreter workers (CPython 3.13+/3.14, GIL disabled), each running its own
 event loop. Handlers run in real parallel — **measured at 4.82× vs 1.38× under
 the GIL** ([DESIGN.md](DESIGN.md) has the numbers and their caveats).
 
-Pylon runs correctly on a GIL build too, and tells you which mode it is in.
+Rango runs correctly on a GIL build too, and tells you which mode it is in.
 
 ## Behaviours
 
@@ -141,7 +149,7 @@ can call. Composition is just a tool call, so budgets and scopes still apply.
 - Scopes are delegated by intersection, never unioned.
 
 ```bash
-pylon new myapp --template behaviour
+rango new myapp --template behaviour
 ```
 
 ## The seven kinds of route
@@ -204,7 +212,7 @@ each provider call. A looping model costs a bounded amount.
 **Scope-filtered tool lists.** `tools/list` shows only what *that caller* can
 invoke. A reader sees three tools where an admin sees six.
 
-**A full audit trail**, including refused calls, at `GET /_pylon/audit`.
+**A full audit trail**, including refused calls, at `GET /_rango/audit`.
 
 ## Security defaults
 
@@ -215,10 +223,10 @@ Per-principal token-bucket rate limiting. Security headers on every response.
 CORS that refuses `*` with credentials *at boot*. Path traversal, symlink
 escapes, and dotfiles refused by the static server.
 
-`pylon security` prints exactly what is reachable without a credential:
+`rango security` prints exactly what is reachable without a credential:
 
 ```
-$ pylon security
+$ rango security
 {"auth_configured": true, "public_routes": ["GET /"], "gated_tools": ["DELETE /books/all"]}
 ```
 
@@ -241,7 +249,7 @@ Python handler. Autoescaping is on and derived from the file extension.
 **A typed TypeScript client** for SPA frontends, from the same route table:
 
 ```bash
-$ pylon typegen          # writes client/api.ts
+$ rango typegen          # writes client/api.ts
 ```
 
 Zero dependencies, `fetch`-based, with auth built in. Pages and static mounts
@@ -250,20 +258,20 @@ are excluded — they are not part of the JSON API surface.
 ## Commands
 
 ```
-pylon new <name>      scaffold a project (api | fullstack | agent | behaviour)
-pylon dev             run with a startup report
-pylon check           routes, tools, and the public attack surface
-pylon security        what is reachable without a credential
-pylon tools           the agent tool manifest
-pylon typegen         generate a typed TypeScript client
-pylon openapi         the OpenAPI 3.1 document
-pylon sql             DDL for declared resources
-pylon keygen          mint an API key
+rango new <name>      scaffold a project (api | fullstack | agent | behaviour)
+rango dev             run with a startup report
+rango check           routes, tools, and the public attack surface
+rango security        what is reachable without a credential
+rango tools           the agent tool manifest
+rango typegen         generate a typed TypeScript client
+rango openapi         the OpenAPI 3.1 document
+rango sql             DDL for declared resources
+rango keygen          mint an API key
 ```
 
 ## Security
 
-Pylon has been through an adversarial review of its own controls — auth,
+Rango has been through an adversarial review of its own controls — auth,
 authorization, injection, traversal, SSRF, exhaustion, disclosure — plus stress
 and soak testing. **Six issues were found and fixed**, each with a regression
 test in `tests/test_pentest.py`:

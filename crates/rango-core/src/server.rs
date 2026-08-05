@@ -14,7 +14,7 @@
 
 use crate::app::App;
 use crate::auth::Principal;
-use crate::http::{PylonRequest, PylonResponse, parse_query};
+use crate::http::{RangoRequest, RangoResponse, parse_query};
 use crate::{mcp, middleware, openapi};
 use bytes::Bytes;
 use futures::FutureExt;
@@ -65,7 +65,7 @@ where
         agents = app.manifest.agents.len(),
         python_workers = app.bridge().workers(),
         rate_limited = app.rate_limiter.is_some(),
-        "pylon listening"
+        "rango listening"
     );
 
     let tracker = Arc::new(tokio::sync::Semaphore::new(Semaphore::MAX_PERMITS));
@@ -181,7 +181,7 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
                 "request handler panicked; returning 500"
             );
             (
-                PylonResponse::error(500, "internal error"),
+                RangoResponse::error(500, "internal error"),
                 "panic".to_string(),
             )
         }
@@ -210,7 +210,7 @@ async fn route_request(
     req: Request<Incoming>,
     client_ip: &str,
     request_id: &str,
-) -> (PylonResponse, String) {
+) -> (RangoResponse, String) {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
@@ -228,11 +228,11 @@ async fn route_request(
     if method == "OPTIONS" && app.manifest.cors.enabled {
         if let Some(cors_headers) = app.cors.preflight(origin.as_deref()) {
             return (
-                PylonResponse { status: 204, headers: cors_headers, body: Bytes::new() },
+                RangoResponse { status: 204, headers: cors_headers, body: Bytes::new() },
                 "-".into(),
             );
         }
-        return (PylonResponse::error(403, "origin not allowed"), "-".into());
+        return (RangoResponse::error(403, "origin not allowed"), "-".into());
     }
 
     // 2. Authenticate. Done before rate limiting is *keyed*, but the limiter
@@ -240,10 +240,10 @@ async fn route_request(
     let principal = match app.authenticator.authenticate(&headers) {
         Ok(p) => p,
         Err(e) => {
-            let mut res = PylonResponse::error(e.status(), e.message());
+            let mut res = RangoResponse::error(e.status(), e.message());
             res.headers.push((
                 "www-authenticate".into(),
-                "Bearer realm=\"pylon\"".into(),
+                "Bearer realm=\"rango\"".into(),
             ));
             finish_cors(app, &mut res, origin.as_deref());
             return (res, "invalid".into());
@@ -261,7 +261,7 @@ async fn route_request(
         };
         let decision = limiter.check(&key);
         if !decision.allowed {
-            let mut res = PylonResponse::error(429, "rate limit exceeded");
+            let mut res = RangoResponse::error(429, "rate limit exceeded");
             res.headers.push(("retry-after".into(), decision.retry_after_secs.to_string()));
             res.headers.push(("x-ratelimit-limit".into(), decision.limit.to_string()));
             res.headers.push(("x-ratelimit-remaining".into(), "0".into()));
@@ -283,7 +283,7 @@ async fn route_request(
         control_plane(app, &method, rest, &body, &principal, request_id).await
     } else {
         let timeout = std::time::Duration::from_secs(app.manifest.server.request_timeout_secs);
-        let dispatch = app.dispatch(PylonRequest {
+        let dispatch = app.dispatch(RangoRequest {
             method,
             path,
             path_params: Default::default(),
@@ -297,7 +297,7 @@ async fn route_request(
         // A handler that hangs must not hold a connection forever.
         match tokio::time::timeout(timeout, dispatch).await {
             Ok(r) => r,
-            Err(_) => PylonResponse::error(504, "handler exceeded the request timeout"),
+            Err(_) => RangoResponse::error(504, "handler exceeded the request timeout"),
         }
     };
 
@@ -305,7 +305,7 @@ async fn route_request(
     (res, principal_id)
 }
 
-fn finish_cors(app: &Arc<App>, res: &mut PylonResponse, origin: Option<&str>) {
+fn finish_cors(app: &Arc<App>, res: &mut RangoResponse, origin: Option<&str>) {
     if app.manifest.cors.enabled {
         for h in app.cors.headers_for(origin) {
             res.headers.push(h);
@@ -313,11 +313,11 @@ fn finish_cors(app: &Arc<App>, res: &mut PylonResponse, origin: Option<&str>) {
     }
 }
 
-async fn read_body(req: Request<Incoming>) -> Result<Bytes, PylonResponse> {
+async fn read_body(req: Request<Incoming>) -> Result<Bytes, RangoResponse> {
     let body = Limited::new(req.into_body(), MAX_BODY_BYTES);
     match body.collect().await {
         Ok(c) => Ok(c.to_bytes()),
-        Err(_) => Err(PylonResponse::error(
+        Err(_) => Err(RangoResponse::error(
             413,
             format!("request body exceeds {MAX_BODY_BYTES} bytes"),
         )),
@@ -326,7 +326,7 @@ async fn read_body(req: Request<Incoming>) -> Result<Bytes, PylonResponse> {
 
 /// Introspection and operations endpoints, mounted under `control_prefix`.
 ///
-/// Everything except `/health` requires the `pylon:admin` scope when any
+/// Everything except `/health` requires the `rango:admin` scope when any
 /// authentication is configured. An open MCP endpoint is an open door to every
 /// tool in the app.
 async fn control_plane(
@@ -336,19 +336,19 @@ async fn control_plane(
     body: &[u8],
     principal: &Principal,
     request_id: &str,
-) -> PylonResponse {
+) -> RangoResponse {
     let auth_configured = !app.manifest.auth.api_keys.is_empty() || app.manifest.auth.jwt.is_some();
     let admin_required = auth_configured && rest != "/health";
-    if admin_required && !principal.has_scope("pylon:admin") {
+    if admin_required && !principal.has_scope("rango:admin") {
         let status = if principal.is_anonymous() { 401 } else { 403 };
-        return PylonResponse::error(
+        return RangoResponse::error(
             status,
-            "the pylon control plane requires the 'pylon:admin' scope",
+            "the rango control plane requires the 'rango:admin' scope",
         );
     }
 
     match (method, rest) {
-        ("GET", "/health") => PylonResponse::json(
+        ("GET", "/health") => RangoResponse::json(
             200,
             &serde_json::json!({
                 "status": "ok",
@@ -361,9 +361,9 @@ async fn control_plane(
             }),
         ),
 
-        ("GET", "/openapi.json") => PylonResponse::json(200, &openapi::generate(&app.manifest)),
+        ("GET", "/openapi.json") => RangoResponse::json(200, &openapi::generate(&app.manifest)),
 
-        ("GET", "/tools") => PylonResponse::json(
+        ("GET", "/tools") => RangoResponse::json(
             200,
             &serde_json::json!({
                 "tools": app.exposed_tools().into_iter().map(|r| serde_json::json!({
@@ -381,7 +381,7 @@ async fn control_plane(
 
         ("POST", "/mcp") => mcp::handle(app, body, principal).await,
 
-        ("GET", "/mcp") => PylonResponse::json(
+        ("GET", "/mcp") => RangoResponse::json(
             200,
             &serde_json::json!({
                 "transport": "streamable-http",
@@ -390,7 +390,7 @@ async fn control_plane(
             }),
         ),
 
-        ("GET", "/routes") => PylonResponse::json(
+        ("GET", "/routes") => RangoResponse::json(
             200,
             &serde_json::json!({
                 "routes": app.manifest.routes.iter().map(|r| serde_json::json!({
@@ -405,12 +405,12 @@ async fn control_plane(
         ),
 
         // Agent activity, without needing a log pipeline first.
-        ("GET", "/audit") => PylonResponse::json(
+        ("GET", "/audit") => RangoResponse::json(
             200,
             &serde_json::json!({"events": app.audit.recent(200)}),
         ),
 
-        ("GET", "/behaviours") => PylonResponse::json(
+        ("GET", "/behaviours") => RangoResponse::json(
             200,
             &serde_json::json!({
                 "behaviours": app.manifest.behaviours.iter().map(|b| serde_json::json!({
@@ -425,7 +425,7 @@ async fn control_plane(
             }),
         ),
 
-        ("GET", "/agents") => PylonResponse::json(
+        ("GET", "/agents") => RangoResponse::json(
             200,
             &serde_json::json!({
                 "agents": app.manifest.agents.iter().map(|a| serde_json::json!({
@@ -443,7 +443,7 @@ async fn control_plane(
         // Security posture on one screen: what is reachable with no credential.
         ("GET", "/security") => {
             let public = app.manifest.public_routes();
-            PylonResponse::json(
+            RangoResponse::json(
                 200,
                 &serde_json::json!({
                     "auth_configured": auth_configured,
@@ -461,7 +461,7 @@ async fn control_plane(
             )
         }
 
-        _ => PylonResponse::error(
+        _ => RangoResponse::error(
             404,
             format!("no control endpoint {method} {rest} (request {request_id})"),
         ),
@@ -494,7 +494,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     "non-string panic payload".to_string()
 }
 
-fn to_hyper(res: PylonResponse) -> Response<Full<Bytes>> {
+fn to_hyper(res: RangoResponse) -> Response<Full<Bytes>> {
     let mut builder = Response::builder().status(res.status);
     for (k, v) in &res.headers {
         builder = builder.header(k.as_str(), v.as_str());

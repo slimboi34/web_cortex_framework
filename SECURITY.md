@@ -1,6 +1,6 @@
 # Security review — v0.3
 
-An adversarial review of Pylon conducted against its own controls: authentication,
+An adversarial review of Rango conducted against its own controls: authentication,
 authorization, injection, traversal, SSRF, resource exhaustion, and information
 disclosure, plus stress and soak testing.
 
@@ -70,7 +70,7 @@ request could permanently deny every Python-backed route in the application.
 The 30-second request timeout returned a 504 to the *caller* but did not stop
 the work, so the leak persisted after the client gave up.
 
-**Fix:** `PylonRequest` now carries an invocation `depth`, incremented on every
+**Fix:** `RangoRequest` now carries an invocation `depth`, incremented on every
 in-process tool call and enforced against `server.max_invocation_depth`
 (default 8) before a behaviour or agent op runs. Exceeding it returns 508 Loop
 Detected, surfaced to the behaviour as a clean halt. After the fix the bomb is
@@ -83,7 +83,7 @@ the response body, disclosing absolute file paths, dependency versions, and code
 structure.
 
 **Fix:** tracebacks are always written to the server log and never to the
-response. Set `PYLON_DEBUG_ERRORS=1` to opt back in during development.
+response. Set `RANGO_DEBUG_ERRORS=1` to opt back in during development.
 
 ### 6. Client input faults reported as server faults — **Low**, fixed
 
@@ -185,7 +185,7 @@ marketing.
 
 - **Self-review.** Same author, same blind spots. Findings 1 and 4 were missed by
   the original suite for exactly that reason.
-- **Not tested:** TLS termination (Pylon serves plaintext and expects a
+- **Not tested:** TLS termination (Rango serves plaintext and expects a
   terminating proxy), HTTP/2-specific attacks, request smuggling, slowloris and
   header-read timeouts, timing side channels measured statistically rather than
   by construction, and the live Anthropic provider path.

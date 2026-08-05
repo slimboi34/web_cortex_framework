@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
-pub struct PylonRequest {
+pub struct RangoRequest {
     pub method: String,
     pub path: String,
     pub path_params: BTreeMap<String, String>,
@@ -30,7 +30,7 @@ pub struct PylonRequest {
     pub depth: u32,
 }
 
-impl PylonRequest {
+impl RangoRequest {
     pub fn synthetic(method: &str, path: &str) -> Self {
         Self {
             method: method.to_string(),
@@ -101,13 +101,13 @@ fn coerce_scalar(s: &str) -> serde_json::Value {
 }
 
 #[derive(Debug, Clone)]
-pub struct PylonResponse {
+pub struct RangoResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Bytes,
 }
 
-impl PylonResponse {
+impl RangoResponse {
     pub fn json(status: u16, value: &serde_json::Value) -> Self {
         let body = serde_json::to_vec(value).unwrap_or_else(|e| {
             serde_json::to_vec(&serde_json::json!({"error": e.to_string()})).unwrap()

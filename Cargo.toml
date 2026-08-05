@@ -1,12 +1,17 @@
 [workspace]
-members = ["crates/pylon-core", "crates/pylon-py"]
+members = ["crates/rango-core", "crates/rango-py"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.85"
+repository = "https://github.com/slimboi34/rango"
+homepage = "https://github.com/slimboi34/rango"
+documentation = "https://docs.rs/rango-core"
+keywords = ["web", "framework", "agent", "mcp", "python"]
+categories = ["web-programming::http-server"]
 
 [workspace.dependencies]
 tokio = { version = "1.53", features = ["full"] }
