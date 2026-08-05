@@ -25,7 +25,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
-          - os: ubuntu-latest
+          # Native ARM runner rather than cross-compilation: `ring`'s ARM
+          # assembly fails to cross-build ("ARM assembler must define
+          # __ARM_ARCH"), and building natively sidesteps the whole problem.
+          - os: ubuntu-24.04-arm
             target: aarch64
           - os: macos-latest
             target: aarch64
