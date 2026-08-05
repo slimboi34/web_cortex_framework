@@ -1,0 +1,98 @@
+site_name: WebCortex
+site_description: A Python web framework with a Rust core, where every route is also an agent tool.
+site_url: https://slimboi34.github.io/web_cortex_framework/
+repo_url: https://github.com/slimboi34/web_cortex_framework
+repo_name: slimboi34/web_cortex_framework
+edit_uri: edit/main/docs/
+copyright: Apache-2.0 licensed.
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  # Required for ```mermaid fences to render as diagrams rather than code.
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: installation.md
+      - Tutorial: tutorial.md
+      - How it works: concepts.md
+  - Building:
+      - Routing: routing.md
+      - Database: database.md
+      - Frontend: frontend.md
+  - Agents:
+      - Tools and MCP: agents-tools.md
+      - Agents: agents.md
+      - Behaviours: behaviours.md
+  - Operating:
+      - Security: security.md
+      - Deployment: deployment.md
+  - Reference:
+      - Use cases: use-cases.md
+      - CLI: cli.md
+      - API: api-reference.md
+      - FAQ: faq.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/slimboi34/web_cortex_framework
