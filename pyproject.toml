@@ -27,12 +27,13 @@ classifiers = [
 ]
 keywords = ["web", "framework", "api", "agent", "mcp", "rust", "free-threaded"]
 
+dependencies = []
+
 [project.urls]
 Homepage = "https://github.com/slimboi34/rango"
 Repository = "https://github.com/slimboi34/rango"
 Changelog = "https://github.com/slimboi34/rango/blob/main/CHANGELOG.md"
 Security = "https://github.com/slimboi34/rango/blob/main/SECURITY.md"
-dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "httpx>=0.27"]

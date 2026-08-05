@@ -1,0 +1,26 @@
+# cargo-audit configuration.
+#
+# Exceptions are listed here rather than passed as CLI flags so the reasoning
+# lives in version control next to the decision, and so a future reader can
+# re-evaluate it instead of finding a bare `--ignore` in a workflow file.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack: key recovery through timing
+    # sidechannels in `rsa` 0.9.x. No fixed release exists upstream.
+    #
+    # Reached transitively: rango-core -> jsonwebtoken -> rsa.
+    #
+    # Not exploitable in Rango as written. The advisory concerns RSA *private
+    # key* operations (PKCS#1 v1.5 decryption and signing). Rango only ever
+    # constructs `jsonwebtoken::DecodingKey` and only ever *verifies* JWT
+    # signatures, which is a public-key operation. It never signs or issues
+    # tokens, and never holds an RSA private key — there is no
+    # `EncodingKey` anywhere in the codebase.
+    #
+    # Re-evaluate if either of these changes:
+    #   * Rango gains the ability to issue/sign JWTs, or
+    #   * jsonwebtoken switches to `aws_lc_rs`, which drops the `rsa` crate
+    #     entirely and would let this exception be removed.
+    "RUSTSEC-2023-0071",
+]

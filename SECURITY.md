@@ -191,9 +191,8 @@ marketing.
   by construction, and the live Anthropic provider path.
 - **No fuzzing.** The manifest parser, the JSON-RPC surface, and the router are
   all reachable pre-auth and deserve a fuzz harness.
-- **No dependency audit.** `cargo audit` / `cargo deny` are not wired into CI.
-  Finding 1 was a dependency feature-flag issue, which is precisely the class
-  that tooling catches.
+- **Dependency audit is now wired into CI** (`cargo audit` on every push). It
+  found one advisory on its first run, documented below.
 - **Rate limiting is per-process and keys anonymous traffic by socket address.**
   Behind a load balancer every anonymous caller shares one bucket, which
   degrades legitimate users rather than attackers. `X-Forwarded-For` is
@@ -204,6 +203,23 @@ marketing.
   public authenticated browser apps.
 - **A behaviour holds a worker thread for its whole run.** Correct for
   procedures measured in seconds, wrong for ones measured in hours.
+
+## Known advisories
+
+**RUSTSEC-2023-0071 — Marvin Attack in `rsa` 0.9.x** (medium, 5.9). Reached
+transitively via `jsonwebtoken`. No upstream fix exists.
+
+**Assessed as not exploitable in Rango**, and the exception is recorded with its
+reasoning in [`.cargo/audit.toml`](.cargo/audit.toml) rather than silenced on a
+command line. The advisory concerns RSA *private key* operations — PKCS#1 v1.5
+decryption and signing. Rango only ever constructs `DecodingKey` and only ever
+*verifies* JWT signatures, which is a public-key operation. It never issues or
+signs tokens; there is no `EncodingKey` in the codebase.
+
+The exception must be revisited if Rango gains token-issuing capability, and can
+be dropped entirely if `jsonwebtoken` is switched to the `aws_lc_rs` provider,
+which does not depend on the `rsa` crate. That switch was not taken here because
+it introduces a C toolchain dependency into the cross-platform wheel build.
 
 ## Reporting
 
