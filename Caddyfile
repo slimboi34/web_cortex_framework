@@ -1,0 +1,27 @@
+# Railway injects $PORT; the fallback keeps `docker run` working locally.
+:{$PORT:8080} {
+	root * /srv
+	encode gzip zstd
+
+	# MkDocs emits directory-style URLs (/tutorial/ -> /tutorial/index.html).
+	try_files {path} {path}/ {path}/index.html {path}.html
+
+	file_server
+
+	handle_errors {
+		rewrite * /404.html
+		file_server
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	# Hashed assets are immutable; HTML should revalidate so a redeploy is seen.
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+	@html path *.html /
+	header @html Cache-Control "public, max-age=0, must-revalidate"
+}

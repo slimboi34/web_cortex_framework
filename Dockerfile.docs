@@ -1,0 +1,15 @@
+# Documentation site. Deployed separately from the Python package — this image
+# contains only the rendered docs, no Rust toolchain and no application code.
+FROM python:3.12-slim AS build
+WORKDIR /build
+COPY docs-requirements.txt .
+RUN pip install --no-cache-dir -r docs-requirements.txt
+COPY mkdocs.yml ./
+COPY docs/ docs/
+# --strict so a broken internal link fails the deploy rather than shipping a
+# site with dead links in it.
+RUN mkdocs build --strict
+
+FROM caddy:2-alpine
+COPY --from=build /build/site /srv
+COPY Caddyfile /etc/caddy/Caddyfile

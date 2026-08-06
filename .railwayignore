@@ -1,0 +1,19 @@
+# The docs image needs only mkdocs.yml, docs/, docs-requirements.txt and the
+# Caddyfile. Everything else is a multi-GB upload for no reason.
+target/
+.venv/
+.venv-gil/
+.venv-312/
+site/
+crates/
+tests/
+examples/
+python/
+__pycache__/
+.pytest_cache/
+*.so
+*.db
+*.whl
+*.tar.gz
+dist/
+client/

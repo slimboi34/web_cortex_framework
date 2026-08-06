@@ -1,0 +1,9 @@
+# This repository deploys the documentation site. The Python package itself is
+# distributed through PyPI, not Railway.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.docs"
+
+[deploy]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
