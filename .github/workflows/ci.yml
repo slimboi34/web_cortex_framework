@@ -63,7 +63,7 @@ jobs:
           # hands out whatever the newest build is at the time the runner runs,
           # which is why the same commit passed at 09:54 and failed at 10:17.
           # Without this line the log gives no way to tell those two apart.
-          python -c "import sys; print('interpreter:', sys.version)"
+          python -c "import sys; print(f'::notice title=interpreter::{sys.implementation.name} {sys.version}')"
           maturin develop --uv
           # Import the COMPILED extension explicitly. The obvious smoke check —
           # `import webcortex; webcortex.free_threaded()` — proves nothing about
