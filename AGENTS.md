@@ -425,7 +425,10 @@ warning to **stderr**. If you are scripting a gate, check
 
 ## 11. Known issue: CPython 3.14.7 with the GIL enabled
 
-**Status: open. Read this before diagnosing any `_core` import failure.**
+**Status: open, and GIL-enabled 3.14 is consequently unsupported.** No cp314
+wheel is built or published; the matrix does not test it. Free-threaded 3.14
+(`3.14t`) is supported and tested. Read this before diagnosing any `_core`
+import failure.
 
 On CPython **3.14.7 with the GIL enabled**, importing the compiled extension
 fails:
@@ -503,9 +506,11 @@ reads.
   file turns a warning into a build failure. Relative links out of `docs/` (e.g.
   `../examples/`) do not resolve on the published site — use absolute GitHub
   URLs.
-- **The Python matrix is 3.12, 3.13, 3.14, 3.14t** across ubuntu and macOS.
-  Wheels build for 3.12, 3.13, 3.14 and 3.14t on Linux x86_64/aarch64, macOS
-  x86_64/aarch64, and Windows x64.
+- **The Python matrix is 3.12, 3.13, 3.14t** across ubuntu and macOS, and wheels
+  build for the same three on Linux x86_64/aarch64, macOS x86_64/aarch64, and
+  Windows x64. GIL-enabled 3.14 is excluded from both — see §11. Add it back to
+  both lists together; a tested target that ships no wheel, or a shipped wheel
+  nothing tests, is worse than either.
 - **PyO3 is used without `abi3`**, because the free-threaded builds expose a
   distinct ABI that cannot be combined with the stable-ABI feature. That is why
   there is one wheel per interpreter version rather than one abi3 wheel.

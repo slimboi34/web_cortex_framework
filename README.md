@@ -7,8 +7,8 @@ pip install web-cortex-framework
 > Installs as **`web-cortex-framework`**, imports as **`webcortex`** — the same
 > split as `djangorestframework` → `import rest_framework`.
 >
-> **On CPython 3.14, use the free-threaded build (`3.14t`) or pin to 3.13.** The
-> extension does not import on 3.14.7 with the GIL enabled; see
+> **Python 3.12, 3.13, and free-threaded 3.14 (`3.14t`).** GIL-enabled 3.14 is
+> not supported and no wheel is published for it — see
 > [Known issue](#known-issue-cpython-3147-with-the-gil-enabled) below.
 
 **📖 [Documentation](https://slimboi34.github.io/web_cortex_framework/)** ·
@@ -327,8 +327,12 @@ unaffected. 3.14.7 was released on 5 August 2026; the failure began the same day
 
 This is not a version-resolution accident on your machine — `uv` resolves `3.14`
 to the newest patch build available when it runs, so an environment that worked
-yesterday can stop working today without anything in your project changing. Pin
-to 3.13, or use the free-threaded 3.14 build, until this is resolved.
+yesterday can stop working today without anything in your project changing.
+
+**No cp314 wheel is published**, and the CI matrix does not test that target.
+Shipping a binary that installs cleanly and then fails at import is worse than
+shipping none: the error arrives later, further from its cause, and looks like
+a bug in your own application. Use 3.13 or `3.14t`.
 
 The investigation so far, including what has been ruled out, is in
 [AGENTS.md §11](AGENTS.md#11-known-issue-cpython-3147-with-the-gil-enabled).
