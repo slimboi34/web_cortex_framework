@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Python | 3.12, 3.13, or free-threaded 3.14 (`3.14t`). **Not GIL-enabled 3.14** — see below. |
+| Python | 3.12, 3.13 or 3.14. Free-threaded 3.14 (`3.14t`) is the fast path — see below. |
 | OS | Linux (x86_64/aarch64), macOS (Apple Silicon/Intel), Windows (x64) |
 | Rust | Only if building from source, or installing from an sdist |
 
@@ -14,15 +14,10 @@
 $ pip install web-cortex-framework
 ```
 
-!!! warning "GIL-enabled CPython 3.14 is not supported"
-    The compiled extension cannot be imported on CPython 3.14.7:
-    `ValueError: module functions cannot set METH_CLASS or METH_STATIC`. No
-    `cp314` wheel is published, so pip will fall back to the sdist and the
-    failure will surface at import rather than install.
-
-    3.12, 3.13 and the **free-threaded** 3.14 build (`3.14t`) are unaffected.
-    Use one of those. Tracked in
-    [AGENTS.md §11](https://github.com/slimboi34/web_cortex_framework/blob/main/AGENTS.md).
+!!! warning "On CPython 3.14, use 0.3.2 or later"
+    0.3.1 and earlier fail to import on CPython 3.14.7 with
+    `ValueError: module functions cannot set METH_CLASS or METH_STATIC`. This was
+    a pyo3 bug, fixed in 0.3.2. Nothing to work around — just upgrade.
 
 The distribution is `web-cortex-framework`; the import is `webcortex`. Same
 split as `djangorestframework` → `import rest_framework`.
@@ -36,7 +31,7 @@ from webcortex import WebCortex   # not "web_cortex_framework"
 ```console
 $ git clone https://github.com/slimboi34/web_cortex_framework
 $ cd web_cortex_framework
-$ uv venv --python 3.13          # or 3.14t; not 3.14
+$ uv venv --python 3.14t         # or 3.12 / 3.13 / 3.14
 $ uv pip install maturin
 $ .venv/bin/maturin develop --uv
 ```

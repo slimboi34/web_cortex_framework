@@ -3,6 +3,26 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, minor bumps may contain breaking changes.
 
+## [0.3.2] — 2026-08-06
+
+### Fixed
+
+- **The extension imports on CPython 3.14.7 again.** 0.3.1 and earlier fail with
+  `ValueError: module functions cannot set METH_CLASS or METH_STATIC`. The cause
+  was pyo3 0.29.1, fixed upstream in 0.29.2 — but `Cargo.lock` still pinned
+  0.29.1 while `Cargo.toml` required 0.29.2. Cargo resolves the newer version at
+  build time, so builds were correct; `Swatinem/rust-cache` keys off `Cargo.lock`
+  though, so CI kept restoring objects compiled against the broken version and
+  the fix looked falsified for a day. The lock now pins 0.29.2, and the cache key
+  hashes `Cargo.toml` too.
+
+### Added
+
+- **GIL-enabled CPython 3.14 is supported again**, and `cp314` wheels are
+  published. 0.3.1 dropped both on the strength of the failure above, which was
+  never a real incompatibility. Supported: 3.12, 3.13, 3.14 and free-threaded
+  3.14 (`3.14t`).
+
 ## [0.3.1] — 2026-08-06
 
 Packaging and supported-interpreter corrections. No library behaviour changed.

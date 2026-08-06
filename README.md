@@ -7,9 +7,8 @@ pip install web-cortex-framework
 > Installs as **`web-cortex-framework`**, imports as **`webcortex`** — the same
 > split as `djangorestframework` → `import rest_framework`.
 >
-> **Python 3.12, 3.13, and free-threaded 3.14 (`3.14t`).** GIL-enabled 3.14 is
-> not supported and no wheel is published for it — see
-> [Known issue](#known-issue-cpython-3147-with-the-gil-enabled) below.
+> **Python 3.12, 3.13 and 3.14**, including the free-threaded build (`3.14t`),
+> which is the fast path for Python-backed routes.
 
 **📖 [Documentation](https://slimboi34.github.io/web_cortex_framework/)** ·
 [Tutorial](https://slimboi34.github.io/web_cortex_framework/tutorial/) ·
@@ -313,29 +312,25 @@ Not yet: Postgres, SSE streaming, durable agent runs, local model supervision.
 See [DESIGN.md](DESIGN.md) for the roadmap, honest risk grading, and — just as
 importantly — what is deliberately **not** being built.
 
-## Known issue: CPython 3.14.7 with the GIL enabled
+## Resolved: the CPython 3.14 import failure
 
-On CPython **3.14.7 specifically, with the GIL enabled**, the compiled extension
-fails to import:
+**0.3.1 and earlier fail to import on CPython 3.14.7.** Fixed in 0.3.2; upgrade
+if you are on 3.14.
 
 ```
 ValueError: module functions cannot set METH_CLASS or METH_STATIC
 ```
 
-3.12, 3.13, 3.14.6 and the **free-threaded** 3.14.7 build (`3.14t`) are all
-unaffected. 3.14.7 was released on 5 August 2026; the failure began the same day.
+The cause was pyo3 0.29.1, fixed in 0.29.2. The reason it took a day to find is
+worth recording, because it is a trap any Rust-backed Python project can fall
+into: `Cargo.toml` was updated to require 0.29.2 while `Cargo.lock` still pinned
+0.29.1. Cargo resolves the newer version at build time, so builds were correct —
+but `Swatinem/rust-cache` keys its cache off `Cargo.lock`, which had not changed,
+so CI kept restoring objects compiled against the broken version. The fix looked
+falsified when it had simply never been built.
 
-This is not a version-resolution accident on your machine — `uv` resolves `3.14`
-to the newest patch build available when it runs, so an environment that worked
-yesterday can stop working today without anything in your project changing.
-
-**No cp314 wheel is published**, and the CI matrix does not test that target.
-Shipping a binary that installs cleanly and then fails at import is worse than
-shipping none: the error arrives later, further from its cause, and looks like
-a bug in your own application. Use 3.13 or `3.14t`.
-
-The investigation so far, including what has been ruled out, is in
-[AGENTS.md §11](AGENTS.md#11-known-issue-cpython-3147-with-the-gil-enabled).
+If you hit something similar: build once with a cold cache before concluding a
+dependency fix did not work.
 
 ## For AI coding tools
 
