@@ -307,13 +307,52 @@ Not yet: Postgres, SSE streaming, durable agent runs, local model supervision.
 See [DESIGN.md](DESIGN.md) for the roadmap, honest risk grading, and — just as
 importantly — what is deliberately **not** being built.
 
+## Known issue: CPython 3.14.7 with the GIL enabled
+
+On CPython **3.14.7 specifically, with the GIL enabled**, the compiled extension
+fails to import:
+
+```
+ValueError: module functions cannot set METH_CLASS or METH_STATIC
+```
+
+3.12, 3.13, 3.14.6 and the **free-threaded** 3.14.7 build (`3.14t`) are all
+unaffected. 3.14.7 was released on 5 August 2026; the failure began the same day.
+
+This is not a version-resolution accident on your machine — `uv` resolves `3.14`
+to the newest patch build available when it runs, so an environment that worked
+yesterday can stop working today without anything in your project changing. Pin
+to 3.13, or use the free-threaded 3.14 build, until this is resolved.
+
+The investigation so far, including what has been ruled out, is in
+[AGENTS.md §11](AGENTS.md#11-known-issue-cpython-3147-with-the-gil-enabled).
+
+## For AI coding tools
+
+[**AGENTS.md**](AGENTS.md) is the machine-facing reference: the complete API
+surface with exact signatures and defaults, the binding and scope rules, the
+constraints the runtime enforces, and the specific mistakes that are cheap to
+make and expensive to debug. Claude Code, Cursor, Codex, Aider and Copilot
+Workspace all read it by convention.
+
+It is written to be correct rather than welcoming. Humans should start with the
+[docs site](https://slimboi34.github.io/web_cortex_framework/) instead.
+
 ## Building from source
 
 ```bash
-uv venv --python 3.14.4+freethreaded
-uv pip install maturin
+# 3.13 is the recommended toolchain today — see "Known issue" above.
+uv venv --python 3.13
+uv pip install maturin pytest
 .venv/bin/maturin develop --uv
 .venv/bin/python -m pytest tests/
+```
+
+The free-threaded build is also supported and is the configuration the bridge was
+designed around:
+
+```bash
+uv venv --python 3.14t
 ```
 
 ## License
