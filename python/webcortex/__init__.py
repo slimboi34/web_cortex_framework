@@ -17,7 +17,7 @@ server exposing six tools — from nine lines.
 from ._bridge import HTTPError, Request, Response, free_threaded
 from .app import WebCortex, Resource
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "WebCortex",
