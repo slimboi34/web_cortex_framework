@@ -43,17 +43,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # GIL-enabled 3.14 is deliberately absent. CPython 3.14.7 cannot import
-        # the compiled extension ("module functions cannot set METH_CLASS or
-        # METH_STATIC"), and since uv resolves `3.14` to whatever patch build is
-        # newest when a runner starts, nothing in this repository can make that
-        # job green. Free-threaded 3.14t is unaffected and is tested below.
-        #
-        # It was briefly kept as a continue-on-error job. That was the wrong
-        # call: it put a permanent red X on every release for a target we do not
-        # ship, and a tolerated failure is a failure nobody reads. Restore this
-        # to ["3.12", "3.13", "3.14", "3.14t"] the day it can pass.
-        # Tracked in AGENTS.md §11.
         python: ["3.12", "3.13", "3.14", "3.14t"]
         exclude:
           # Keep the matrix affordable; macOS covers the free-threaded path.
@@ -64,13 +53,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # EXPERIMENT: bust the cache. A dispatch-only probe on this same commit
-          # and the same 3.14.7 build imported `_core` cleanly, while this job
-          # kept failing — and the probe's only material difference was a cold
-          # cache, because rust-cache keys per workflow. If a stale artifact from
-          # before the pyo3 0.29.1 -> 0.29.2 pin is being reused, that is the
-          # whole bug and 3.14 was never broken.
-          prefix-key: "probe-cold"
+          # Key on the manifests, not just Cargo.lock.
+          #
+          # rust-cache hashes Cargo.lock by default. That is not enough: when
+          # Cargo.toml required pyo3 0.29.2 while Cargo.lock still said 0.29.1,
+          # cargo resolved the newer version at build time and built correctly —
+          # but the lock never changed, so the cache key never changed, and every
+          # job restored objects compiled against 0.29.1. `_core` then failed to
+          # import on 3.14 for a day after the fix had already landed.
+          #
+          # Including Cargo.toml means a dependency change invalidates the cache
+          # even when the lock lags behind it.
+          key: ${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
       - uses: astral-sh/setup-uv@v5
       - name: Build and test
         shell: bash
@@ -160,13 +154,10 @@ jobs:
         with:
           target: ${{ matrix.target }}
           # PyO3 without abi3 needs one wheel per interpreter version.
-          # cp314 (GIL-enabled) is omitted on purpose — see the python job above.
-          # Shipping a wheel that cannot import is worse than shipping none: pip
-          # installs it happily and the failure arrives later, at import.
           args: >-
             --release
             --out dist
-            --interpreter 3.12 3.13 3.14t
+            --interpreter 3.12 3.13 3.14 3.14t
           manylinux: auto
           sccache: "true"
       - uses: actions/upload-artifact@v4
