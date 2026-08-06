@@ -89,6 +89,61 @@ jobs:
           path: dist
       - name: List artifacts
         run: ls -la dist
+
+      # Do the OIDC exchange ourselves first, purely to report the outcome.
+      #
+      # When trusted publishing is misconfigured, gh-action-pypi-publish fails
+      # with the reason buried in a ~60 KB job log, which is a miserable way to
+      # learn that a form field has a typo in it. PyPI's mint-token endpoint
+      # returns a precise error — `invalid-publisher` along with the claims it
+      # actually saw — so asking it directly turns "the publish step failed"
+      # into "PyPI expected repo X, workflow Y, environment Z".
+      #
+      # This does not replace the publish step and never blocks it: it only ever
+      # annotates. The token minted here is discarded.
+      - name: Report the trusted-publishing exchange
+        continue-on-error: true
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+
+          def annotate(level, title, message):
+              one_line = " ".join(str(message).split())
+              print(f"::{level} title={title}::{one_line}")
+
+          url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+          token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+          if not (url and token):
+              annotate("warning", "OIDC unavailable",
+                       "No id-token request URL. The job needs permissions.id-token: write.")
+              raise SystemExit(0)
+
+          req = urllib.request.Request(
+              f"{url}&audience=pypi", headers={"Authorization": f"bearer {token}"}
+          )
+          oidc = json.load(urllib.request.urlopen(req, timeout=30))["value"]
+
+          mint = urllib.request.Request(
+              "https://pypi.org/_/oidc/mint-token",
+              data=json.dumps({"token": oidc}).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              with urllib.request.urlopen(mint, timeout=30) as resp:
+                  body = json.load(resp)
+              if body.get("token"):
+                  annotate("notice", "Trusted publishing OK",
+                           "PyPI accepted the OIDC identity and issued a scoped token.")
+              else:
+                  annotate("error", "Trusted publishing rejected", body)
+          except urllib.error.HTTPError as exc:
+              detail = exc.read().decode("utf-8", "replace")
+              annotate("error", f"Trusted publishing rejected ({exc.code})", detail)
+          PY
+
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
