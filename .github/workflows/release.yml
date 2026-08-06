@@ -170,8 +170,11 @@ jobs:
           import subprocess, pathlib, sys
           files = [str(p) for p in sorted(pathlib.Path("dist").iterdir())]
           proc = subprocess.run(
+              # --verbose is what makes PyPI's response *body* appear. Without
+              # it twine prints only the status line, which for this failure is
+              # the uninformative "400 Bad Request from .../legacy/ Bad Request".
               [sys.executable, "-m", "twine", "upload", "--non-interactive",
-               "--skip-existing", "--disable-progress-bar", *files],
+               "--verbose", "--skip-existing", "--disable-progress-bar", *files],
               env={**os.environ,
                    "TWINE_USERNAME": "__token__",
                    "TWINE_PASSWORD": body["token"],
@@ -184,9 +187,20 @@ jobs:
               annotate("notice", "Upload accepted",
                        "PyPI accepted every file in dist.")
           else:
-              tail = (proc.stderr or proc.stdout).strip().splitlines()[-6:]
+              # --verbose makes the output long, and the explanation is rarely
+              # the last line — it sits in the response body a little above the
+              # traceback. Pull the lines that carry meaning and fall back to the
+              # tail only if none match, rather than truncating blindly.
+              combined = f"{proc.stdout}\n{proc.stderr}".splitlines()
+              signal = [
+                  ln.strip() for ln in combined
+                  if any(k in ln for k in ("400", "403", "Bad Request", "ERROR",
+                                           "Uploading", "not allowed", "already",
+                                           "invalid", "Invalid", "reason"))
+              ]
+              picked = signal[-12:] or [ln.strip() for ln in combined if ln.strip()][-12:]
               annotate("error", f"PyPI rejected the upload (exit {proc.returncode})",
-                       " | ".join(tail))
+                       " | ".join(picked))
           PY
 
       # skip-existing, because the diagnostic step above may already have
