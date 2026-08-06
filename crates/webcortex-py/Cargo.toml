@@ -19,7 +19,12 @@ crate-type = ["cdylib"]
 webcortex-core = { path = "../webcortex-core" }
 # No abi3: the free-threaded builds we target expose a distinct ABI, so the
 # stable-ABI feature cannot be combined with them.
-pyo3 = { version = "0.29", features = ["extension-module"] }
+# Pinned to 0.29.2 rather than "0.29" so the lockfile has to move. CI was
+# building 0.29.1, which is where `_core` stopped importing on CPython 3.14.7
+# with "module functions cannot set METH_CLASS or METH_STATIC". 0.29.2 is a
+# patch release of refcount and crash fixes; whether it addresses this
+# specifically is what CI is being asked to answer.
+pyo3 = { version = "0.29.2", features = ["extension-module"] }
 tokio.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
