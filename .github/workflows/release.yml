@@ -87,8 +87,19 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
           path: dist
+      # As an annotation rather than plain stdout, for the same reason as the
+      # OIDC check below: this is the other half of any upload failure, and
+      # reading it should not require pulling the whole job log.
       - name: List artifacts
-        run: ls -la dist
+        run: |
+          python - <<'PY'
+          import pathlib
+          files = sorted(pathlib.Path("dist").iterdir())
+          listing = ", ".join(f"{f.name} ({f.stat().st_size // 1024} KiB)" for f in files)
+          print(f"::notice title=dist ({len(files)} files)::{listing}")
+          for f in files:
+              print(f"{f.stat().st_size:>12}  {f.name}")
+          PY
 
       # Do the OIDC exchange ourselves first, purely to report the outcome.
       #
