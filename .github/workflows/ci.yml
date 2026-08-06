@@ -60,7 +60,16 @@ jobs:
           uv pip install maturin pytest
           source .venv/bin/activate
           maturin develop --uv
-          python -c "import webcortex, sys; print(webcortex.__version__, 'free_threaded=', webcortex.free_threaded())"
+          # Import the COMPILED extension explicitly. The obvious smoke check —
+          # `import webcortex; webcortex.free_threaded()` — proves nothing about
+          # it: free_threaded() lives in _bridge.py and only reads
+          # sys._is_gil_enabled, so it passes cleanly on a build whose native
+          # module cannot load at all. When that happened on CPython 3.14 the
+          # first thing to actually import _core was a server subprocess inside
+          # a module-scoped fixture, so a one-line binding failure surfaced as
+          # forty unexplained fixture errors several minutes later.
+          python -c "from webcortex import _core; print('_core ok', _core.__version__)"
+          python -c "import webcortex; print(webcortex.__version__, 'free_threaded=', webcortex.free_threaded())"
           pytest tests/ -q
 
   audit:
