@@ -1,124 +1,70 @@
 # Releasing
 
-Everything is automated except the one step that requires a human logged into
-PyPI. This documents both.
-
-## One-time: link PyPI to this repository
-
-WebCortex publishes via [trusted publishing][tp], so no API token is ever stored
-in GitHub. PyPI verifies a short-lived OIDC token from the release workflow
-instead. That link has to be created once, by an account owner.
-
-1. Sign in at <https://pypi.org> (create the account if needed; 2FA is required).
-2. Go to **<https://pypi.org/manage/account/publishing/>**.
-3. Under *Add a new pending publisher*, enter **exactly** these values:
-
-   | Field | Value |
-   |---|---|
-   | PyPI Project Name | `web-cortex-framework` |
-   | Owner | `slimboi34` |
-   | Repository name | `web_cortex_framework` |
-   | Workflow name | `release.yml` |
-   | Environment name | `pypi` |
-
-4. Save.
-
-It is called a *pending* publisher because the project does not exist on PyPI
-yet; the first successful upload creates it and the publisher becomes permanent.
-
-The `pypi` environment already exists on the GitHub side.
-
-### Verifying the link worked
-
-Re-run the release workflow (below). The `Publish to PyPI` job failing with
-`invalid-publisher` means the values above do not match — most often the
-repository name, which is `web_cortex_framework` with underscores, not the
-`webcortex` import name.
-
-## Cutting a release
-
 ```bash
-# 1. Bump the version in all three places — they must agree.
-#    pyproject.toml   version = "X.Y.Z"
-#    Cargo.toml       version = "X.Y.Z"   (workspace.package)
+# 1. Bump the version. All four must agree.
+#    pyproject.toml                version = "X.Y.Z"
+#    Cargo.toml                    version = "X.Y.Z"   (workspace.package)
+#    Cargo.lock                    webcortex-core and webcortex-py
 #    python/webcortex/__init__.py  __version__ = "X.Y.Z"
+#
+#    `cargo check` updates Cargo.lock for you once the other two are edited.
 
 # 2. Update CHANGELOG.md.
 
-# 3. Verify locally before tagging.
-cargo test && cargo clippy --all-targets -- -D warnings && cargo audit
-.venv/bin/python -m pytest tests/ -q
-
-# 4. Tag and push. The tag is what triggers publishing.
+# 3. Tag. The tag is what publishes.
 git tag -a vX.Y.Z -m "vX.Y.Z — summary"
 git push origin main --tags
 ```
 
-The release workflow then runs the full CI suite as a gate, builds wheels for
-Linux (x86_64, aarch64), macOS (arm64, x86_64), and Windows (x64) across Python
-3.12/3.13/3.14/3.14t, builds an sdist, and publishes everything.
+That is the whole process. The workflow runs CI as a gate, and publishes the
+wheels and sdist that CI built — it does not rebuild them, so the artifact that
+was tested is the artifact that ships.
 
-To re-run after fixing the publisher link without cutting a new version:
+Supported interpreters are **3.12, 3.13, and free-threaded 3.14 (`3.14t`)**
+across Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows (x64).
+GIL-enabled 3.14 is deliberately excluded — see [AGENTS.md §11](AGENTS.md).
 
-```bash
-gh run list --workflow Release --limit 1
-gh run rerun <run-id> --failed
-```
+`workflow_dispatch` runs the same thing without a tag, which is useful for
+re-running a failed publish. It is a no-op if the version is already on PyPI.
 
 ## Version numbers are permanent
 
-PyPI does not allow re-uploading a version, even after deleting it. A broken
-0.3.0 cannot be replaced by a fixed 0.3.0 — it has to become 0.3.1. Check the
-artifacts before tagging:
+PyPI does not allow re-uploading a file, even after deleting it. A broken 0.3.0
+cannot be replaced by a fixed 0.3.0 — it has to become 0.3.1. This is not
+hypothetical: 0.3.0 shipped without an sdist because its sdist was rejected, and
+that could only be corrected by releasing again.
+
+So check before tagging:
 
 ```bash
-.venv/bin/maturin sdist --out dist
-.venv/bin/maturin build --release -i .venv/bin/python --out dist
-.venv/bin/twine check --strict dist/*
+maturin sdist --out dist
+maturin build --release --out dist
+twine check --strict dist/*
 ```
 
 `twine check --strict` catches metadata and README-rendering problems that PyPI
-would otherwise reject, or silently render badly on the project page.
+would otherwise reject.
 
-## Trying it against TestPyPI first
+## PyPI setup
 
-Worth doing for a first release, or any release that changes packaging.
-TestPyPI is a separate instance with separate accounts and its own publisher
-configuration.
+Already configured, via [trusted publishing][tp] — no API token is stored
+anywhere. Recorded here in case it ever needs rebuilding:
 
-1. Register the same pending publisher at
-   <https://test.pypi.org/manage/account/publishing/>.
-2. Add to the publish step in `.github/workflows/release.yml`:
+| Field | Value |
+|---|---|
+| PyPI Project Name | `web-cortex-framework` |
+| Owner | `slimboi34` |
+| Repository name | `web_cortex_framework` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
 
-   ```yaml
-   with:
-     packages-dir: dist
-     repository-url: https://test.pypi.org/legacy/
-   ```
+If `Publish to PyPI` ever fails with `invalid-publisher`, one of those five no
+longer matches. The usual culprit is the repository name, which is
+`web_cortex_framework` with underscores — not the `webcortex` import name.
 
-3. Install from it to confirm:
-
-   ```bash
-   pip install --index-url https://test.pypi.org/simple/ \
-     --extra-index-url https://pypi.org/simple/ web-cortex-framework
-   ```
-
-Remember to remove `repository-url` before the real release.
-
-## If you would rather use an API token
-
-Trusted publishing is preferred because nothing secret is stored. If a token is
-needed anyway:
-
-1. Create one at <https://pypi.org/manage/account/token/>, scoped to the project.
-2. `gh secret set PYPI_API_TOKEN --repo slimboi34/web_cortex_framework`
-3. In `release.yml`, drop `environment: pypi` and the `id-token` permission, and
-   pass the token to the publish action:
-
-   ```yaml
-   with:
-     packages-dir: dist
-     password: ${{ secrets.PYPI_API_TOKEN }}
-   ```
+Leave *Environment name* set to `pypi` rather than *(Any)*. With `(Any)`, any
+job in `release.yml` can mint a publishing token; with `pypi`, only jobs that
+declare `environment: pypi` can, which is what makes GitHub's environment
+protection rules actually binding.
 
 [tp]: https://docs.pypi.org/trusted-publishers/

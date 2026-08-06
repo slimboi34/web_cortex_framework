@@ -11,76 +11,25 @@ permissions:
   contents: read
 
 jobs:
-  # Never publish something that has not passed the same gates as a normal push.
+  # CI already builds every wheel and the sdist on each push, and uploads them
+  # as `wheels-*`. Those are the artifacts this workflow publishes — it does not
+  # rebuild them.
+  #
+  # The point is not only brevity. Rebuilding here meant the thing tested and
+  # the thing published were different builds, produced by duplicated config
+  # that could drift apart silently. Now there is one build, and the release is
+  # the act of uploading what CI already proved.
   verify:
     uses: ./.github/workflows/ci.yml
 
-  build:
-    name: Wheel ${{ matrix.target }} (${{ matrix.os }})
-    needs: verify
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64
-          # Native ARM runner rather than cross-compilation: `ring`'s ARM
-          # assembly fails to cross-build ("ARM assembler must define
-          # __ARM_ARCH"), and building natively sidesteps the whole problem.
-          - os: ubuntu-24.04-arm
-            target: aarch64
-          - os: macos-latest
-            target: aarch64
-          # Intel macOS is cross-compiled from the ARM runner: GitHub has retired
-          # the macos-13 Intel runners, and Apple's toolchain targets both
-          # architectures natively, so this needs no cross setup.
-          - os: macos-latest
-            target: x86_64
-          - os: windows-latest
-            target: x64
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          # cp314 (GIL-enabled) is omitted on purpose: the extension cannot
-          # import on CPython 3.14.7. Free-threaded 3.14t is unaffected.
-          # Kept in step with ci.yml's wheels job. See AGENTS.md §11.
-          args: >-
-            --release
-            --out dist
-            --interpreter 3.12 3.13 3.14t
-          manylinux: auto
-          sccache: "true"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target }}
-          path: dist
-
-  sdist:
-    needs: verify
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-sdist
-          path: dist
-
   publish:
     name: Publish to PyPI
-    needs: [build, sdist]
+    needs: verify
     runs-on: ubuntu-latest
-    # Trusted publishing: no API token stored anywhere. Configure the publisher
-    # at https://pypi.org/manage/project/web-cortex-framework/settings/publishing/
+    # Trusted publishing: no API token stored anywhere. The publisher is
+    # configured at
+    # https://pypi.org/manage/project/web-cortex-framework/settings/publishing/
+    # and must name this workflow and this environment.
     environment: pypi
     permissions:
       id-token: write
@@ -90,78 +39,13 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
           path: dist
-      # As an annotation rather than plain stdout, for the same reason as the
-      # OIDC check below: this is the other half of any upload failure, and
-      # reading it should not require pulling the whole job log.
-      - name: List artifacts
-        run: |
-          python - <<'PY'
-          import pathlib
-          files = sorted(pathlib.Path("dist").iterdir())
-          listing = ", ".join(f"{f.name} ({f.stat().st_size // 1024} KiB)" for f in files)
-          print(f"::notice title=dist ({len(files)} files)::{listing}")
-          for f in files:
-              print(f"{f.stat().st_size:>12}  {f.name}")
-          PY
 
-      # Do the OIDC exchange ourselves first, purely to report the outcome.
-      #
-      # When trusted publishing is misconfigured, gh-action-pypi-publish fails
-      # with the reason buried in a ~60 KB job log, which is a miserable way to
-      # learn that a form field has a typo in it. PyPI's mint-token endpoint
-      # returns a precise error — `invalid-publisher` along with the claims it
-      # actually saw — so asking it directly turns "the publish step failed"
-      # into "PyPI expected repo X, workflow Y, environment Z".
-      #
-      # This does not replace the publish step and never blocks it: it only ever
-      # annotates. The token minted here is discarded.
-      - name: Report the trusted-publishing exchange
-        continue-on-error: true
-        env:
-          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
-        run: |
-          python - <<'PY'
-          import json, os, urllib.request
+      - name: What is being published
+        run: ls -lh dist
 
-          def annotate(level, title, message):
-              one_line = " ".join(str(message).split())
-              print(f"::{level} title={title}::{one_line}")
-
-          url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
-          token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
-          if not (url and token):
-              annotate("warning", "OIDC unavailable",
-                       "No id-token request URL. The job needs permissions.id-token: write.")
-              raise SystemExit(0)
-
-          req = urllib.request.Request(
-              f"{url}&audience=pypi", headers={"Authorization": f"bearer {token}"}
-          )
-          oidc = json.load(urllib.request.urlopen(req, timeout=30))["value"]
-
-          mint = urllib.request.Request(
-              "https://pypi.org/_/oidc/mint-token",
-              data=json.dumps({"token": oidc}).encode(),
-              headers={"Content-Type": "application/json"},
-          )
-          try:
-              with urllib.request.urlopen(mint, timeout=30) as resp:
-                  body = json.load(resp)
-              if body.get("token"):
-                  annotate("notice", "Trusted publishing OK",
-                           "PyPI accepted the OIDC identity and issued a scoped token.")
-              else:
-                  annotate("error", "Trusted publishing rejected", body)
-          except urllib.error.HTTPError as exc:
-              detail = exc.read().decode("utf-8", "replace")
-              annotate("error", f"Trusted publishing rejected ({exc.code})", detail)
-          PY
-
-      # skip-existing, because 0.3.0's twenty wheels were accepted during the
-      # runs where only the sdist was rejected. Without this the job fails on
-      # "file already exists" before it ever reaches the file that still needs
-      # uploading.
+      # skip-existing makes a re-run a no-op rather than a failure: PyPI files
+      # are immutable, so a second attempt at an already-published version would
+      # otherwise fail on the first file it recognises.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
