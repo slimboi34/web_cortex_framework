@@ -1,0 +1,77 @@
+name: Experiment — 3.14 gil_used
+
+# Not part of CI. Dispatch-only, and deliberately allowed to fail: this exists
+# to answer one question and should be deleted once it has.
+#
+# QUESTION
+# --------
+# `_core` cannot be imported on GIL-enabled CPython 3.14.7:
+#
+#     ValueError: module functions cannot set METH_CLASS or METH_STATIC
+#
+# but imports fine on *free-threaded* 3.14.7, and on 3.12 and 3.13. The only
+# declaration that treats those two builds differently is
+#
+#     #[pymodule(gil_used = false)]
+#
+# which is how the extension tells CPython it does not need the GIL re-enabled.
+# If pyo3's code path for that attribute is what 3.14.7 now rejects, then
+# building without it should import cleanly — on the same interpreter, same
+# commit, same everything else.
+#
+# A pass here does NOT mean "remove gil_used". It means the cause is located,
+# and the fix belongs upstream in pyo3 rather than in a support matrix.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "3.14 GIL, gil_used = false (current)"
+            python: "3.14"
+            patch: "no"
+          - label: "3.14 GIL, attribute removed"
+            python: "3.14"
+            patch: "yes"
+          - label: "3.14t free-threaded, gil_used = false (control)"
+            python: "3.14t"
+            patch: "no"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Probe
+        shell: bash
+        run: |
+          if [ "${{ matrix.patch }}" = "yes" ]; then
+            sed -i 's/#\[pymodule(gil_used = false)\]/#[pymodule]/' \
+              crates/webcortex-py/src/lib.rs
+            grep -n "pymodule" crates/webcortex-py/src/lib.rs
+          fi
+
+          uv venv --python ${{ matrix.python }}
+          uv pip install maturin
+          source .venv/bin/activate
+          python -c "import sys; print(f'::notice title=interpreter::{sys.version}')"
+          maturin develop --uv
+
+          # The whole experiment is this import.
+          python - <<'PY'
+          import sys
+          label = "${{ matrix.label }}"
+          try:
+              from webcortex import _core
+          except Exception as exc:
+              print(f"::error title=FAILED — {label}::{type(exc).__name__}: {exc}")
+              raise SystemExit(1)
+          print(f"::notice title=IMPORTED — {label}::_core {_core.__version__} on {sys.version.split()[0]}")
+          PY
