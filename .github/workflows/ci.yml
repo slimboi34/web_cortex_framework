@@ -54,7 +54,7 @@ jobs:
         # ship, and a tolerated failure is a failure nobody reads. Restore this
         # to ["3.12", "3.13", "3.14", "3.14t"] the day it can pass.
         # Tracked in AGENTS.md §11.
-        python: ["3.12", "3.13", "3.14t"]
+        python: ["3.12", "3.13", "3.14", "3.14t"]
         exclude:
           # Keep the matrix affordable; macOS covers the free-threaded path.
           - os: ubuntu-latest
