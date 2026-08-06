@@ -59,6 +59,11 @@ jobs:
           uv venv --python ${{ matrix.python }}
           uv pip install maturin pytest
           source .venv/bin/activate
+          # The exact patch release matters. `3.14` is a moving target — uv
+          # hands out whatever the newest build is at the time the runner runs,
+          # which is why the same commit passed at 09:54 and failed at 10:17.
+          # Without this line the log gives no way to tell those two apart.
+          python -c "import sys; print('interpreter:', sys.version)"
           maturin develop --uv
           # Import the COMPILED extension explicitly. The obvious smoke check —
           # `import webcortex; webcortex.free_threaded()` — proves nothing about
@@ -68,7 +73,22 @@ jobs:
           # first thing to actually import _core was a server subprocess inside
           # a module-scoped fixture, so a one-line binding failure surfaced as
           # forty unexplained fixture errors several minutes later.
-          python -c "from webcortex import _core; print('_core ok', _core.__version__)"
+          #
+          # The failure is also raised as a workflow annotation. A binding error
+          # is one line; without an annotation the only way to read that line is
+          # to pull the whole ~60 KB job log, which is a poor trade for one line
+          # and is awkward from anything but a browser.
+          python - <<'PY'
+          import sys, traceback
+          try:
+              from webcortex import _core
+          except Exception as exc:
+              detail = f"{type(exc).__name__}: {exc}"
+              print(f"::error title=_core failed to import on CPython {sys.version.split()[0]}::{detail}")
+              traceback.print_exc()
+              raise SystemExit(1)
+          print("_core ok", _core.__version__)
+          PY
           python -c "import webcortex; print(webcortex.__version__, 'free_threaded=', webcortex.free_threaded())"
           pytest tests/ -q
 
