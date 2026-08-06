@@ -129,15 +129,16 @@ def triage(ctx, input):
 
 ## Status
 
-!!! warning "Pre-release"
-    v0.3.0. Working and tested, but young. Read
-    [Deployment](deployment.md#is-it-production-ready) for an honest assessment
-    of what it is and is not ready for.
+!!! warning "Young"
+    v0.3.1, on PyPI as `web-cortex-framework`. Working and tested, but young.
+    Read [Deployment](deployment.md#is-it-production-ready) for an honest
+    assessment of what it is and is not ready for.
 
 **Verified:** 251 tests (66 Rust, 185 Python, including a 54-test adversarial
 suite). Clippy clean. `cargo audit` clean. CI builds wheels for Linux
-(x86_64/aarch64), macOS (arm64/x86_64), and Windows across Python
-3.12/3.13/3.14/3.14t.
+(x86_64/aarch64), macOS (arm64/x86_64), and Windows across Python 3.12, 3.13
+and free-threaded 3.14 (`3.14t`). GIL-enabled 3.14 is not supported — see
+[Installation](installation.md#from-pypi).
 
 **Measured:** CPU-bound Python handlers scale **4.82x** at concurrency 8 on a
 free-threaded build, against **1.38x** on a GIL build. Soak: 1,786,805 requests

@@ -43,8 +43,8 @@ logging to `info`.
 
 ```console
 $ webcortex dev --port 3000
-  webcortex 0.3.0  ·  supportdesk
-  python 3.14.4 (free-threaded)
+  webcortex 0.3.1  ·  supportdesk
+  python 3.14.7 (free-threaded)
   12 routes, 10 served without touching Python
   8 agent tools: list_tickets, get_tickets, create_tickets, … +3
   agents: assistant

@@ -4,19 +4,25 @@
 
 | | |
 |---|---|
-| Python | 3.12 or newer. 3.13+ **free-threaded** is the fast path — see below. |
+| Python | 3.12, 3.13, or free-threaded 3.14 (`3.14t`). **Not GIL-enabled 3.14** — see below. |
 | OS | Linux (x86_64/aarch64), macOS (Apple Silicon/Intel), Windows (x64) |
 | Rust | Only if building from source, or installing from an sdist |
 
 ## From PyPI
 
-!!! warning "Not yet published"
-    WebCortex is pre-release and not on PyPI yet. Build from source for now.
-    Once released:
-
 ```console
 $ pip install web-cortex-framework
 ```
+
+!!! warning "GIL-enabled CPython 3.14 is not supported"
+    The compiled extension cannot be imported on CPython 3.14.7:
+    `ValueError: module functions cannot set METH_CLASS or METH_STATIC`. No
+    `cp314` wheel is published, so pip will fall back to the sdist and the
+    failure will surface at import rather than install.
+
+    3.12, 3.13 and the **free-threaded** 3.14 build (`3.14t`) are unaffected.
+    Use one of those. Tracked in
+    [AGENTS.md §11](https://github.com/slimboi34/web_cortex_framework/blob/main/AGENTS.md).
 
 The distribution is `web-cortex-framework`; the import is `webcortex`. Same
 split as `djangorestframework` → `import rest_framework`.
@@ -30,7 +36,7 @@ from webcortex import WebCortex   # not "web_cortex_framework"
 ```console
 $ git clone https://github.com/slimboi34/web_cortex_framework
 $ cd web_cortex_framework
-$ uv venv --python 3.14
+$ uv venv --python 3.13          # or 3.14t; not 3.14
 $ uv pip install maturin
 $ .venv/bin/maturin develop --uv
 ```
@@ -43,7 +49,7 @@ Verify:
 ```console
 $ .venv/bin/webcortex --help
 $ .venv/bin/python -c "import webcortex; print(webcortex.__version__)"
-0.3.0
+0.3.1
 ```
 
 ## Free-threaded Python
@@ -60,8 +66,8 @@ Python-backed routes.
 === "pyenv"
 
     ```console
-    $ pyenv install 3.14.4t
-    $ pyenv local 3.14.4t
+    $ pyenv install 3.14.7t
+    $ pyenv local 3.14.7t
     ```
 
 === "python.org installer"
@@ -79,7 +85,7 @@ print(webcortex.free_threaded())   # True on a GIL-disabled build
 `webcortex dev` prints it at startup:
 
 ```
-  python 3.14.4 (free-threaded)
+  python 3.14.7 (free-threaded)
 ```
 
 ### Why it matters
