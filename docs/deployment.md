@@ -28,7 +28,7 @@ An honest answer, because the useful version is qualified.
 1.79M requests soaked with zero errors and stable memory, wheels building on
 five platform targets across four interpreter versions.
 
-**What is young:** v0.3.0, one author, no production users yet.
+**What is young:** v0.3.1, one author, no production users yet.
 
 ---
 
@@ -78,24 +78,17 @@ app = WebCortex(
 
 ## Docker
 
+There is no build stage: `pip install` pulls a prebuilt wheel, so the image
+needs no Rust toolchain and no compiler.
+
 ```dockerfile title="Dockerfile"
-FROM python:3.14-slim AS build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential curl && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+# 3.13, or 3.14t for free-threading. Not python:3.14-slim — the extension does
+# not import on GIL-enabled 3.14. See Installation.
+FROM python:3.13-slim
 
-WORKDIR /build
-COPY . .
-RUN pip install --no-cache-dir maturin && \
-    maturin build --release --out /dist
-
-# ---
-FROM python:3.14-slim
 RUN useradd --create-home --uid 10001 app
 WORKDIR /app
-COPY --from=build /dist/*.whl /tmp/
-RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl
+RUN pip install --no-cache-dir web-cortex-framework
 COPY --chown=app:app . .
 USER app
 
@@ -108,9 +101,10 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
 CMD ["webcortex", "run", "api.py"]
 ```
 
-!!! tip "Once published, the build stage disappears"
-    `pip install web-cortex-framework` will pull a prebuilt wheel, so no Rust
-    toolchain is needed in the image at all.
+!!! tip "Pin the version"
+    `pip install web-cortex-framework==0.3.1` in an image you intend to
+    redeploy. The wheel is prebuilt for Linux x86_64 and aarch64, so the install
+    is a download, not a compile.
 
 ```yaml title="docker-compose.yml"
 services:
@@ -175,7 +169,7 @@ volumes: { appdata: }
 present an API key.
 
 ```json
-{"status": "ok", "app": "myapp", "version": "0.3.0",
+{"status": "ok", "app": "myapp", "version": "0.3.1",
  "routes": 12, "tools": 8, "agents": 1, "python_workers": 10}
 ```
 

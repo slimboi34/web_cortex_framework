@@ -54,8 +54,8 @@ Run it:
 
 ```console
 $ webcortex dev
-  webcortex 0.3.0  ·  supportdesk
-  python 3.14.4 (free-threaded)
+  webcortex 0.3.1  ·  supportdesk
+  python 3.14.7 (free-threaded)
   7 routes, 7 served without touching Python
   5 agent tools: list_tickets, get_tickets, create_tickets, update_tickets, delete_tickets
   security: auth, rate-limited, headers
