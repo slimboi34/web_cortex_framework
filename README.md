@@ -1,8 +1,15 @@
 # WebCortex
 
-> **Status: pre-release.** Not yet published; build from source. Once released it
-> installs as **`web-cortex-framework`** and imports as **`webcortex`** — the same
+```bash
+pip install web-cortex-framework
+```
+
+> Installs as **`web-cortex-framework`**, imports as **`webcortex`** — the same
 > split as `djangorestframework` → `import rest_framework`.
+>
+> **On CPython 3.14, use the free-threaded build (`3.14t`) or pin to 3.13.** The
+> extension does not import on 3.14.7 with the GIL enabled; see
+> [Known issue](#known-issue-cpython-3147-with-the-gil-enabled) below.
 
 **📖 [Documentation](https://slimboi34.github.io/web_cortex_framework/)** ·
 [Tutorial](https://slimboi34.github.io/web_cortex_framework/tutorial/) ·
@@ -54,9 +61,8 @@ headers. No second file, no schema written twice, no drift.
 ## Start here
 
 ```bash
-# Not yet on PyPI — see Status below. For now, build from source:
-git clone https://github.com/slimboi34/web_cortex_framework && cd webcortex
-uv venv --python 3.14 && uv pip install maturin && maturin develop --uv
+# 3.13, or the free-threaded 3.14t — not GIL-enabled 3.14. See Known issue.
+uv venv --python 3.13 && uv pip install web-cortex-framework
 
 webcortex new myapp                # --template api | fullstack | agent | behaviour
 cd myapp
