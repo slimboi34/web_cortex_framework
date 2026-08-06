@@ -63,6 +63,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # EXPERIMENT: bust the cache. A dispatch-only probe on this same commit
+          # and the same 3.14.7 build imported `_core` cleanly, while this job
+          # kept failing — and the probe's only material difference was a cold
+          # cache, because rust-cache keys per workflow. If a stale artifact from
+          # before the pyo3 0.29.1 -> 0.29.2 pin is being reused, that is the
+          # whole bug and 3.14 was never broken.
+          prefix-key: "probe-cold"
       - uses: astral-sh/setup-uv@v5
       - name: Build and test
         shell: bash
