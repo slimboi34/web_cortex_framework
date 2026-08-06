@@ -3,6 +3,44 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, minor bumps may contain breaking changes.
 
+## [0.3.1] — 2026-08-06
+
+Packaging and supported-interpreter corrections. No library behaviour changed.
+
+### Removed
+
+- **GIL-enabled CPython 3.14 is no longer supported**, and no `cp314` wheel is
+  built or published. The extension cannot be imported on CPython 3.14.7:
+  `ValueError: module functions cannot set METH_CLASS or METH_STATIC`. 3.12,
+  3.13, 3.14.6 and the free-threaded 3.14 build are all unaffected, so this is
+  neither a regression here nor a free-threading problem. Publishing a wheel
+  that installs cleanly and then fails at import is worse than publishing none —
+  the error arrives later, further from its cause. Use 3.13 or `3.14t`.
+
+  0.3.0 still carries its `cp314` files; PyPI is immutable. The investigation,
+  including what has been ruled out, is in AGENTS.md §11.
+
+### Fixed
+
+- The sdist now contains `LICENSE`. Declaring `license = { text = "Apache-2.0" }`
+  makes maturin write `License-File: LICENSE` into the metadata, and PyPI
+  enforces that claim — 0.3.0's sdist was rejected with
+  `400 License-File LICENSE does not exist in distribution file` and that release
+  shipped wheels only. Wheels were unaffected because maturin copies the file
+  into `.dist-info` itself.
+- The README no longer says the project is unpublished. It is the
+  `long_description`, so that text was the PyPI landing page.
+
+### Added
+
+- `AGENTS.md`: a machine-facing reference for AI coding tools — the full API
+  surface with exact signatures and defaults, the parameter-binding order, the
+  scope and delegation model, and the failure modes that are cheap to hit and
+  expensive to diagnose.
+- CI reports the resolved interpreter and any `_core` import failure as workflow
+  annotations. `3.14` is a moving target that `uv` re-resolves per run, so the
+  same commit could pass and fail half an hour apart with no way to tell why.
+
 ## [0.3.0] — 2026-08-04
 
 The first release intended for other people to install.

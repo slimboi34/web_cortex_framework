@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "webcortex-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2745,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "webcortex-py"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "futures",

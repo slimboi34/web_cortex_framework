@@ -7,7 +7,7 @@ build-backend = "maturin"
 # Both are available on PyPI — the split is for ergonomics, not necessity, the
 # same way djangorestframework imports as `rest_framework`.
 name = "web-cortex-framework"
-version = "0.3.0"
+version = "0.3.1"
 description = "A Rust-cored Python web framework where every route is also an agent tool."
 readme = "README.md"
 requires-python = ">=3.12"
