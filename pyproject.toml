@@ -46,3 +46,16 @@ manifest-path = "crates/webcortex-py/Cargo.toml"
 python-source = "python"
 module-name = "webcortex._core"
 features = []
+
+# LICENSE has to be shipped in the sdist explicitly.
+#
+# `license = { text = "Apache-2.0" }` above makes maturin write
+# `License-File: LICENSE` into the metadata, and PyPI enforces that claim: it
+# rejects a distribution whose declared License-File is not actually inside it,
+# with `400 License-File LICENSE does not exist in distribution file`.
+#
+# Wheels were unaffected — maturin copies LICENSE into the .dist-info itself —
+# so all twenty uploaded and only the sdist was refused. The sdist is built from
+# the crate at manifest-path, and LICENSE lives at the repository root, outside
+# it, so nothing pulled it in.
+include = [{ path = "LICENSE", format = "sdist" }]
