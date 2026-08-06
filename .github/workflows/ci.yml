@@ -39,23 +39,22 @@ jobs:
   python:
     name: Python ${{ matrix.python }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # GIL-enabled 3.14 is a known-failing target and is reported, not enforced.
-    # CPython 3.14.7 (released 2026-08-05) cannot import the compiled extension:
-    # "module functions cannot set METH_CLASS or METH_STATIC". 3.14.6 is fine and
-    # so is free-threaded 3.14.7, so this is neither a regression in this repo
-    # nor a free-threading problem — and because uv resolves `3.14` to the newest
-    # patch build at run time, the job cannot be made green by anything in here.
-    #
-    # It stays in the matrix, and stays loud in the annotations, because it is the
-    # only thing watching for a fix upstream. Remove this line the day it passes;
-    # a permanently-tolerated failure is a failure nobody reads.
-    # Tracked in AGENTS.md §11.
-    continue-on-error: ${{ matrix.python == '3.14' }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.12", "3.13", "3.14", "3.14t"]
+        # GIL-enabled 3.14 is deliberately absent. CPython 3.14.7 cannot import
+        # the compiled extension ("module functions cannot set METH_CLASS or
+        # METH_STATIC"), and since uv resolves `3.14` to whatever patch build is
+        # newest when a runner starts, nothing in this repository can make that
+        # job green. Free-threaded 3.14t is unaffected and is tested below.
+        #
+        # It was briefly kept as a continue-on-error job. That was the wrong
+        # call: it put a permanent red X on every release for a target we do not
+        # ship, and a tolerated failure is a failure nobody reads. Restore this
+        # to ["3.12", "3.13", "3.14", "3.14t"] the day it can pass.
+        # Tracked in AGENTS.md §11.
+        python: ["3.12", "3.13", "3.14t"]
         exclude:
           # Keep the matrix affordable; macOS covers the free-threaded path.
           - os: ubuntu-latest
@@ -153,10 +152,13 @@ jobs:
         with:
           target: ${{ matrix.target }}
           # PyO3 without abi3 needs one wheel per interpreter version.
+          # cp314 (GIL-enabled) is omitted on purpose — see the python job above.
+          # Shipping a wheel that cannot import is worse than shipping none: pip
+          # installs it happily and the failure arrives later, at import.
           args: >-
             --release
             --out dist
-            --interpreter 3.12 3.13 3.14 3.14t
+            --interpreter 3.12 3.13 3.14t
           manylinux: auto
           sccache: "true"
       - uses: actions/upload-artifact@v4
