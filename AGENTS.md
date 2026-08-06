@@ -423,12 +423,11 @@ warning to **stderr**. If you are scripting a gate, check
 
 ---
 
-## 11. Known issue: CPython 3.14.7 with the GIL enabled
+## 11. Resolved: the CPython 3.14 import failure
 
-**Status: open, and GIL-enabled 3.14 is consequently unsupported.** No cp314
-wheel is built or published; the matrix does not test it. Free-threaded 3.14
-(`3.14t`) is supported and tested. Read this before diagnosing any `_core`
-import failure.
+**Status: fixed in 0.3.2.** 3.12, 3.13 and 3.14 — GIL-enabled and free-threaded
+— are all supported, tested and shipped. Kept here because the *reason* it took
+a day to find is a trap worth not repeating.
 
 On CPython **3.14.7 with the GIL enabled**, importing the compiled extension
 fails:
@@ -439,33 +438,43 @@ ValueError: module functions cannot set METH_CLASS or METH_STATIC
 
 Established by controlled runs, not inference:
 
-| interpreter | build | result |
+| interpreter | pyo3 0.29.1 | pyo3 0.29.2 |
 | --- | --- | --- |
-| 3.12, 3.13 | GIL-enabled | passes |
-| 3.14.6 (10 Jun 2026) | GIL-enabled | passes |
-| **3.14.7 (5 Aug 2026)** | **GIL-enabled** | **fails** |
-| 3.14.7 (5 Aug 2026) | free-threaded (`3.14t`) | passes |
+| 3.12, 3.13 | passes | passes |
+| 3.14.6, GIL-enabled | passes | passes |
+| **3.14.7, GIL-enabled** | **fails** | **passes** |
+| 3.14.7 free-threaded (`3.14t`) | passes | passes |
 
-Notes for anyone picking this up:
+### The cause
 
-- It is **not** intermittent, despite looking that way. `uv` resolves `3.14` to
-  whatever patch build is newest when a runner starts, so the same commit changed
-  verdict inside half an hour and platforms flipped one at a time as they rolled
-  forward. CI now prints the interpreter as a `::notice::` annotation on every
-  job for exactly this reason.
-- It is **not** the pyo3 version. `crates/webcortex-py/Cargo.toml` pins pyo3
-  `0.29.2` and the failure persists. The pin was a hypothesis and is now
-  falsified; it can be relaxed back to `"0.29"` once the real cause is known.
-- Nothing in `crates/` declares `#[staticmethod]` or `#[classmethod]`. The module
-  is three `add_class` calls, an exception type, and five plain `#[pyfunction]`s.
-  The flags come from generated code.
-- CPython raises this when a method definition carrying `METH_CLASS` or
-  `METH_STATIC` is used to build a **module-level** function.
+pyo3 **0.29.1**, fixed upstream in **0.29.2**.
 
-Next steps if you are investigating: pin the CPython patch version to reproduce
-deliberately, then reduce the module to a single function to find which construct
-emits the flags. Check for an upstream pyo3 issue first — this is very likely
-theirs, not ours.
+### Why that took a day to establish
+
+`crates/webcortex-py/Cargo.toml` was changed to require `0.29.2` early on. The
+failure continued, so the fix looked falsified — and on that basis 3.14 was
+dropped from the matrix and the wheel set entirely.
+
+It had never been built. `Cargo.lock` still pinned `0.29.1`. Cargo resolves the
+newer version at build time, so any *fresh* build was correct, but
+`Swatinem/rust-cache` keys its cache off `Cargo.lock` — which had not changed —
+so every CI job restored objects compiled against the broken version.
+
+The tell was available and went unread for hours: a dispatch-only probe on the
+same commit and the same 3.14.7 build imported cleanly, and its only material
+difference from the failing job was a cold cache.
+
+### What now prevents a repeat
+
+- `Cargo.lock` pins 0.29.2 explicitly.
+- The rust-cache key hashes `Cargo.toml` as well as `Cargo.lock`, so a manifest
+  change invalidates the cache even when the lock lags behind it.
+- CI prints the resolved interpreter as a `::notice::` on every job, and raises
+  `_core` import failures as `::error::` annotations.
+
+**If you are ever debugging a dependency fix that appears not to work: build once
+with a cold cache before concluding anything.** A cache that silently serves
+objects from before your change will falsify a correct hypothesis.
 
 **Symptom to recognise:** a wall of ~100 pytest fixture errors that all bottom
 out in `from . import _core`. That is one binding failure, not a hundred test
@@ -479,7 +488,7 @@ three seconds rather than several minutes.
 ### Build a working copy
 
 ```bash
-uv venv --python 3.13          # 3.12 or 3.13; avoid 3.14 until §11 is fixed
+uv venv --python 3.14t         # or 3.12 / 3.13 / 3.14
 uv pip install maturin pytest
 source .venv/bin/activate
 maturin develop --uv
@@ -506,11 +515,10 @@ reads.
   file turns a warning into a build failure. Relative links out of `docs/` (e.g.
   `../examples/`) do not resolve on the published site — use absolute GitHub
   URLs.
-- **The Python matrix is 3.12, 3.13, 3.14t** across ubuntu and macOS, and wheels
-  build for the same three on Linux x86_64/aarch64, macOS x86_64/aarch64, and
-  Windows x64. GIL-enabled 3.14 is excluded from both — see §11. Add it back to
-  both lists together; a tested target that ships no wheel, or a shipped wheel
-  nothing tests, is worse than either.
+- **The Python matrix is 3.12, 3.13, 3.14, 3.14t** across ubuntu and macOS, and
+  wheels build for the same four on Linux x86_64/aarch64, macOS x86_64/aarch64,
+  and Windows x64. Change those two lists together: a tested target that ships no
+  wheel, or a shipped wheel nothing tests, is worse than either.
 - **PyO3 is used without `abi3`**, because the free-threaded builds expose a
   distinct ABI that cannot be combined with the stable-ABI feature. That is why
   there is one wheel per interpreter version rather than one abi3 wheel.
