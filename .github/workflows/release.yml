@@ -112,9 +112,6 @@ jobs:
       #
       # This does not replace the publish step and never blocks it: it only ever
       # annotates. The token minted here is discarded.
-      - name: Install twine
-        run: pip install --disable-pip-version-check --quiet twine
-
       - name: Report the trusted-publishing exchange
         continue-on-error: true
         env:
@@ -156,56 +153,12 @@ jobs:
           except urllib.error.HTTPError as exc:
               detail = exc.read().decode("utf-8", "replace")
               annotate("error", f"Trusted publishing rejected ({exc.code})", detail)
-              raise SystemExit(0)
-
-          # Attempt the upload directly, so PyPI's own rejection is legible.
-          #
-          # By this point the identity is known good and the artifacts are known
-          # well-formed, which means the only remaining explanation lives in the
-          # HTTP response to the upload — and that is precisely the thing the
-          # action buries. twine surfaces it, so ask twine.
-          #
-          # --skip-existing keeps this idempotent: on a re-run it is a no-op
-          # rather than a "file already exists" failure.
-          import subprocess, pathlib, sys
-          files = [str(p) for p in sorted(pathlib.Path("dist").iterdir())]
-          proc = subprocess.run(
-              # --verbose is what makes PyPI's response *body* appear. Without
-              # it twine prints only the status line, which for this failure is
-              # the uninformative "400 Bad Request from .../legacy/ Bad Request".
-              [sys.executable, "-m", "twine", "upload", "--non-interactive",
-               "--verbose", "--skip-existing", "--disable-progress-bar", *files],
-              env={**os.environ,
-                   "TWINE_USERNAME": "__token__",
-                   "TWINE_PASSWORD": body["token"],
-                   "TWINE_REPOSITORY_URL": "https://upload.pypi.org/legacy/"},
-              capture_output=True, text=True,
-          )
-          print(proc.stdout)
-          print(proc.stderr, file=sys.stderr)
-          if proc.returncode == 0:
-              annotate("notice", "Upload accepted",
-                       "PyPI accepted every file in dist.")
-          else:
-              # --verbose makes the output long, and the explanation is rarely
-              # the last line — it sits in the response body a little above the
-              # traceback. Pull the lines that carry meaning and fall back to the
-              # tail only if none match, rather than truncating blindly.
-              combined = f"{proc.stdout}\n{proc.stderr}".splitlines()
-              signal = [
-                  ln.strip() for ln in combined
-                  if any(k in ln for k in ("400", "403", "Bad Request", "ERROR",
-                                           "Uploading", "not allowed", "already",
-                                           "invalid", "Invalid", "reason"))
-              ]
-              picked = signal[-12:] or [ln.strip() for ln in combined if ln.strip()][-12:]
-              annotate("error", f"PyPI rejected the upload (exit {proc.returncode})",
-                       " | ".join(picked))
           PY
 
-      # skip-existing, because the diagnostic step above may already have
-      # uploaded these files. This step remains the real publisher — it is the
-      # one that mints and attaches PEP 740 attestations.
+      # skip-existing, because 0.3.0's twenty wheels were accepted during the
+      # runs where only the sdist was rejected. Without this the job fails on
+      # "file already exists" before it ever reaches the file that still needs
+      # uploading.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
