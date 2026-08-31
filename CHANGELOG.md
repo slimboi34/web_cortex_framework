@@ -3,7 +3,7 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, minor bumps may contain breaking changes.
 
-## [0.3.2] — 2026-08-06
+## [0.3.2] — 2026-08-31
 
 ### Fixed
 
@@ -22,6 +22,16 @@ while the major version is 0, minor bumps may contain breaking changes.
   published. 0.3.1 dropped both on the strength of the failure above, which was
   never a real incompatibility. Supported: 3.12, 3.13, 3.14 and free-threaded
   3.14 (`3.14t`).
+- The documentation site is deployed to Railway.
+
+### Security
+
+- `h2` 0.4.15 → 0.4.19 in `Cargo.lock` for [RUSTSEC-2026-0258] (unbounded empty
+  DATA frames). The advisory landed 17 Aug, between this release being cut and
+  it being published, and the release gate's `cargo audit` rightly refused to
+  ship it. `h2` is a transitive dependency (via hyper); no API involved.
+
+[RUSTSEC-2026-0258]: https://rustsec.org/advisories/RUSTSEC-2026-0258
 
 ## [0.3.1] — 2026-08-06
 
