@@ -121,6 +121,10 @@ describe itself to the model writing it.
 - The agent runtime now propagates nesting depth into its tool calls. In 0.3
   it reset depth to zero, so an agent calling a behaviour calling the agent
   bypassed the nesting ceiling that behaviours alone respected.
+- Unused dependencies are gone: five Rust crates (`anyhow`, `thiserror`,
+  `hmac`, `async-stream`, `pin-project-lite`), four features nothing used
+  (sqlx `json` and `macros`, reqwest `stream` and `charset`), and `httpx` from
+  the `dev` extra.
 
 ### Verified
 
