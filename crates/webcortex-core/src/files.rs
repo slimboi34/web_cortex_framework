@@ -81,7 +81,7 @@ impl FileServer {
     /// result is still under the root (which also catches symlinks pointing
     /// out of the tree).
     fn resolve(&self, relative: &str) -> Option<PathBuf> {
-        let decoded = percent_decode(relative);
+        let decoded = crate::http::percent_decode(relative, false);
         // A NUL byte can truncate a path inside some syscalls.
         if decoded.contains('\0') {
             return None;
@@ -121,30 +121,6 @@ fn weak_etag(bytes: &[u8]) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     format!("W/\"{hex}\"")
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(b) => {
-                    out.push(b);
-                    i += 3;
-                }
-                Err(_) => {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]

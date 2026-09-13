@@ -126,6 +126,13 @@ describe itself to the model writing it.
   (sqlx `json` and `macros`, reqwest `stream` and `charset`), and `httpx` from
   the `dev` extra.
 
+### Fixed
+
+- Percent-decoding panicked on a `%` followed by a multi-byte character (a 500
+  through the request path's panic boundary). The three copies of the decoder,
+  for query strings, the file server and the proxy path-traversal check, are
+  now one that works on bytes.
+
 ### Verified
 
 326 tests (95 Rust, 231 Python). Clippy clean. `cargo audit` clean.
