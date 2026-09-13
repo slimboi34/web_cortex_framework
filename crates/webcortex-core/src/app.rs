@@ -518,7 +518,7 @@ impl App {
             .unwrap_or_else(|| SharedBudget::new(format!("behaviour:{}", def.name), def.token_budget));
         match self
             .bridge
-            .call_behaviour(app, def.clone(), input, actor.clone(), req.depth + 1, Some(budget))
+            .call_behaviour(app, def.clone(), input, actor.clone(), req.depth + 1, budget)
             .await
         {
             Ok(value) => Ok(WebCortexResponse::json(200, &value)),

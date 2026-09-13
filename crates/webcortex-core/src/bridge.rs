@@ -21,7 +21,8 @@ pub trait PyBridge: Send + Sync + 'static {
     ///
     /// Distinct from [`Self::call`] because a behaviour receives a context
     /// object rather than a request: it needs to reach back into the runtime for
-    /// tool and model calls, which a plain handler never does.
+    /// tool and model calls, which a plain handler never does. `budget` is the
+    /// request tree's; the runtime creates it when the behaviour is outermost.
     fn call_behaviour<'a>(
         &'a self,
         _app: std::sync::Arc<crate::App>,
@@ -29,9 +30,8 @@ pub trait PyBridge: Send + Sync + 'static {
         _input: serde_json::Value,
         _principal: crate::auth::Principal,
         _depth: u32,
-        _budget: Option<std::sync::Arc<crate::agent::SharedBudget>>,
+        _budget: std::sync::Arc<crate::agent::SharedBudget>,
     ) -> BoxFuture<'a, Result<serde_json::Value, String>> {
-
         Box::pin(async move {
             Err(format!(
                 "behaviour {:?} requires an interpreter, but this runtime was built without one",

@@ -117,15 +117,12 @@ impl PyBridge for PythonBridge {
         input: serde_json::Value,
         principal: webcortex_core::auth::Principal,
         depth: u32,
-        budget: Option<Arc<webcortex_core::agent::SharedBudget>>,
+        budget: Arc<webcortex_core::agent::SharedBudget>,
     ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Captured here, on a tokio thread. The behaviour later runs on a Python
         // worker thread and uses this handle to re-enter the runtime.
         let handle = tokio::runtime::Handle::current();
-        let budget = budget.unwrap_or_else(|| {
-            webcortex_core::agent::SharedBudget::new(format!("behaviour:{}", def.name), def.token_budget)
-        });
 
         let submitted = Python::attach(|py| -> PyResult<()> {
             let ctx = BehaviourContext::new(
