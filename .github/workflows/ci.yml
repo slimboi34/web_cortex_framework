@@ -64,7 +64,21 @@ jobs:
           #
           # Including Cargo.toml means a dependency change invalidates the cache
           # even when the lock lags behind it.
-          key: ${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          #
+          # The interpreter is part of the key too, and this is the important
+          # half. rust-cache keys on the job id, and every entry of this matrix
+          # shares the id `python` — so 3.12, 3.13, 3.14 and 3.14t on one OS
+          # were sharing a single cache. pyo3-ffi's build script configures
+          # itself against the interpreter it is built with (ABI flags,
+          # Py_GIL_DISABLED), and cargo's fingerprint does not include the
+          # interpreter, so a GIL-enabled 3.14 job that restored objects built
+          # by the free-threaded job imported a module compiled for the wrong
+          # ABI: `ValueError: module functions cannot set METH_CLASS or
+          # METH_STATIC`. Which job won the race to save the cache decided
+          # whether the next run passed — the "same commit passed at 09:54 and
+          # failed at 10:17" mystery below.
+          key: py${{ matrix.python }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+
       - uses: astral-sh/setup-uv@v5
       - name: Build and test
         shell: bash

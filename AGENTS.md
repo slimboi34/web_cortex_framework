@@ -638,13 +638,37 @@ The tell was available and went unread for hours: a dispatch-only probe on the
 same commit and the same 3.14.7 build imported cleanly, and its only material
 difference from the failing job was a cold cache.
 
+### The second cause, found while shipping 2.0
+
+The same error came back on the macOS 3.14 job of the 2.0.0 branch, with
+pyo3 0.29.2 correctly pinned and Homebrew's CPython 3.14.7 — a combination
+the table above says passes. The log showed the tell: the job compiled only
+`webcortex-core` and `webcortex-py`; pyo3 came from a cache whose key was
+**identical to the one the passing 3.14t job restored**.
+
+`Swatinem/rust-cache` keys on the job id, and every entry of the Python
+matrix has the id `python`, so 3.12, 3.13, 3.14 and 3.14t on one OS shared
+one cache. `pyo3-ffi`'s build script configures itself against the interpreter
+it is built with (`Py_GIL_DISABLED` among other things), and cargo's
+fingerprint does not include the interpreter. A GIL-enabled 3.14 job that
+restored objects built by the free-threaded job therefore imported a module
+compiled for the wrong ABI — and whichever matrix job won the race to save
+the cache decided whether the *next* run passed. That is what "passed at
+09:54 and failed at 10:17" was.
+
+The cache key now includes `matrix.python`. The pyo3 0.29.1 → 0.29.2 upgrade
+was still correct; it was just not the whole story.
+
 ### What now prevents a repeat
 
 - `Cargo.lock` pins 0.29.2 explicitly.
 - The rust-cache key hashes `Cargo.toml` as well as `Cargo.lock`, so a manifest
   change invalidates the cache even when the lock lags behind it.
+- The rust-cache key includes the matrix interpreter, so builds for different
+  ABIs never share compiled objects.
 - CI prints the resolved interpreter as a `::notice::` on every job, and raises
   `_core` import failures as `::error::` annotations.
+
 
 **If you are ever debugging a dependency fix that appears not to work: build once
 with a cold cache before concluding anything.** A cache that silently serves
