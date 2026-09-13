@@ -42,6 +42,14 @@ pyo3::create_exception!(
     "A behaviour was stopped by the runtime rather than by its own logic."
 );
 
+/// True when a tool call failed on the runtime's nesting ceiling, a deliberate
+/// stop rather than a handler fault. Matched on the status `call_tool_in_tree`
+/// reports: a bare "508" also matches a handler's own message, and the phrase
+/// "nesting ceiling" never appears in the error at all.
+fn is_nesting_ceiling(error: &str) -> bool {
+    error.contains("failed with 508:")
+}
+
 /// Handed to a Behaviour as `ctx`. Every method crosses back into Rust, so
 /// scopes, budgets, approval gates, and the audit trail apply to a behaviour
 /// exactly as they apply to an agent.
@@ -215,7 +223,7 @@ impl BehaviourContext {
                 self.record("call_failed", tool, serde_json::json!({"error": &e}), elapsed);
                 // The runtime's nesting ceiling is a deliberate stop, not a
                 // handler fault; surface it as a halt so the caller sees why.
-                if e.contains("508") || e.contains("nesting ceiling") {
+                if is_nesting_ceiling(&e) {
                     return Err(BehaviourHalted::new_err(format!(
                         "behaviour {:?} was stopped: {e}",
                         self.behaviour
@@ -432,7 +440,7 @@ impl BehaviourContext {
             }
         }
         if let Some(e) = first_err {
-            if e.contains("508") || e.contains("nesting ceiling") {
+            if is_nesting_ceiling(&e) {
                 return Err(BehaviourHalted::new_err(format!("behaviour {:?} was stopped: {e}", self.behaviour)));
             }
             return Err(PyRuntimeError::new_err(e));

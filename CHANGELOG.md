@@ -139,6 +139,10 @@ describe itself to the model writing it.
   through the request path's panic boundary). The three copies of the decoder,
   for query strings, the file server and the proxy path-traversal check, are
   now one that works on bytes.
+- A behaviour treated any failed tool call whose error mentioned "508" (say,
+  "order 5080 not found") as the nesting ceiling and halted, instead of
+  raising an exception it could catch. It now matches the status the runtime
+  reports.
 
 ### Verified
 

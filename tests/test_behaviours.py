@@ -226,7 +226,7 @@ def test_behaviour_endpoint_inherits_its_scopes_as_a_guard():
 
 
 APP = '''
-from webcortex import WebCortex
+from webcortex import HTTPError, WebCortex
 
 app = WebCortex("beh", database="sqlite://./beh.db", port={port})
 
@@ -298,6 +298,20 @@ def boom(ctx, input):
 def halter(ctx, input):
     ctx.halt("stopped on purpose")
     return {{"unreachable": True}}
+
+
+@app.get("/orders/{{id}}", tool=True, tool_name="lookup_order")
+def lookup_order(id: int):
+    raise HTTPError(404, f"order {{id}} not found")
+
+
+@app.behaviour("looker", tools=["lookup_order"])
+def looker(ctx, input):
+    try:
+        ctx.call("lookup_order", id=5080)
+    except RuntimeError as e:
+        return {{"error": str(e)}}
+    return {{"error": None}}
 
 
 @app.behaviour("introspect", tools=["list_tickets"])
@@ -443,6 +457,15 @@ def test_explicit_halt_is_reported_structurally(beh_server):
     assert status == 200
     assert out["halted"] is True
     assert "on purpose" in out["reason"]
+
+
+def test_a_tool_error_mentioning_508_is_not_taken_for_the_nesting_ceiling(beh_server):
+    # "order 5080 not found" contains "508". The runtime's ceiling halts a
+    # behaviour; an ordinary tool failure must stay an exception it can catch.
+    status, out = run_behaviour(beh_server, "looker")
+    assert status == 200, out
+    assert "halted" not in out, out
+    assert "order 5080 not found" in out["error"]
 
 
 def test_context_exposes_identity_and_declared_tools(beh_server):
