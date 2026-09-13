@@ -40,6 +40,7 @@ def test_every_agent_is_a_tool_named_after_itself():
     route = next(r for r in app.manifest()["routes"] if r["op"]["kind"] == "agent")
     assert route["path"] == "/agents/helper"
     assert route["input_schema"]["properties"]["session_id"]["type"] == "string"
+    assert route["input_schema"]["properties"]["reset"]["type"] == "boolean"
 
 
 def test_a_supervisor_may_list_another_agent_as_a_tool():

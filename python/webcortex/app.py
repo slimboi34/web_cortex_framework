@@ -1258,6 +1258,10 @@ class WebCortex:
                         "type": "string",
                         "description": "Continue an earlier conversation with this id.",
                     },
+                    "reset": {
+                        "type": "boolean",
+                        "description": "Discard the session's history before this turn.",
+                    },
                 },
                 "required": ["input"],
                 "additionalProperties": False,
