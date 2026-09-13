@@ -332,8 +332,7 @@ async fn classify(
         };
         app.provider().complete(&req).await?
     };
-    let spent = response.input_tokens + response.output_tokens + response.cache_read_tokens + response.cache_write_tokens;
-    let _ = budget.charge(spent);
+    let _ = budget.charge(response.total_tokens());
     app.ledger().charge(
         "flow", &def.name, &response.model,
         response.input_tokens, response.output_tokens,

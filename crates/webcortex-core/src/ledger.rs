@@ -23,15 +23,30 @@ pub struct Totals {
 
 impl Totals {
     fn add(&mut self, input: u64, output: u64, cache_read: u64, cache_write: u64) {
-        self.calls += 1;
-        self.input_tokens += input;
-        self.output_tokens += output;
-        self.cache_read_tokens += cache_read;
-        self.cache_write_tokens += cache_write;
+        self.merge(&Totals {
+            calls: 1,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+        });
+    }
+
+    /// Fold `other` into these totals. Saturating: the token counts are
+    /// whatever an upstream's `usage` field reported.
+    fn merge(&mut self, other: &Totals) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.saturating_add(other.cache_write_tokens);
     }
 
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
     }
 
     pub fn cost_usd(&self, price: &Price) -> f64 {
@@ -121,25 +136,9 @@ impl Ledger {
         let mut unpriced: Vec<String> = Vec::new();
 
         for (k, t) in &entries {
-            total.calls += t.calls;
-            total.input_tokens += t.input_tokens;
-            total.output_tokens += t.output_tokens;
-            total.cache_read_tokens += t.cache_read_tokens;
-            total.cache_write_tokens += t.cache_write_tokens;
-
-            let m = by_model.entry(k.model.clone()).or_default();
-            m.calls += t.calls;
-            m.input_tokens += t.input_tokens;
-            m.output_tokens += t.output_tokens;
-            m.cache_read_tokens += t.cache_read_tokens;
-            m.cache_write_tokens += t.cache_write_tokens;
-
-            let c = by_caller.entry(format!("{}:{}", k.kind, k.name)).or_default();
-            c.calls += t.calls;
-            c.input_tokens += t.input_tokens;
-            c.output_tokens += t.output_tokens;
-            c.cache_read_tokens += t.cache_read_tokens;
-            c.cache_write_tokens += t.cache_write_tokens;
+            total.merge(t);
+            by_model.entry(k.model.clone()).or_default().merge(t);
+            by_caller.entry(format!("{}:{}", k.kind, k.name)).or_default().merge(t);
 
             match price_for(&k.model) {
                 Some(p) => {

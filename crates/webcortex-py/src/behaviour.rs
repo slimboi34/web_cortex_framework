@@ -147,15 +147,18 @@ impl BehaviourContext {
     }
 
     fn charge_tokens(&self, input: u64, output: u64, cache: u64) -> PyResult<()> {
-        let total = self.input_tokens.fetch_add(input, Ordering::SeqCst)
-            + input
-            + self.output_tokens.fetch_add(output, Ordering::SeqCst)
-            + output
-            + self.cache_tokens.fetch_add(cache, Ordering::SeqCst)
-            + cache;
+        // Saturating, like the shared budget: the counts come from upstream.
+        let add = |counter: &AtomicU64, n: u64| match counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_add(n)))
+        {
+            Ok(c) | Err(c) => c.saturating_add(n),
+        };
+        let total = add(&self.input_tokens, input)
+            .saturating_add(add(&self.output_tokens, output))
+            .saturating_add(add(&self.cache_tokens, cache));
         // The tree's ceiling is checked as well as the behaviour's own, so a
         // behaviour launched by an agent cannot outspend the agent's budget.
-        if let Err(e) = self.budget.charge(input + output + cache) {
+        if let Err(e) = self.budget.charge(input.saturating_add(output).saturating_add(cache)) {
             return Err(BehaviourHalted::new_err(e));
         }
         if let Some(budget) = self.token_budget {
@@ -258,7 +261,7 @@ impl BehaviourContext {
         self.charge_tokens(
             response.input_tokens,
             response.output_tokens,
-            response.cache_read_tokens + response.cache_write_tokens,
+            response.cache_read_tokens.saturating_add(response.cache_write_tokens),
         )?;
 
         if structured {

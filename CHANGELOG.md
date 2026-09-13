@@ -43,7 +43,8 @@ describe itself to the model writing it.
   `SharedBudget` from its `token_budget`; it travels with every in-process
   call, and nested runs charge the same counter. `usage.tree_tokens` reports
   the total. This generalises the 0.3 depth counter: a per-frame limit is not
-  a per-request limit.
+  a per-request limit. Token arithmetic saturates, so an upstream reporting an
+  absurd `usage` cannot wrap the counter and reopen an exhausted budget.
 - `ctx.gather(...)` and `ctx.ask_many(...)` run tool calls and model calls
   concurrently from a behaviour — one wait instead of a loop of round trips —
   with the same admission, scoping, gating and charging as `call` and `ask`.

@@ -51,6 +51,17 @@ pub struct ProviderResponse {
     pub raw_content: Value,
 }
 
+impl ProviderResponse {
+    /// Every token the call spent, cached or not: what a budget is charged.
+    /// Saturating, because the counts are whatever the upstream reported.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+}
+
 /// Everything a provider needs for one completion.
 pub struct CompletionRequest<'a> {
     pub agent: &'a AgentDef,

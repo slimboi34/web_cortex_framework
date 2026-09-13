@@ -128,7 +128,10 @@ pub struct Usage {
 
 impl Usage {
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
     }
 }
 
@@ -183,9 +186,17 @@ impl SharedBudget {
     }
 
     /// Record spend. Returns `Err` once the ceiling is passed; the tokens are
-    /// still counted, because they were still spent.
+    /// still counted, because they were still spent. The counter saturates:
+    /// token counts are whatever an upstream's `usage` field says, and a
+    /// counter that wrapped would reopen a budget that was already exhausted.
     pub fn charge(&self, tokens: u64) -> Result<(), String> {
-        let total = self.used.fetch_add(tokens, Ordering::SeqCst) + tokens;
+        let previous = match self
+            .used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| Some(u.saturating_add(tokens)))
+        {
+            Ok(p) | Err(p) => p,
+        };
+        let total = previous.saturating_add(tokens);
         match self.max_tokens {
             Some(max) if total > max => Err(format!(
                 "the request tree rooted at {:?} exhausted its shared token budget of {max} \
@@ -536,7 +547,10 @@ impl AgentRuntime {
 
             self.charge(app, &mut st, "agent", &response);
             st.usage.steps += 1;
-            st.last_input_tokens = response.input_tokens + response.cache_read_tokens + response.cache_write_tokens;
+            st.last_input_tokens = response
+                .input_tokens
+                .saturating_add(response.cache_read_tokens)
+                .saturating_add(response.cache_write_tokens);
 
             st.steps.push(Step {
                 index: st.usage.steps - 1,
@@ -873,17 +887,14 @@ impl AgentRuntime {
     }
 
     fn charge(&self, app: &App, st: &mut RunState, kind: &str, response: &ProviderResponse) {
-        st.usage.input_tokens += response.input_tokens;
-        st.usage.output_tokens += response.output_tokens;
-        st.usage.cache_read_tokens += response.cache_read_tokens;
-        st.usage.cache_write_tokens += response.cache_write_tokens;
-        let spent = response.input_tokens
-            + response.output_tokens
-            + response.cache_read_tokens
-            + response.cache_write_tokens;
+        let u = &mut st.usage;
+        u.input_tokens = u.input_tokens.saturating_add(response.input_tokens);
+        u.output_tokens = u.output_tokens.saturating_add(response.output_tokens);
+        u.cache_read_tokens = u.cache_read_tokens.saturating_add(response.cache_read_tokens);
+        u.cache_write_tokens = u.cache_write_tokens.saturating_add(response.cache_write_tokens);
         // Over-budget is detected at the top of the loop; charging never fails
         // a step that already happened.
-        let _ = st.budget.charge(spent);
+        let _ = st.budget.charge(response.total_tokens());
         app.ledger().charge(
             kind,
             &st.def.name,
@@ -1431,5 +1442,15 @@ mod tests {
         let out = bounded(&v, 10);
         assert!(out.as_str().unwrap().contains("truncated"));
         assert_eq!(bounded(&v, 10_000), v);
+    }
+
+    #[test]
+    fn a_shared_budget_saturates_rather_than_wrapping() {
+        // A wrapped counter would read as nearly unspent and reopen the budget.
+        let budget = SharedBudget::new("t", Some(1_000));
+        assert!(budget.charge(u64::MAX).is_err());
+        assert!(budget.charge(u64::MAX).is_err());
+        assert_eq!(budget.used(), u64::MAX);
+        assert!(budget.exhausted());
     }
 }
