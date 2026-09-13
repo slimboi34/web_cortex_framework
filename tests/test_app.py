@@ -168,6 +168,17 @@ def test_openapi_strips_path_params_from_the_request_body():
     assert "title" in body_props
 
 
+def test_gated_tools_are_reported_under_the_names_agents_call():
+    app = make_app()
+
+    @app.post("/items/purge", tool=True, approval="required")
+    def purge() -> dict:
+        return {}
+
+    assert app.security_report()["gated_tools"] == ["create_items_purge"]
+    assert "create_items_purge" in app.check()["tools"]
+
+
 def test_generated_ddl_marks_the_primary_key():
     app = make_app()
     app.resource("books", fields={"id": int, "title": str, "year": int})

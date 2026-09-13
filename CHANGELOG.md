@@ -143,6 +143,10 @@ describe itself to the model writing it.
   "order 5080 not found") as the nesting ceiling and halted, instead of
   raising an exception it could catch. It now matches the status the runtime
   reports.
+- `security_report()["gated_tools"]`, and with it `webcortex check`, the
+  startup banner and the context pack, listed a gated route without an
+  explicit `tool_name` as `METHOD /path`. It now uses the tool name agents
+  call, as `/_webcortex/security` always did.
 
 ### Verified
 

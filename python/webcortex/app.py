@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from . import schema as _schema
 from ._bridge import Dispatcher, HTTPError, Request, Response, default_worker_count
+from .contextpack import _derive_tool_name
 
 __all__ = ["WebCortex", "Request", "Response", "HTTPError", "Resource"]
 
@@ -1397,7 +1398,7 @@ class WebCortex:
             "security_headers": self._security_headers.get("enabled", True),
             "public_routes": public,
             "gated_tools": [
-                r["tool"]["name"] or f"{r['method']} {r['path']}"
+                r["tool"]["name"] or _derive_tool_name(r["method"], r["path"])
                 for r in self._routes_with_default_root()
                 if r.get("approval") == "required"
             ],
