@@ -1109,7 +1109,7 @@ class WebCortex:
             self._add_route(
                 "POST",
                 path,
-                {"kind": "behaviour", "behaviour": behaviour_name, "handler": handler_index},
+                {"kind": "behaviour", "behaviour": behaviour_name},
                 summary=(description or doc).split("\n", 1)[0] or f"Run the {behaviour_name} behaviour",
                 description=description or doc,
                 input_schema=input_schema,
@@ -1247,7 +1247,7 @@ class WebCortex:
         guard = list(expose_scopes if expose_scopes is not None else scopes)
         self._add_route(
             "POST", path,
-            {"kind": "agent", "agent": name, "stream": False},
+            {"kind": "agent", "agent": name},
             summary=description.split("\n", 1)[0] or f"Ask the {name} agent",
             description=description or f"Ask the {name} agent.",
             input_schema={
@@ -1307,7 +1307,6 @@ class WebCortex:
             "server": {
                 "host": os.environ.get("WEBCORTEX_HOST", self.host),
                 "port": int(os.environ.get("WEBCORTEX_PORT", self.port)),
-                "python_workers": self.workers,
                 "control_prefix": self.control_prefix,
                 "request_timeout_secs": self.request_timeout,
                 "shutdown_timeout_secs": self.shutdown_timeout,

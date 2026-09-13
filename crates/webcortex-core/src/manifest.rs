@@ -513,10 +513,6 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
-    /// Number of free-threaded Python worker interpreters. `None` = auto
-    /// (cpu count). Ignored entirely if no route uses a Python op.
-    #[serde(default)]
-    pub python_workers: Option<usize>,
     /// Mount point for the introspection surfaces (OpenAPI, MCP, health).
     #[serde(default = "default_control_prefix")]
     pub control_prefix: String,
@@ -581,7 +577,6 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
-            python_workers: None,
             control_prefix: default_control_prefix(),
             request_timeout_secs: default_request_timeout(),
             shutdown_timeout_secs: default_shutdown_timeout(),
@@ -648,9 +643,6 @@ pub struct Route {
     /// Whether an agent may invoke this without a human in the loop.
     #[serde(default)]
     pub approval: Approval,
-    /// Reject requests whose body fails this JSON Schema before the op runs.
-    #[serde(default)]
-    pub validate_body: bool,
 }
 
 /// Controls whether a route is visible to agents as a callable tool.
@@ -703,12 +695,9 @@ pub enum Op {
         #[serde(default)]
         rewrite: Option<String>,
     },
-    /// Invoke a declared agent, optionally streaming tokens back over SSE.
-    Agent {
-        agent: String,
-        #[serde(default)]
-        stream: bool,
-    },
+    /// Invoke a declared agent. The result is returned whole; streaming is on
+    /// the roadmap (DESIGN.md §6).
+    Agent { agent: String },
     /// Render a server-side template.
     ///
     /// The template receives a data dictionary and nothing else — no database
@@ -727,10 +716,8 @@ pub enum Op {
     /// Run a Behaviour: Python control flow whose leaves are tool and model
     /// calls. Unlike an agent, the *structure* is deterministic — the loops and
     /// branches are code, and only the leaves are probabilistic.
-    Behaviour {
-        behaviour: String,
-        handler: u32,
-    },
+    /// The handler index lives on the [`BehaviourDef`].
+    Behaviour { behaviour: String },
     /// Serve files from a directory.
     Files {
         dir: String,
