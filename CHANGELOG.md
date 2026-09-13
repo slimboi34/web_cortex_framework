@@ -155,6 +155,10 @@ describe itself to the model writing it.
 - The `webcortex dev` / `run` banner printed the declared host and port even
   when `WEBCORTEX_HOST` or `WEBCORTEX_PORT` moved the server. It prints the
   address that binds.
+- `sqlite://:memory:` served no tables: `run()` applied the DDL on its own
+  `sqlite3` connection, a separate database the runtime never saw. The runtime
+  now applies the DDL through its pool at startup, and holds an in-memory
+  database on one long-lived connection so every request sees the same data.
 
 ### Verified
 

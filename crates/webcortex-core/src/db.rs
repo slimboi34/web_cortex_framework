@@ -20,15 +20,30 @@ pub struct Db {
 
 impl Db {
     pub async fn connect(cfg: &DatabaseConfig) -> Result<Self, String> {
+        let filename = strip_scheme(&cfg.url);
         let opts = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(strip_scheme(&cfg.url))
+            .filename(filename)
             .create_if_missing(true);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(cfg.max_connections)
+        let mut pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(cfg.max_connections);
+        if filename == ":memory:" {
+            // Every connection to `:memory:` opens a private, empty database
+            // that vanishes when the connection closes. Hold exactly one for
+            // the life of the pool, so every query sees the same tables.
+            pool = pool
+                .max_connections(1)
+                .min_connections(1)
+                .idle_timeout(None)
+                .max_lifetime(None);
+        }
+        let pool = pool
             .connect_with(opts)
             .await
             .map_err(|e| format!("database connect failed: {e}"))?;
-        Ok(Self { pool })
+        let db = Self { pool };
+        if !cfg.schema.trim().is_empty() {
+            db.execute_raw(&cfg.schema).await?;
+        }
+        Ok(db)
     }
 
     /// Run one or more statements with no bindings. Used for schema setup.
@@ -198,4 +213,57 @@ fn decode_column(row: &sqlx::sqlite::SqliteRow, i: usize, type_name: &str) -> Va
         return v.map(Value::from).unwrap_or(Value::Null);
     }
     Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS books (id INTEGER PRIMARY KEY, title TEXT);\n\
+                          CREATE TABLE IF NOT EXISTS authors (id INTEGER PRIMARY KEY, name TEXT);";
+
+    fn config(url: &str) -> DatabaseConfig {
+        DatabaseConfig { url: url.into(), max_connections: 16, schema: SCHEMA.into() }
+    }
+
+    #[tokio::test]
+    async fn an_in_memory_database_gets_its_schema_and_keeps_it_across_queries() {
+        let db = Db::connect(&config("sqlite://:memory:")).await.expect("connects");
+        // Concurrent queries: a pool of private `:memory:` connections would
+        // hand some of them a database without the table.
+        let inserts = (0..8).map(|i| {
+            let db = &db;
+            async move {
+                let title = json!(format!("t{i}"));
+                db.run("INSERT INTO books (title) VALUES (?)", std::slice::from_ref(&title), QueryReturns::Affected)
+                    .await
+            }
+        });
+        for result in futures::future::join_all(inserts).await {
+            result.expect("every insert sees the table");
+        }
+        let count = db.run("SELECT COUNT(*) AS n FROM books", &[], QueryReturns::One).await.expect("count");
+        assert_eq!(count["n"], json!(8));
+        // Every statement of the schema ran, not only the first.
+        db.run("SELECT id, name FROM authors", &[], QueryReturns::Many).await.expect("second table exists");
+    }
+
+    #[tokio::test]
+    async fn reapplying_the_schema_to_an_existing_file_keeps_its_rows() {
+        let path = std::env::temp_dir().join(format!("webcortex-db-test-{}.sqlite", std::process::id()));
+        let url = format!("sqlite://{}", path.display());
+        {
+            let db = Db::connect(&config(&url)).await.expect("first boot");
+            db.run("INSERT INTO books (title) VALUES ('kept')", &[], QueryReturns::Affected).await.expect("insert");
+            db.pool.close().await;
+        }
+        let db = Db::connect(&config(&url)).await.expect("second boot");
+        let count = db.run("SELECT COUNT(*) AS n FROM books", &[], QueryReturns::One).await.expect("count");
+        assert_eq!(count["n"], json!(1));
+        db.pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

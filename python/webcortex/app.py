@@ -1323,7 +1323,13 @@ class WebCortex:
                 else None
             ),
             "database": (
-                {"url": os.environ.get("WEBCORTEX_DATABASE_URL", self.database), "max_connections": 16}
+                {
+                    "url": os.environ.get("WEBCORTEX_DATABASE_URL", self.database),
+                    "max_connections": 16,
+                    # Applied by the runtime through its own pool, so an
+                    # in-memory database gets its tables too.
+                    "schema": self.schema_sql,
+                }
                 if self.database
                 else None
             ),
@@ -1435,7 +1441,6 @@ class WebCortex:
         """Boot the runtime and serve. Blocks."""
         from . import _core
 
-        self._apply_schema()
         workers = self.workers or default_worker_count()
         dispatcher = Dispatcher(self._handlers, workers)
         try:
@@ -1444,29 +1449,6 @@ class WebCortex:
             pass
         finally:
             dispatcher.shutdown()
-
-    def _apply_schema(self) -> None:
-        """Create tables for declared resources.
-
-        Deliberately limited to `CREATE TABLE IF NOT EXISTS`. Real schema
-        evolution needs versioned, reviewable migrations; silently altering a
-        production table because a Python literal changed is exactly the failure
-        mode this framework should not ship.
-        """
-        if not self._schema_sql or not self.database:
-            return
-        import sqlite3
-
-        url = os.environ.get("WEBCORTEX_DATABASE_URL", self.database)
-        if not url.startswith("sqlite"):
-            return
-        filename = url.split("://", 1)[-1] if "://" in url else url.split(":", 1)[-1]
-        con = sqlite3.connect(filename)
-        try:
-            con.executescript(self.schema_sql)
-            con.commit()
-        finally:
-            con.close()
 
 
 # ----------------------------------------------------------------------

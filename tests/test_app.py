@@ -208,3 +208,13 @@ def test_generated_ddl_marks_the_primary_key():
     assert "CREATE TABLE IF NOT EXISTS books" in sql
     assert "id INTEGER PRIMARY KEY" in sql
     assert "title TEXT" in sql
+
+
+def test_the_manifest_hands_the_ddl_to_the_runtime():
+    # `run()` used to apply this on its own sqlite3 connection, which a
+    # `sqlite://:memory:` pool never saw. The runtime applies it now.
+    app = make_app()
+    app.resource("books", fields={"id": int, "title": str})
+    database = app.manifest()["database"]
+    assert database["schema"] == app.schema_sql
+    assert "CREATE TABLE IF NOT EXISTS books" in database["schema"]

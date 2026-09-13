@@ -595,6 +595,11 @@ pub struct DatabaseConfig {
     pub url: String,
     #[serde(default = "default_pool_size")]
     pub max_connections: u32,
+    /// `CREATE TABLE IF NOT EXISTS` statements for declared resources, applied
+    /// through the pool at connect. Python used to apply them on a connection
+    /// of its own, which a `:memory:` database never saw.
+    #[serde(default)]
+    pub schema: String,
 }
 
 fn default_pool_size() -> u32 {

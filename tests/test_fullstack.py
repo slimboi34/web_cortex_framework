@@ -116,7 +116,7 @@ def test_typescript_signatures_never_wrap():
 APP = '''
 from webcortex import WebCortex
 
-app = WebCortex("fs", database="sqlite://./fs.db", templates="templates", port={port})
+app = WebCortex("fs", database="{database}", templates="templates", port={port})
 
 app.resource("items", fields={{"id": int, "name": str}}, tools=True)
 
@@ -144,13 +144,14 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def page_server():
+# The in-memory run proves the runtime, not Python, creates the tables.
+@pytest.fixture(scope="module", params=["sqlite://./fs.db", "sqlite://:memory:"])
+def page_server(request):
     port = _free_port()
     workdir = Path(tempfile.mkdtemp(prefix="webcortex-fs-"))
     (workdir / "templates").mkdir()
     (workdir / "static").mkdir()
-    (workdir / "api.py").write_text(APP.format(port=port))
+    (workdir / "api.py").write_text(APP.format(port=port, database=request.param))
     (workdir / "templates/index.html").write_text(INDEX)
     (workdir / "templates/about.html").write_text(ABOUT)
     (workdir / "templates/dash.html").write_text(DASH)
