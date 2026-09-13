@@ -173,6 +173,13 @@ pub struct ToolSpec {
 /// unbounded even though every frame was capped. A budget that travels *with
 /// the request* is the fix, generalised. Steps stay per-run; tokens are what
 /// cost money, so tokens are what is shared.
+///
+/// Only the outermost agent, behaviour or flow creates one, from its own
+/// `token_budget`. Every nested run charges that same `Arc`, so spend in any
+/// branch reduces what is left for all the others. A nested agent's or
+/// behaviour's own `token_budget` still caps the model calls it makes itself,
+/// but sets no smaller ceiling for the runs it starts; a nested flow's
+/// `token_budget` is not consulted at all.
 #[derive(Debug)]
 pub struct SharedBudget {
     pub label: String,
@@ -273,19 +280,29 @@ struct RunState {
     def: AgentDef,
     /// The agent that started the run. Its limits govern the whole run.
     entry: AgentDef,
+    /// Who started the run. A handoff re-delegates from here.
     caller: Principal,
+    /// The authority tool calls run under: `caller` delegated to `def`, and
+    /// only ever narrowed by a handoff.
     actor: Principal,
     conversation: Conversation,
     usage: Usage,
     steps: Vec<Step>,
     output: String,
     path: Vec<String>,
+    /// This run's nesting level; its tool calls dispatch at `depth + 1`.
     depth: u32,
+    /// The request tree's budget, shared with every nested run.
     budget: Arc<SharedBudget>,
+    /// Resolved context blocks and handoff guidance, appended to the system
+    /// prompt. Re-resolved for the new agent on a handoff.
     system_suffix: String,
     /// Input size of the last provider call: the real measure of context.
     last_input_tokens: u64,
+    /// The client's session id, echoed in the result.
     session_id: Option<String>,
+    /// Where the conversation is saved: the session id scoped by the entry
+    /// agent and the caller, so another principal's id cannot reach it.
     session_key: Option<String>,
 }
 

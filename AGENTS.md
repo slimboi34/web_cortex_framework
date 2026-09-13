@@ -484,7 +484,9 @@ HTTP status: 202 for `awaiting_approval`, 502 for `failed`, 200 otherwise.
 in-process call (`App::call_tool_in_tree`). The outermost agent, behaviour or
 flow creates it from its own `token_budget`; nested runs charge the same
 counter and stop with `budget_exhausted` when it is spent. `usage.tree_tokens`
-reports the total. Steps stay per-run. **Any new op that can re-enter the
+reports the total. A nested agent's or behaviour's own `token_budget` still
+caps the model calls it makes itself, but sets no smaller ceiling for what it
+starts; a nested flow's `token_budget` is not consulted. Steps stay per-run. **Any new op that can re-enter the
 dispatcher must pass `depth + 1` and the budget through**; the 0.3 agent loop
 reset depth to zero on tool calls, which bypassed the nesting ceiling.
 
