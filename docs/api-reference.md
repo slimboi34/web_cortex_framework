@@ -179,7 +179,7 @@ app.agent(
     keep_recent=6,
     temperature=1.0,
     max_tokens=4096,
-    expose_at=None,          # defaults to /agents/<name>
+    expose_at=None,          # defaults to /agents/<name-with-hyphens>
     tool=True,
 )
 ```
@@ -243,7 +243,7 @@ app.flow(
     scopes=(),
     expose_scopes=None,
     token_budget=None,
-    expose_at=None,          # defaults to /flows/<name>
+    expose_at=None,          # defaults to /flows/<name-with-hyphens>
     tool=True,
     input_schema=None,
 )

@@ -237,7 +237,7 @@ a gate that can never fire is dead configuration giving false confidence.
 | `keep_recent` | `6` | Messages kept verbatim by a compaction |
 | `temperature` | `1.0` | |
 | `max_tokens` | `4096` | Per response |
-| `expose_at` | `/agents/<name>` | The POST route |
+| `expose_at` | `/agents/<name-with-hyphens>` | The POST route |
 | `tool` | `True` | Expose under the agent's own name |
 
 ## Providers

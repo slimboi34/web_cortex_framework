@@ -188,7 +188,8 @@ marketing.
 - **Not tested:** TLS termination (WebCortex serves plaintext and expects a
   terminating proxy), HTTP/2-specific attacks, request smuggling, slowloris and
   header-read timeouts, timing side channels measured statistically rather than
-  by construction, and the live Anthropic provider path.
+  by construction, and the live provider paths (Anthropic and
+  OpenAI-compatible).
 - **No fuzzing.** The manifest parser, the JSON-RPC surface, and the router are
   all reachable pre-auth and deserve a fuzz harness.
 - **Dependency audit is now wired into CI** (`cargo audit` on every push). It

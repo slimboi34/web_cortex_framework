@@ -113,7 +113,7 @@ $ webcortex check
 ```
 
 When a route genuinely needs Python, it crosses onto a pool of free-threaded
-interpreter workers (CPython 3.13+/3.14, GIL disabled), each running its own
+interpreter workers (free-threaded CPython 3.14, GIL disabled), each running its own
 event loop. Handlers run in real parallel — **measured at 4.82× vs 1.38× under
 the GIL** ([DESIGN.md](DESIGN.md) has the numbers and their caveats).
 
@@ -188,7 +188,8 @@ loop never asks: who is in control, what may it do, how much may the whole
 thing cost, what happens when a human has to decide. Four primitives, all
 executed by the runtime:
 
-**Every agent is a tool.** An agent is mounted at `/agents/<name>` and exposed
+**Every agent is a tool.** An agent is mounted at `/agents/<name>` (underscores
+become hyphens) and exposed
 under its own name, so `app.agent("editor", tools=["researcher", "writer"])` is
 the entire supervisor/worker pattern. Workers run under a principal delegated
 from the supervisor's, one nesting level deeper, against the supervisor's
@@ -274,7 +275,7 @@ many agents deep the call is. A memory is four Rust-executed tools —
 agent writing on someone's behalf writes to that someone's memory and can never
 read another's.
 
-## The eight kinds of route
+## The nine kinds of route
 
 | Kind | Declared with | Runs in |
 |---|---|---|

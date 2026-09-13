@@ -121,7 +121,8 @@ $ webcortex openapi > openapi.json
 ```
 
 Includes `x-webcortex-op` on each operation showing which engine serves it
-(`static`, `query`, `python`, `proxy`, `page`, `files`, `agent`) and
+(`static`, `query`, `python`, `proxy`, `page`, `files`, `agent`, `behaviour`,
+`flow`) and
 `x-webcortex-tool` for tool exposure.
 
 ## `webcortex tools`

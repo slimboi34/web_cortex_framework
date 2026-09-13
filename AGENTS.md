@@ -496,7 +496,8 @@ reset depth to zero on tool calls, which bypassed the nesting ceiling.
 
 Sessions: `SessionStore` keyed by `(agent, principal.id, session_id)`,
 in-memory, `server.session_capacity` (1000) / `session_ttl_secs` (3600),
-LRU-evicted. Saved after any terminal status except `awaiting_approval`.
+LRU-evicted. Those, `approval_ttl_secs` and `max_invocation_depth` are
+manifest defaults that `WebCortex(...)` does not set yet. Saved after any terminal status except `awaiting_approval`.
 
 Approvals: a gated call suspends the run into `App.approvals` with the whole
 `RunState`, the turn's tool calls, the index of the gated one, and the results
@@ -518,7 +519,8 @@ app.flow(name, *, pipeline=None, parallel=None, merge="collect", route=None,
 Exactly one of `pipeline` / `parallel` / `route`. A step is a tool name or
 `{"tool": name, "input": template}`; every step must be an exposed tool, and a
 flow may not contain itself. Executed in Rust (`flow.rs`) under a delegated
-principal, `depth + 1`, and one shared budget. Mounted at `/flows/<name>` as a
+principal, `depth + 1`, and one shared budget. Mounted at
+`/flows/<name-with-hyphens>` as a
 tool named `<name>`.
 
 Argument rules without a template: agent target → `{"input": <previous>}`
@@ -720,10 +722,13 @@ reads.
   file turns a warning into a build failure. Relative links out of `docs/` (e.g.
   `../examples/`) do not resolve on the published site — use absolute GitHub
   URLs.
-- **The Python matrix is 3.12, 3.13, 3.14, 3.14t** across ubuntu and macOS, and
-  wheels build for the same four on Linux x86_64/aarch64, macOS x86_64/aarch64,
-  and Windows x64. Change those two lists together: a tested target that ships no
-  wheel, or a shipped wheel nothing tests, is worse than either.
+- **The Python matrix is 3.12, 3.13, 3.14, 3.14t** on macOS (arm64), and the
+  same without 3.13 on ubuntu (x86_64), testing a source build; wheels build
+  for all four on Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x64.
+  Change the interpreter lists together: a tested target that ships no wheel,
+  or a shipped wheel nothing tests, is worse than either. Today the Linux
+  aarch64, macOS x86_64 and Windows wheels are built but never run — a known
+  gap, not a precedent.
 - **PyO3 is used without `abi3`**, because the free-threaded builds expose a
   distinct ABI that cannot be combined with the stable-ABI feature. That is why
   there is one wheel per interpreter version rather than one abi3 wheel.

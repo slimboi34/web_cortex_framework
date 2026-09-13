@@ -17,3 +17,4 @@ __pycache__/
 *.tar.gz
 dist/
 client/
+scout/

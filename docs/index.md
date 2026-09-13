@@ -62,7 +62,7 @@ $ webcortex check
 ```
 
 When a route genuinely needs Python, it crosses onto a pool of free-threaded
-interpreter workers (CPython 3.13+ with the GIL disabled), each running its own
+interpreter workers (free-threaded CPython 3.14), each running its own
 event loop. Handlers run in real parallel — which was not possible when Django's
 execution model was designed.
 

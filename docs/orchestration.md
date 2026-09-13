@@ -21,7 +21,7 @@ whole tree.
 
 ## Every agent is a tool
 
-An agent is mounted at `/agents/<name>` (or `expose_at`) and exposed under its
+An agent is mounted at `/agents/<name-with-hyphens>` (or `expose_at`) and exposed under its
 own name, so another agent can list it in `tools=[...]`. That is the entire
 supervisor/worker pattern:
 
@@ -133,7 +133,7 @@ app.flow(
 
 Every step is a **tool** — an agent, a behaviour, another flow, or any route
 marked `tool=True` — so composition is uniform. A flow is itself a tool and a
-route (`/flows/<name>`), so flows nest and agents can invoke them.
+route (`/flows/<name-with-hyphens>`), so flows nest and agents can invoke them.
 
 ### What a step receives
 
@@ -208,7 +208,8 @@ The store key includes the **principal**, so two callers using the same id
 never see each other's history. `"reset": true` discards it first.
 
 Sessions live in memory — bounded (`session_capacity`, default 1000) and
-expiring (`session_ttl_secs`, default 3600) — and do not survive a restart.
+expiring (`session_ttl_secs`, default 3600), both fixed for now rather than
+settable from `WebCortex(...)` — and do not survive a restart.
 That is stated rather than hidden: durable conversation state is application
 data, and it belongs in a table you own. Combine sessions with a
 [context window](context.md#compaction) so a long conversation is compacted
@@ -241,7 +242,8 @@ The response is the continued run. Three things are true about it:
   — usually with the model explaining that it cannot do that.
 - **A decision is consumed.** A second POST with the same id is a 404.
 
-Suspended runs are held in memory for `approval_ttl_secs` (default 3600).
+Suspended runs are held in memory for `approval_ttl_secs` (3600 seconds, not
+yet settable from `WebCortex(...)`).
 Deciding requires the `webcortex:admin` scope; the run itself resumes as the
 delegated principal of whoever started it, not as the approver.
 

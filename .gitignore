@@ -6,6 +6,7 @@ __pycache__/
 *.db
 .pytest_cache/
 site/
+dist/
 scout/suggestions.md
 scout/state.json
 scout/logs/

@@ -60,7 +60,7 @@ Everything overridable by environment, so one image runs everywhere:
 | `WEBCORTEX_DATABASE_URL` | Overrides the declared database |
 | `WEBCORTEX_LOG` | `error` / `warn` / `info` / `debug` |
 | `WEBCORTEX_DEBUG_ERRORS` | **Never set in production** — returns tracebacks |
-| `ANTHROPIC_API_KEY` | For `claude-*` and `anthropic/…` models |
+| `ANTHROPIC_API_KEY` | For `claude-*` and `anthropic/…` models; `ANTHROPIC_BASE_URL` for a gateway |
 | `OPENAI_API_KEY` | For `gpt-*` and `openai/…` models; `OPENAI_BASE_URL` for a gateway |
 | `OLLAMA_HOST` | Where `ollama/…` models are served (default `http://127.0.0.1:11434`) |
 | `WEBCORTEX_FAKE_PROVIDER` | **Tests only** — answers every model call deterministically |
@@ -86,8 +86,7 @@ There is no build stage: `pip install` pulls a prebuilt wheel, so the image
 needs no Rust toolchain and no compiler.
 
 ```dockerfile title="Dockerfile"
-# 3.13, or 3.14t for free-threading. Not python:3.14-slim — the extension does
-# not import on GIL-enabled 3.14. See Installation.
+# 3.12–3.14, or 3.14t for free-threading.
 FROM python:3.13-slim
 
 RUN useradd --create-home --uid 10001 app
@@ -223,7 +222,11 @@ INFO audit kind=tool_called run_id=… actor=agent:assistant#service
 - **SQLite writes serialise.** For write-heavy work, wait for Postgres or use a
   Python handler against a real connection pool.
 
-Prefer horizontal scaling: instances are stateless apart from the database.
+Prefer horizontal scaling, with one caveat. Instances are stateless apart from
+the database *and* agent state: sessions and suspended approvals live in the
+memory of the instance that created them. Route a session's requests, and the
+`POST /_webcortex/approvals/{id}` that resumes a run, back to that instance
+(sticky routing), or run one instance while you rely on them.
 
 ---
 
@@ -238,7 +241,7 @@ Prefer horizontal scaling: instances are stateless apart from the database.
 - [ ] Rate limiting at the edge as well as in-process
 - [ ] Log aggregation capturing `webcortex::audit`
 - [ ] Every agent, behaviour and flow has a `token_budget`; prices declared so `/usage` reports dollars
-- [ ] `session_ttl_secs` and `approval_ttl_secs` suit the workload (both default to an hour)
+- [ ] Sessions and pending approvals expiring after an hour suits the workload (`session_ttl_secs` and `approval_ttl_secs` are fixed defaults, not yet settable from Python)
 
 - [ ] Database backups, if SQLite: the file is your database
 - [ ] `cargo audit` in CI

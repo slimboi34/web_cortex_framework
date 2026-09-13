@@ -1,7 +1,7 @@
 # Changelog
 
-Notable changes per release. Versions follow [semantic versioning](https://semver.org);
-while the major version is 0, minor bumps may contain breaking changes.
+Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
+bumps could contain breaking changes.
 
 ## [2.0.0] — 2026-09-13
 
@@ -13,7 +13,7 @@ describe itself to the model writing it.
 
 ### Added — orchestration
 
-- **Every agent is a tool.** An agent is mounted at `/agents/<name>` (or
+- **Every agent is a tool.** An agent is mounted at `/agents/<name-with-hyphens>` (or
   `expose_at`) and exposed under its own name, so
   `app.agent("editor", tools=["researcher", "writer"])` is the whole
   supervisor/worker pattern. Workers run as delegates of the supervisor, one
@@ -108,7 +108,7 @@ describe itself to the model writing it.
 
 ### Changed
 
-- **An agent without `expose_at` now has a route** at `/agents/<name>`,
+- **An agent without `expose_at` now has a route** at `/agents/<name-with-hyphens>`,
   guarded by `expose_scopes` (default `scopes`). An agent declared with no
   scopes is therefore a public route; `webcortex security` reports it.
 - `app.agent(model=...)` is optional and defaults to the `default` alias;

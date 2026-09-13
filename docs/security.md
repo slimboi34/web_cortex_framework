@@ -165,7 +165,7 @@ footgun in local development.
 | Body size | 32 MB | compile-time |
 | Request timeout | 30s | `request_timeout` |
 | Shutdown drain | 25s | `shutdown_timeout` |
-| Invocation depth | 8 | `max_invocation_depth` |
+| Invocation depth | 8 | not yet (`server.max_invocation_depth`) |
 
 ## What has been tested
 

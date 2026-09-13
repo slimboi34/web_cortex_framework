@@ -1163,7 +1163,7 @@ class WebCortex:
         and it inherits the route's declared scopes.
 
         **Every agent is a tool.** It is mounted at `expose_at` (default
-        `/agents/<name>`) and exposed under its own name, so another agent can
+        `/agents/<name-with-hyphens>`) and exposed under its own name, so another agent can
         list it in `tools=[...]`. The endpoint takes `{"input": "...",
         "session_id": "..."}`; a `session_id` continues a conversation.
 
