@@ -125,11 +125,6 @@ impl ProviderRegistry {
         }
     }
 
-    /// True when at least one real provider is configured.
-    pub fn any_configured(&self) -> bool {
-        self.anthropic.is_some() || self.openai.is_some() || self.fake.is_some() || !self.prefixed.is_empty()
-    }
-
     /// Which providers are live, for the startup banner and `/_webcortex/models`.
     pub fn describe(&self) -> serde_json::Value {
         serde_json::json!({
@@ -207,10 +202,6 @@ impl ProviderRegistry {
             .get(model)
             .or_else(|| model.split_once('/').and_then(|(_, m)| self.pricing.get(m)))
             .copied()
-    }
-
-    pub fn pricing(&self) -> &BTreeMap<String, Price> {
-        &self.pricing
     }
 }
 

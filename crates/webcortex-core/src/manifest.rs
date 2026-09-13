@@ -805,7 +805,7 @@ pub struct AgentDef {
     pub model: String,
     #[serde(default)]
     pub system: String,
-    /// Route ids this agent may call as tools. Resolved against the route table
+    /// Tool names this agent may call. Resolved against the route table
     /// at startup, so a typo is a boot error rather than a runtime surprise.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -864,7 +864,6 @@ impl Manifest {
 
         let mut seen = std::collections::HashSet::new();
         for r in &self.routes {
-
             if !seen.insert((r.method.as_str(), r.path.as_str())) {
                 return Err(format!("duplicate route {} {}", r.method, r.path));
             }
@@ -1004,11 +1003,8 @@ impl Manifest {
             }
         }
 
-        let mut agent_names = std::collections::HashSet::new();
+        // Duplicate agent names were already rejected, before the routes.
         for a in &self.agents {
-            if !agent_names.insert(a.name.as_str()) {
-                return Err(format!("duplicate agent name {:?}", a.name));
-            }
             for t in &a.tools {
                 if !tool_names.contains(t.as_str()) {
                     if self.behaviours.iter().any(|b| &b.name == t) {
@@ -1124,11 +1120,6 @@ impl Manifest {
     pub fn context(&self, name: &str) -> Option<&ContextDef> {
         self.contexts.iter().find(|c| c.name == name)
     }
-
-    pub fn agent_def(&self, name: &str) -> Option<&AgentDef> {
-        self.agents.iter().find(|a| a.name == name)
-    }
-
 
     /// Routes reachable without any credential. Surfaced by `webcortex check` so an
     /// operator can see their public attack surface on one screen.

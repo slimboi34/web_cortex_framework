@@ -4,8 +4,8 @@
 //!
 //! 1. CORS preflight — answered before anything else can reject it
 //! 2. Request id — so every subsequent log line correlates
-//! 3. Rate limit — cheapest rejection, applied before authentication work
-//! 4. Authenticate — establish the principal once
+//! 3. Authenticate — establish the principal once
+//! 4. Rate limit — keyed by that principal, or by client IP when anonymous
 //! 5. Dispatch — scope checks happen inside, next to the op
 //! 6. Response headers — security headers and CORS applied to every exit path
 //!
@@ -29,6 +29,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
@@ -122,8 +123,6 @@ where
     }
     Ok(())
 }
-
-use tokio::sync::Semaphore;
 
 async fn shutdown_signal() {
     let ctrl_c = async {

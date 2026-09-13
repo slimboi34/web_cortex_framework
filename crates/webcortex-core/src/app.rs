@@ -462,8 +462,8 @@ impl App {
 
     /// Refuse an invocation nested deeper than the configured ceiling.
     ///
-    /// Checked only for behaviour and agent ops, because those are the ones that
-    /// can re-enter the dispatcher and form a cycle.
+    /// Checked for agent, behaviour and flow ops, because those are the ones
+    /// that can re-enter the dispatcher and form a cycle.
     fn depth_exceeded(&self, req: &WebCortexRequest) -> Option<WebCortexResponse> {
         let max = self.manifest.server.max_invocation_depth;
         if req.depth < max {
