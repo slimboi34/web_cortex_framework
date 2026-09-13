@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from webcortex import WebCortex
+from webcortex import Request, WebCortex
 
 
 def make_app(**kw) -> WebCortex:
@@ -177,6 +177,19 @@ def test_gated_tools_are_reported_under_the_names_agents_call():
 
     assert app.security_report()["gated_tools"] == ["create_items_purge"]
     assert "create_items_purge" in app.check()["tools"]
+
+
+def test_a_request_annotation_binds_under_postponed_annotations():
+    # This module has `from __future__ import annotations`, so the annotation
+    # below is the string "Request" until something resolves it.
+    app = make_app()
+
+    @app.post("/hook")
+    def hook(r: Request) -> dict:
+        return {}
+
+    route = next(r for r in app.manifest()["routes"] if r["path"] == "/hook")
+    assert "r" not in (route["input_schema"] or {}).get("properties", {})
 
 
 def test_generated_ddl_marks_the_primary_key():

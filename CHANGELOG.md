@@ -147,6 +147,9 @@ describe itself to the model writing it.
   startup banner and the context pack, listed a gated route without an
   explicit `tool_name` as `METHOD /path`. It now uses the tool name agents
   call, as `/_webcortex/security` always did.
+- A handler parameter annotated `Request` in a module that uses
+  `from __future__ import annotations` was bound as an ordinary required
+  input instead of receiving the request. Annotations are resolved first now.
 
 ### Verified
 

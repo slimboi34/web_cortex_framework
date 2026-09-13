@@ -1484,10 +1484,7 @@ def _behaviour_input_schema(fn: Callable) -> dict:
     gives agents a precise tool schema for free; leaving it bare accepts any
     object.
     """
-    try:
-        hints = __import__("typing").get_type_hints(fn)
-    except Exception:
-        hints = getattr(fn, "__annotations__", {})
+    hints = _schema.type_hints(fn)
 
     params = [p for p in inspect.signature(fn).parameters]
     if len(params) < 2:
@@ -1505,15 +1502,14 @@ def _path_params(path: str) -> list[str]:
 
 
 def _request_param(fn: Callable) -> str | None:
-    """Name of the parameter that should receive the Request, if any."""
-    try:
-        hints = fn.__annotations__
-    except AttributeError:
-        hints = {}
-    for name, param in inspect.signature(fn).parameters.items():
-        if hints.get(name) is Request or name in _REQUEST_PARAM_NAMES:
-            return name
-        if param.annotation is Request:
+    """Name of the parameter that should receive the Request, if any.
+
+    Annotations are resolved first. Under `from __future__ import annotations`
+    `r: Request` is the string "Request", which an identity check misses.
+    """
+    hints = _schema.type_hints(fn)
+    for name in inspect.signature(fn).parameters:
+        if name in _REQUEST_PARAM_NAMES or hints.get(name) in (Request, "Request"):
             return name
     return None
 
@@ -1525,10 +1521,7 @@ def _bind_handler(fn: Callable, request_param: str | None) -> Callable:
     routes coroutine handlers and blocking handlers to different pools.
     """
     sig = inspect.signature(fn)
-    try:
-        hints = __import__("typing").get_type_hints(fn)
-    except Exception:
-        hints = getattr(fn, "__annotations__", {})
+    hints = _schema.type_hints(fn)
 
     binder = _make_binder(sig, hints, request_param)
 
