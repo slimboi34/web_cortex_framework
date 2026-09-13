@@ -214,12 +214,20 @@ def ask(path: str, chunk: str, part: int, parts: int) -> list[dict]:
         f"{HOST}/api/chat", data=json.dumps(body).encode(),
         headers={"content-type": "application/json"}, method="POST",
     )
+    # Anything the network or the server can do wrong is a skipped chunk, not a
+    # crashed run: a dropped connection, a timeout, a 4xx for an option the
+    # server does not know, a body that is not JSON.
     try:
         with urllib.request.urlopen(req, timeout=900) as r:
             payload = json.loads(r.read())
-    except urllib.error.URLError as e:
-        log(f"model call failed for {path}: {e}")
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:300].decode("utf-8", "replace")
+        log(f"model call failed for {path}: HTTP {e.code}: {detail}")
         return []
+    except Exception as e:  # noqa: BLE001 - a scheduled reviewer must not die on one bad call
+        log(f"model call failed for {path}: {type(e).__name__}: {e}")
+        return []
+
     content = payload.get("message", {}).get("content", "")
     try:
         parsed = json.loads(content)
