@@ -200,7 +200,9 @@ def ask(path: str, chunk: str, part: int, parts: int) -> list[dict]:
     """One model call with a forced JSON shape — the probabilistic leaf."""
     prompt = (
         f"File: {path}" + (f" (part {part} of {parts})" if parts > 1 else "") +
-        "\n\n```\n" + chunk + "\n```\n\nReturn your suggestions as JSON."
+        "\n\n```\n" + chunk + "\n```\n\n"
+        'Return JSON of the form {"suggestions": [{"title", "area", "severity", '
+        '"where", "rationale", "proposal"}]}. An empty list means the file is fine.'
     )
     body = {
         "model": MODEL,
@@ -232,24 +234,70 @@ def ask(path: str, chunk: str, part: int, parts: int) -> list[dict]:
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", content, re.S)
+        m = re.search(r"[\[{].*[\]}]", content, re.S)
         if not m:
-            log(f"unparseable answer for {path}")
+            log(f"unparseable answer for {path}: {content[:120]!r}")
             return []
         try:
             parsed = json.loads(m.group(0))
         except json.JSONDecodeError:
+            log(f"unparseable answer for {path}: {content[:120]!r}")
             return []
-    items = parsed.get("suggestions") if isinstance(parsed, dict) else None
+    items = normalise(parsed)
+    if not items and content.strip() not in ("", "[]", '{"suggestions": []}', '{"suggestions":[]}'):
+        log(f"no usable suggestions in answer for {path}; it began {content[:100]!r}")
+    for it in items:
+        it["file"] = path
+    return items
+
+
+_SEVERITIES = ("low", "medium", "high")
+
+
+def normalise(parsed: object) -> list[dict]:
+    """Accept the shapes a small model actually emits.
+
+    The schema asks for `{"suggestions": [...]}` with fixed keys; local models
+    frequently answer with a bare list, or with `section` / `issue` / `fix`
+    instead of `where` / `rationale` / `proposal`. Mapping those here is
+    cheaper than losing the run.
+    """
+    if isinstance(parsed, dict):
+        items = parsed.get("suggestions")
+        if items is None:
+            items = [parsed] if any(k in parsed for k in ("title", "issue", "proposal", "fix")) else []
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
+        items = []
     if not isinstance(items, list):
         return []
-    clean = []
+
+    out: list[dict] = []
     for it in items:
-        if not isinstance(it, dict) or not it.get("title") or not it.get("proposal"):
+        if not isinstance(it, dict):
             continue
-        it["file"] = path
-        clean.append(it)
-    return clean
+        proposal = (it.get("proposal") or it.get("fix") or it.get("suggestion")
+                    or it.get("recommendation") or it.get("change") or "")
+        rationale = it.get("rationale") or it.get("issue") or it.get("problem") or it.get("why") or ""
+        where = it.get("where") or it.get("section") or it.get("location") or it.get("function") or ""
+        title = it.get("title") or ""
+        if not title:
+            head = (rationale or proposal).strip().split(". ", 1)[0]
+            title = (f"{where}: {head}" if where else head)[:120]
+        if not title or not str(proposal).strip():
+            continue
+        severity = str(it.get("severity", "")).lower()
+        out.append({
+            "title": str(title).strip(),
+            "area": str(it.get("area") or "correctness"),
+            "severity": severity if severity in _SEVERITIES else "medium",
+            "where": str(where),
+            "rationale": str(rationale).strip(),
+            "proposal": str(proposal).strip(),
+        })
+    return out
+
 
 
 def fingerprint(s: dict) -> str:
