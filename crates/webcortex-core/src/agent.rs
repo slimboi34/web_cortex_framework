@@ -428,50 +428,12 @@ impl AgentRuntime {
     ) -> RunResult {
         let SuspendedRun { state: mut st, calls, gated, mut results, approval_id, .. } = suspended;
         let call = &calls[gated];
-        let started = std::time::Instant::now();
 
         if approve {
             self.audit.record(AuditEvent::approval_decided(
                 &st.run_id, &st.actor, &call.name, &approval_id, true, note,
             ));
-            st.usage.tool_calls += 1;
-            match app
-                .call_tool_in_tree(&call.name, &call.arguments, &st.actor, st.depth + 1, Some(st.budget.clone()))
-                .await
-            {
-                Ok(value) => {
-                    st.steps.push(Step {
-                        index: st.usage.steps,
-                        kind: StepKind::ToolCall,
-                        tool: Some(call.name.clone()),
-                        arguments: Some(call.arguments.clone()),
-                        result: Some(value.clone()),
-                        error: None,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    });
-                    self.audit.record(AuditEvent::tool_called(
-                        &st.run_id, &st.actor, &call.name, &call.arguments, true,
-                        started.elapsed().as_millis() as u64,
-                    ));
-                    results.push(tool_result(&call.id, &bounded(&value, st.entry.policy.max_tool_result_bytes), false));
-                }
-                Err(e) => {
-                    st.steps.push(Step {
-                        index: st.usage.steps,
-                        kind: StepKind::ToolCall,
-                        tool: Some(call.name.clone()),
-                        arguments: Some(call.arguments.clone()),
-                        result: None,
-                        error: Some(e.clone()),
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    });
-                    self.audit.record(AuditEvent::tool_called(
-                        &st.run_id, &st.actor, &call.name, &call.arguments, false,
-                        started.elapsed().as_millis() as u64,
-                    ));
-                    results.push(tool_result(&call.id, &json!({"error": e}), true));
-                }
-            }
+            results.push(self.dispatch_call(app, &mut st, call).await);
         } else {
             self.audit.record(AuditEvent::approval_decided(
                 &st.run_id, &st.actor, &call.name, &approval_id, false, note,
@@ -667,49 +629,42 @@ impl AgentRuntime {
             // 3. Dispatch in-process, under delegated authority and the shared
             //    budget. Scope enforcement happens inside `dispatch`, so an
             //    agent cannot reach a route its caller could not.
-            st.usage.tool_calls += 1;
-            match app
-                .call_tool_in_tree(&call.name, &call.arguments, &st.actor, st.depth + 1, Some(st.budget.clone()))
-                .await
-            {
-                Ok(value) => {
-                    st.steps.push(Step {
-                        index: st.usage.steps,
-                        kind: StepKind::ToolCall,
-                        tool: Some(call.name.clone()),
-                        arguments: Some(call.arguments.clone()),
-                        result: Some(value.clone()),
-                        error: None,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    });
-                    self.audit.record(AuditEvent::tool_called(
-                        &st.run_id, &st.actor, &call.name, &call.arguments, true,
-                        started.elapsed().as_millis() as u64,
-                    ));
-                    let shown = bounded(&value, st.entry.policy.max_tool_result_bytes);
-                    results.push(tool_result(&call.id, &shown, false));
-                }
-                Err(e) => {
-                    st.steps.push(Step {
-                        index: st.usage.steps,
-                        kind: StepKind::ToolCall,
-                        tool: Some(call.name.clone()),
-                        arguments: Some(call.arguments.clone()),
-                        result: None,
-                        error: Some(e.clone()),
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    });
-                    self.audit.record(AuditEvent::tool_called(
-                        &st.run_id, &st.actor, &call.name, &call.arguments, false,
-                        started.elapsed().as_millis() as u64,
-                    ));
-                    // A failed tool is information the model can act on, not
-                    // a reason to abort the run.
-                    results.push(tool_result(&call.id, &json!({"error": e}), true));
-                }
-            }
+            results.push(self.dispatch_call(app, st, call).await);
         }
         CallsOutcome::Done(results)
+    }
+
+    /// Run one admitted tool call, record its step and audit event, and return
+    /// the `tool_result` the model sees, bounded. Shared by a fresh turn and an
+    /// approved resume, so the two cannot drift. A failed tool is information
+    /// the model can act on, not a reason to abort the run.
+    async fn dispatch_call(&self, app: &App, st: &mut RunState, call: &ToolCall) -> Value {
+        let started = std::time::Instant::now();
+        st.usage.tool_calls += 1;
+        let outcome = app
+            .call_tool_in_tree(&call.name, &call.arguments, &st.actor, st.depth + 1, Some(st.budget.clone()))
+            .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        self.audit.record(AuditEvent::tool_called(
+            &st.run_id, &st.actor, &call.name, &call.arguments, outcome.is_ok(), duration_ms,
+        ));
+        let (result, error, shown, is_error) = match outcome {
+            Ok(value) => {
+                let shown = bounded(&value, st.entry.policy.max_tool_result_bytes);
+                (Some(value), None, shown, false)
+            }
+            Err(e) => (None, Some(e.clone()), json!({"error": e}), true),
+        };
+        st.steps.push(Step {
+            index: st.usage.steps,
+            kind: StepKind::ToolCall,
+            tool: Some(call.name.clone()),
+            arguments: Some(call.arguments.clone()),
+            result,
+            error,
+            duration_ms,
+        });
+        tool_result(&call.id, &shown, is_error)
     }
 
     async fn handoff(
