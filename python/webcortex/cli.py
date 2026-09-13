@@ -90,7 +90,8 @@ def _banner(app: Any) -> None:
         print(f"  flows: {', '.join(f'{f['name']} ({f['kind']})' for f in flows)}")
     if security.get("memories"):
         print(f"  memory: {', '.join(security['memories'])}")
-    aliases = app.manifest().get("models", {}).get("aliases", {})
+    manifest = app.manifest()
+    aliases = manifest.get("models", {}).get("aliases", {})
     if aliases:
         print(f"  models: {', '.join(f'{k}={v}' for k, v in aliases.items())}")
 
@@ -112,7 +113,9 @@ def _banner(app: Any) -> None:
     if security["gated_tools"]:
         print(f"  approval-gated tools: {', '.join(security['gated_tools'])}")
 
-    prefix, host, port = app.control_prefix, app.host, app.port
+    # The manifest applies WEBCORTEX_HOST and WEBCORTEX_PORT: print what binds.
+    server = manifest["server"]
+    prefix, host, port = server["control_prefix"], server["host"], server["port"]
     print(f"  http://{host}:{port}{prefix}/openapi.json   ·   MCP: http://{host}:{port}{prefix}/mcp")
     if report["agents"] or behaviours or flows:
         print(f"  usage: http://{host}:{port}{prefix}/usage   ·   approvals: http://{host}:{port}{prefix}/approvals")

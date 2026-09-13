@@ -192,6 +192,15 @@ def test_a_request_annotation_binds_under_postponed_annotations():
     assert "r" not in (route["input_schema"] or {}).get("properties", {})
 
 
+def test_the_banner_prints_the_address_the_server_will_bind(monkeypatch, capsys):
+    from webcortex.cli import _banner
+
+    monkeypatch.delenv("WEBCORTEX_HOST", raising=False)
+    monkeypatch.setenv("WEBCORTEX_PORT", "9123")
+    _banner(make_app())
+    assert "127.0.0.1:9123" in capsys.readouterr().out
+
+
 def test_generated_ddl_marks_the_primary_key():
     app = make_app()
     app.resource("books", fields={"id": int, "title": str, "year": int})

@@ -150,6 +150,9 @@ describe itself to the model writing it.
 - A handler parameter annotated `Request` in a module that uses
   `from __future__ import annotations` was bound as an ordinary required
   input instead of receiving the request. Annotations are resolved first now.
+- The `webcortex dev` / `run` banner printed the declared host and port even
+  when `WEBCORTEX_HOST` or `WEBCORTEX_PORT` moved the server. It prints the
+  address that binds.
 
 ### Verified
 
