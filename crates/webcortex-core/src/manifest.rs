@@ -976,12 +976,17 @@ impl Manifest {
         for b in &self.behaviours {
             check_contexts(&b.name, "behaviour", &b.context)?;
             for t in &b.tools {
-                // A behaviour may call another behaviour, so both namespaces
-                // are valid targets.
-                if tool_names.contains(t.as_str())
-                    || self.behaviours.iter().any(|o| &o.name == t)
-                {
+                // An exposed behaviour is a tool like any route. One declared
+                // with tool=False has no tool, so naming it could never work.
+                if tool_names.contains(t.as_str()) {
                     continue;
+                }
+                if self.behaviours.iter().any(|o| &o.name == t) {
+                    return Err(format!(
+                        "behaviour {:?} declares tool {:?}, a behaviour declared with tool=False, \
+                         which cannot be called as a tool",
+                        b.name, t
+                    ));
                 }
                 let hint = nearest(t, &tool_names);
                 return Err(match hint {
@@ -1005,9 +1010,14 @@ impl Manifest {
                 return Err(format!("duplicate agent name {:?}", a.name));
             }
             for t in &a.tools {
-                if !tool_names.contains(t.as_str())
-                    && !self.behaviours.iter().any(|b| &b.name == t)
-                {
+                if !tool_names.contains(t.as_str()) {
+                    if self.behaviours.iter().any(|b| &b.name == t) {
+                        return Err(format!(
+                            "agent {:?} references tool {:?}, a behaviour declared with tool=False, \
+                             which cannot be called as a tool",
+                            a.name, t
+                        ));
+                    }
                     let hint = nearest(t, &tool_names);
                     return Err(match hint {
                         Some(h) => format!(

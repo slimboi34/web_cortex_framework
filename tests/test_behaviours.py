@@ -147,6 +147,31 @@ def test_an_agent_may_use_a_behaviour_as_a_tool():
     assert app.check()["agents"] == ["boss"]
 
 
+def test_a_behaviour_declared_with_tool_false_cannot_be_named_as_a_tool():
+    app = WebCortex("t")
+
+    @app.behaviour("hidden", tool=False)
+    def hidden(ctx, input):
+        return {}
+
+    app.agent("boss", model="m", tools=["hidden"])
+    with pytest.raises(ValueError, match="tool=False"):
+        app.check()
+
+    app = WebCortex("t")
+
+    @app.behaviour("hidden", tool=False)
+    def hidden_again(ctx, input):
+        return {}
+
+    @app.behaviour("outer", tools=["hidden"])
+    def outer(ctx, input):
+        return {}
+
+    with pytest.raises(ValueError, match="tool=False"):
+        app.check()
+
+
 def test_duplicate_behaviour_names_are_rejected():
     app = WebCortex("t")
 

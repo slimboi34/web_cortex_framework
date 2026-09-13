@@ -129,6 +129,9 @@ describe itself to the model writing it.
   agent ops (results are not streamed yet), `handler` on behaviour ops (it is
   on the behaviour), `validate_body` on routes (body validation was never
   implemented) and `server.python_workers` (workers are passed to `serve`).
+- Naming a behaviour declared with `tool=False` in an agent's or a
+  behaviour's `tools` is a boot error. It used to pass `check()` and then
+  never be callable.
 
 ### Fixed
 

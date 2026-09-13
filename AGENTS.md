@@ -413,7 +413,9 @@ The `ctx` surface:
 
 Behaviours are exposed as tools by default (`tool=True`), so agents can invoke
 behaviours and behaviours compose with each other. Default route is
-`/behaviours/<name-with-hyphens>`; override with `expose_at`.
+`/behaviours/<name-with-hyphens>`; override with `expose_at`. A behaviour
+declared with `tool=False` is not a tool, and naming it in any `tools=` is a
+boot error.
 
 `max_steps` caps total leaf operations and `token_budget` caps spend — **both
 enforced by the runtime**, so a runaway loop costs a bounded amount. Tokens are
