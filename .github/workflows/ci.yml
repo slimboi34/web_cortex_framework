@@ -8,6 +8,11 @@ on:
   # release.yml reuses this workflow as its gate.
   workflow_call:
 
+# Nothing here writes to the repository. release.yml grants its publish job
+# `id-token: write` itself; this workflow only needs to read.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -21,6 +26,8 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Generous against cold-cache runs; a hung job should not burn six hours.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +46,7 @@ jobs:
   python:
     name: Python ${{ matrix.python }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -122,6 +130,7 @@ jobs:
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -138,6 +147,8 @@ jobs:
   wheels:
     name: Wheel ${{ matrix.target }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Four release builds per job; Windows is the slowest.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -182,6 +193,7 @@ jobs:
   sdist:
     name: Source distribution
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1

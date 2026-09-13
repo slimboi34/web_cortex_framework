@@ -1,0 +1,28 @@
+# One weekly PR per ecosystem for minor and patch updates, instead of a PR per
+# dependency. Major versions still arrive one at a time, because they are the
+# ones that need reading. Before accepting a pyo3 bump, see AGENTS.md §11.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      pip-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
