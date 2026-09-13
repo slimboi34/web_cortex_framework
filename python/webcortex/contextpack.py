@@ -127,9 +127,7 @@ def build(app: Any) -> str:
     add("| Method | Path | Engine | Tool | Scopes |")
     add("|---|---|---|---|---|")
     for r in routes:
-        tool = r["tool"]["name"] or ("(derived)" if r["tool"]["expose"] else "")
-        if r["tool"]["expose"] and not r["tool"]["name"]:
-            tool = _derive_tool_name(r["method"], r["path"])
+        tool = r["tool"]["name"] or (_derive_tool_name(r["method"], r["path"]) if r["tool"]["expose"] else "")
         add(f"| {r['method']} | {r['path']} | {r['op']['kind']} | {tool} | {' '.join(r['scopes']) or '-'} |")
     add("")
 

@@ -294,7 +294,6 @@ fn inspect_manifest(manifest_json: &str) -> PyResult<String> {
         "behaviours": manifest.behaviours.iter().map(|b| &b.name).collect::<Vec<_>>(),
         "flows": manifest.flows.iter().map(|f| &f.name).collect::<Vec<_>>(),
         "contexts": manifest.contexts.iter().map(|c| &c.name).collect::<Vec<_>>(),
-        "openapi": webcortex_core::openapi::generate(&manifest),
 
     });
     Ok(report.to_string())

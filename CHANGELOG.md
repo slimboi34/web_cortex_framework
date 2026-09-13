@@ -125,6 +125,8 @@ describe itself to the model writing it.
   `hmac`, `async-stream`, `pin-project-lite`), four features nothing used
   (sqlx `json` and `macros`, reqwest `stream` and `charset`), and `httpx` from
   the `dev` extra.
+- `app.check()` no longer embeds a full OpenAPI document that nothing read
+  (every banner and `webcortex check` built one); `app.openapi()` has it.
 - The manifest no longer carries fields the runtime never read: `stream` on
   agent ops (results are not streamed yet), `handler` on behaviour ops (it is
   on the behaviour), `validate_body` on routes (body validation was never

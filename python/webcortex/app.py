@@ -93,7 +93,6 @@ class WebCortex:
         self._models: dict = {"aliases": {}, "providers": {}, "pricing": {}}
         self._resources: list[Resource] = []
         self._schema_sql: list[str] = []
-        self._templates_used: set[str] = set()
         self._next_id = 0
 
         # A default root route is added at manifest time *only* if the app did
@@ -573,7 +572,6 @@ class WebCortex:
         else:
             page_data = {"kind": "none"}
 
-        self._templates_used.add(template)
         return self._add_route(
             method, path,
             {"kind": "page", "template": template, "data": page_data, "status": status},
@@ -590,7 +588,6 @@ class WebCortex:
             wants_request = _request_param(fn)
             handler_index = len(self._handlers)
             self._handlers.append(_bind_handler(fn, wants_request))
-            self._templates_used.add(template)
             self._add_route(
                 "GET", path,
                 {

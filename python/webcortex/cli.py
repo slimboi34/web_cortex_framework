@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .starters import TEMPLATES
+
 DEFAULT_MODULE = "api.py"
 
 
@@ -219,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     new.add_argument("name")
     new.add_argument(
         "--template", "-t", default="api",
-        choices=("api", "fullstack", "agent", "behaviour", "orchestration"),
+        choices=TEMPLATES,
         help=("api: JSON+MCP · fullstack: adds pages · agent: adds an approval gate · "
               "behaviour: adds programmable procedures · orchestration: handoffs, flows, "
               "memory, context and a local model"),
@@ -290,7 +292,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check":
         report = app.check()
-        report.pop("openapi", None)
         print(json.dumps({**report, "security": app.security_report()}, indent=2))
         return 0
 

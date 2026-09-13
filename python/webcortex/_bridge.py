@@ -104,7 +104,6 @@ class Dispatcher:
             max_workers=count * 4,
             thread_name_prefix="webcortex-sync",
         )
-        self.worker_count = count
 
     # Called from Rust.
     def submit(self, handler_id: int, request: dict, completer: Any) -> None:
