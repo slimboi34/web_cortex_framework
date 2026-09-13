@@ -23,7 +23,8 @@ describe itself to the model writing it.
   agent — its system prompt, tools and context apply from the next step —
   while the budget and the caller's authority carry over. Authority is
   re-derived from the original caller and filtered by what the previous agent
-  held, so it can only shrink. The result records the `path`.
+  held, so it can only shrink. The result records the `path`. A declared tool
+  that collides with a handoff's `transfer_to_<name>` is a boot error.
 - **Flows.** `app.flow(name, pipeline=[...] | parallel=[...] | route={...})`
   declares an orchestration as data, executed in Rust. Steps are any tools;
   agent results are unwrapped for the next step; `{"tool": ..., "input": {...}}`

@@ -57,6 +57,15 @@ def test_handoff_to_an_undeclared_agent_is_a_boot_error_with_a_hint():
         app.check()
 
 
+def test_a_tool_named_like_a_handoff_is_a_boot_error():
+    app = make_app()
+    app.static("GET", "/t", {"ok": True}, tool=True, tool_name="transfer_to_billing")
+    app.agent("billing")
+    app.agent("desk", tools=["transfer_to_billing"], handoffs=["billing"])
+    with pytest.raises(ValueError, match="collides"):
+        app.check()
+
+
 def test_an_agent_cannot_hand_off_to_itself():
     app = make_app()
     app.agent("loop", handoffs=["loop"])

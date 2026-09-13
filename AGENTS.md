@@ -469,7 +469,8 @@ before the last `keep_recent` are summarised with `compact_with` (default
 assistant message so `tool_use`/`tool_result` pairs stay together.
 
 A typo in `tools`, `handoffs` or `context` is a **boot error** with a "did you
-mean" hint. An agent that lists itself in `handoffs` is rejected.
+mean" hint. An agent that lists itself in `handoffs` is rejected, and so is one
+whose `tools` include `transfer_to_<h>` for one of its own handoffs `h`.
 
 Result shape: `run_id, agent, path, status, output, steps, usage,
 pending_approval?, session_id?`. `status` ∈ `completed | step_limit |
