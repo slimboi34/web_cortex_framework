@@ -470,7 +470,7 @@ before the last `keep_recent` are summarised with `compact_with` (default
 `fast`) and replaced by one user message. The cut always lands on an
 assistant message so `tool_use`/`tool_result` pairs stay together. A failed
 compaction is a `compaction` step with `error` set, naming the model; the run
-continues uncompacted.
+continues uncompacted, and the next attempt waits 2, then 4, 8… steps.
 
 A typo in `tools`, `handoffs` or `context` is a **boot error** with a "did you
 mean" hint. An agent that lists itself in `handoffs` is rejected, and so is one

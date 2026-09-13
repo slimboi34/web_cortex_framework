@@ -299,6 +299,11 @@ struct RunState {
     system_suffix: String,
     /// Input size of the last provider call: the real measure of context.
     last_input_tokens: u64,
+    /// Consecutive failed compactions, and the step the next attempt waits
+    /// for. A summariser that keeps failing would otherwise be called, and
+    /// charged, on every remaining step.
+    compaction_failures: u32,
+    compaction_retry_at: u32,
     /// The client's session id, echoed in the result.
     session_id: Option<String>,
     /// Where the conversation is saved: the session id scoped by the entry
@@ -403,6 +408,8 @@ impl AgentRuntime {
             budget,
             system_suffix,
             last_input_tokens: 0,
+            compaction_failures: 0,
+            compaction_retry_at: 0,
             session_id: opts.session_id,
             session_key,
         };
@@ -481,18 +488,30 @@ impl AgentRuntime {
                 return self.finish(app, st, RunStatus::BudgetExhausted, None);
             }
 
-            if let Err(e) = self.maybe_compact(app, &mut st).await {
-                // A failed compaction is not a reason to abandon the run; the
-                // next provider call may still fit. Recorded so it is visible.
-                st.steps.push(Step {
-                    index: st.usage.steps,
-                    kind: StepKind::Compaction,
-                    tool: None,
-                    arguments: None,
-                    result: None,
-                    error: Some(e),
-                    duration_ms: 0,
-                });
+            if st.usage.steps >= st.compaction_retry_at {
+                let compactions = st.usage.compactions;
+                match self.maybe_compact(app, &mut st).await {
+                    Ok(()) if st.usage.compactions > compactions => st.compaction_failures = 0,
+                    Ok(()) => {}
+                    Err(e) => {
+                        // A failed compaction is not a reason to abandon the run;
+                        // the next provider call may still fit. Recorded so it is
+                        // visible, then retried after 2, 4, 8… steps rather than
+                        // on every one.
+                        st.compaction_failures = st.compaction_failures.saturating_add(1);
+                        let wait = 1u32.checked_shl(st.compaction_failures).unwrap_or(u32::MAX);
+                        st.compaction_retry_at = st.usage.steps.saturating_add(wait);
+                        st.steps.push(Step {
+                            index: st.usage.steps,
+                            kind: StepKind::Compaction,
+                            tool: None,
+                            arguments: None,
+                            result: None,
+                            error: Some(e),
+                            duration_ms: 0,
+                        });
+                    }
+                }
             }
 
             let tools = self.tool_specs(app, &st.def);
@@ -1394,6 +1413,29 @@ mod tests {
         let step = out.steps.iter().find(|s| s.kind == StepKind::Compaction).expect("a compaction step");
         let error = step.error.as_deref().unwrap_or_default();
         assert!(error.contains("\"test\"") && error.contains("summariser unavailable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_compaction_that_keeps_failing_backs_off_instead_of_retrying_every_step() {
+        // Every call gets a tool turn, so the summariser never returns text and
+        // every compaction attempt fails.
+        let (app, _, provider) =
+            app_with(ScriptedProvider::always_tool("safe", json!({})).with_tokens(1000, 10)).await;
+        let mut def = app.agent("a").unwrap().clone();
+        def.max_steps = Some(12);
+        def.policy.max_context_tokens = Some(500);
+        def.policy.keep_recent = 2;
+        def.policy.compact_with = Some("test".into());
+
+        let out = app.agent_runtime().unwrap().run(&app, &def, &caller(&[]), "go", RunOptions::default()).await;
+        assert_eq!(out.status, RunStatus::StepLimit, "{:?}", out.steps);
+        let failed: Vec<_> =
+            out.steps.iter().filter(|s| s.kind == StepKind::Compaction).map(|s| s.index).collect();
+        // First eligible at step 2, then after waits of 2 and 4 steps; the next
+        // would be step 16, past the limit.
+        assert_eq!(failed, vec![2, 4, 8]);
+        let attempts = provider.snapshots().iter().filter(|s| s.system.starts_with("You compress")).count();
+        assert_eq!(attempts, 3);
     }
 
     #[tokio::test]

@@ -69,7 +69,9 @@ describe itself to the model writing it.
   the last call; older turns are summarised with `compact_with` (default the
   `fast` alias), keeping `keep_recent` messages verbatim. The cut lands on an
   assistant turn so tool pairs stay intact. A failed compaction is recorded
-  as a step naming the model, and the run continues uncompacted.
+  as a step naming the model, and the run continues uncompacted; the next
+  attempt waits 2, then 4, 8… steps, so a summariser that keeps failing is not
+  called on every remaining step.
 - **The ledger.** `GET /_webcortex/usage` reports tokens by caller and model,
   and dollars only from prices declared with `app.pricing(...)` — `null`, not
   zero, where none are.
