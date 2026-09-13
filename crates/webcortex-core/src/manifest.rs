@@ -730,6 +730,23 @@ pub enum Op {
     Flow { flow: String },
 }
 
+impl Op {
+    /// The engine name, as `x-webcortex-op` and the control plane report it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Op::Static { .. } => "static",
+            Op::Python { .. } => "python",
+            Op::Query { .. } => "query",
+            Op::Proxy { .. } => "proxy",
+            Op::Agent { .. } => "agent",
+            Op::Page { .. } => "page",
+            Op::Files { .. } => "files",
+            Op::Behaviour { .. } => "behaviour",
+            Op::Flow { .. } => "flow",
+        }
+    }
+}
+
 fn default_page_status() -> u16 {
     200
 }

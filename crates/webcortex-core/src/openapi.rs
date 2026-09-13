@@ -69,7 +69,7 @@ fn operation(r: &Route) -> Value {
                 }
             }
         },
-        "x-webcortex-op": op_kind(&r.op),
+        "x-webcortex-op": r.op.kind(),
         "x-webcortex-tool": r.tool.expose,
     });
 
@@ -121,18 +121,4 @@ fn body_schema(r: &Route) -> Option<Value> {
         req.retain(|v| v.as_str().map(|s| !in_path.contains(&s.to_string())).unwrap_or(true));
     }
     Some(cloned)
-}
-
-fn op_kind(op: &Op) -> &'static str {
-    match op {
-        Op::Static { .. } => "static",
-        Op::Python { .. } => "python",
-        Op::Query { .. } => "query",
-        Op::Proxy { .. } => "proxy",
-        Op::Agent { .. } => "agent",
-        Op::Page { .. } => "page",
-        Op::Files { .. } => "files",
-        Op::Behaviour { .. } => "behaviour",
-        Op::Flow { .. } => "flow",
-    }
 }

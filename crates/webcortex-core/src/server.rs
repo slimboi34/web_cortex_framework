@@ -460,7 +460,7 @@ async fn control_plane(
                     "id": r.id,
                     "method": r.method,
                     "path": r.path,
-                    "op": op_name(&r.op),
+                    "op": r.op.kind(),
                     "tool": r.tool.expose.then(|| r.tool_name()),
                     "scopes": r.scopes,
                 })).collect::<Vec<_>>()
@@ -534,22 +534,6 @@ async fn control_plane(
         ),
     }
 }
-
-fn op_name(op: &crate::manifest::Op) -> &'static str {
-    use crate::manifest::Op::*;
-    match op {
-        Static { .. } => "static",
-        Python { .. } => "python",
-        Query { .. } => "query",
-        Proxy { .. } => "proxy",
-        Agent { .. } => "agent",
-        Page { .. } => "page",
-        Files { .. } => "files",
-        Behaviour { .. } => "behaviour",
-        Flow { .. } => "flow",
-    }
-}
-
 
 /// Best-effort extraction of a panic message for the log. Never surfaced to the
 /// client, which only ever sees "internal error".
