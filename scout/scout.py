@@ -234,15 +234,12 @@ def ask(path: str, chunk: str, part: int, parts: int) -> list[dict]:
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
-        m = re.search(r"[\[{].*[\]}]", content, re.S)
-        if not m:
+        parsed = salvage(content)
+        if parsed is None:
             log(f"unparseable answer for {path}: {content[:120]!r}")
             return []
-        try:
-            parsed = json.loads(m.group(0))
-        except json.JSONDecodeError:
-            log(f"unparseable answer for {path}: {content[:120]!r}")
-            return []
+        log(f"salvaged a truncated answer for {path}")
+
     items = normalise(parsed)
     if not items and content.strip() not in ("", "[]", '{"suggestions": []}', '{"suggestions":[]}'):
         log(f"no usable suggestions in answer for {path}; it began {content[:100]!r}")
@@ -251,7 +248,33 @@ def ask(path: str, chunk: str, part: int, parts: int) -> list[dict]:
     return items
 
 
+def salvage(content: str) -> object | None:
+    """Recover the complete entries from an answer that stopped mid-JSON.
+
+    Small models under a grammar constraint sometimes emit a stop token
+    halfway through a string. The entries before that point are intact, so
+    cut back to the last complete object in the list and close the brackets.
+    """
+    m = re.search(r"[\[{].*", content, re.S)
+    if not m:
+        return None
+    text = m.group(0)
+    for _ in range(200):
+        end = text.rfind("}")
+        if end <= 0:
+            return None
+        candidate = text[: end + 1].rstrip().rstrip(",")
+        for closer in ("]}", "]", "}", ""):
+            try:
+                return json.loads(candidate + closer)
+            except json.JSONDecodeError:
+                continue
+        text = text[:end]
+    return None
+
+
 _SEVERITIES = ("low", "medium", "high")
+
 
 
 def normalise(parsed: object) -> list[dict]:
