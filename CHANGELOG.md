@@ -68,7 +68,8 @@ describe itself to the model writing it.
 - **Compaction.** `context_window` is checked against the *measured* input of
   the last call; older turns are summarised with `compact_with` (default the
   `fast` alias), keeping `keep_recent` messages verbatim. The cut lands on an
-  assistant turn so tool pairs stay intact.
+  assistant turn so tool pairs stay intact. A failed compaction is recorded
+  as a step naming the model, and the run continues uncompacted.
 - **The ledger.** `GET /_webcortex/usage` reports tokens by caller and model,
   and dollars only from prices declared with `app.pricing(...)` — `null`, not
   zero, where none are.

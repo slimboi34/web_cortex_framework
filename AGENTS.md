@@ -466,7 +466,9 @@ result (the step record keeps the full value). `context_window` compares
 against the **measured** input tokens of the last call; when exceeded, turns
 before the last `keep_recent` are summarised with `compact_with` (default
 `fast`) and replaced by one user message. The cut always lands on an
-assistant message so `tool_use`/`tool_result` pairs stay together.
+assistant message so `tool_use`/`tool_result` pairs stay together. A failed
+compaction is a `compaction` step with `error` set, naming the model; the run
+continues uncompacted.
 
 A typo in `tools`, `handoffs` or `context` is a **boot error** with a "did you
 mean" hint. An agent that lists itself in `handoffs` is rejected, and so is one

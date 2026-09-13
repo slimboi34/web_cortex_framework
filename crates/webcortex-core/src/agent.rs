@@ -837,14 +837,16 @@ impl AgentRuntime {
                 force_tool: None,
                 system_suffix: "",
             };
-            self.provider.complete(&req).await?
+            self.provider
+                .complete(&req)
+                .await
+                .map_err(|e| format!("compaction with model {:?} failed: {e}", summariser.model))?
         };
         self.charge(app, st, "compaction", &response);
-        let summary = if response.text.is_empty() {
-            return Err("compaction model returned no text".into());
-        } else {
-            response.text
-        };
+        if response.text.is_empty() {
+            return Err(format!("compaction model {:?} returned no text", summariser.model));
+        }
+        let summary = response.text;
 
         let before = st.conversation.messages.len();
         let tail = st.conversation.messages.split_off(cut);
@@ -1414,6 +1416,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_compaction_is_recorded_and_the_run_continues() {
+        let (app, _, _) = app_with(
+            ScriptedProvider::sequence(vec![
+                ("tool", "safe", json!({})),
+                ("tool", "safe", json!({})),
+                ("error", "summariser unavailable", json!(null)), // the compaction call
+                ("text", "final", json!(null)),
+            ])
+            .with_tokens(1000, 10),
+        )
+        .await;
+        let mut def = app.agent("a").unwrap().clone();
+        def.policy.max_context_tokens = Some(500);
+        def.policy.keep_recent = 2;
+        def.policy.compact_with = Some("test".into());
+
+        let out = app.agent_runtime().unwrap().run(&app, &def, &caller(&[]), "go", RunOptions::default()).await;
+        assert_eq!(out.status, RunStatus::Completed, "{:?}", out.steps);
+        assert_eq!(out.output, "final");
+        assert_eq!(out.usage.compactions, 0);
+        let step = out.steps.iter().find(|s| s.kind == StepKind::Compaction).expect("a compaction step");
+        let error = step.error.as_deref().unwrap_or_default();
+        assert!(error.contains("\"test\"") && error.contains("summariser unavailable"), "{error}");
+    }
+
+    #[tokio::test]
     async fn sessions_carry_the_conversation_between_runs() {
         let (app, _, provider) = app_with(ScriptedProvider::sequence(vec![
             ("text", "one", json!(null)),
@@ -1424,7 +1452,8 @@ mod tests {
         let opts = RunOptions { session_id: Some("s1".into()), ..Default::default() };
         let a = app.invoke_agent("a", "first", &caller(&[]), opts.clone()).await.unwrap();
         assert_eq!(a.session_id.as_deref(), Some("s1"));
-        let _ = app.invoke_agent("a", "second", &caller(&[]), opts.clone()).await.unwrap();
+        let b = app.invoke_agent("a", "second", &caller(&[]), opts.clone()).await.unwrap();
+        assert_eq!(b.session_id.as_deref(), Some("s1"), "every turn echoes the session id");
         let snaps = provider.snapshots();
         assert_eq!(snaps[0].message_count, 1);
         assert_eq!(snaps[1].message_count, 3, "user, assistant, user");
