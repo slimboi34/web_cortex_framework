@@ -1055,6 +1055,15 @@ impl Manifest {
                         ),
                     });
                 }
+                // The handoff is itself a tool. A declared tool of the same
+                // name would reach the model twice and never be dispatched.
+                if a.tools.iter().any(|t| t.strip_prefix("transfer_to_") == Some(h.as_str())) {
+                    return Err(format!(
+                        "agent {:?} lists tool \"transfer_to_{h}\", which collides with the tool \
+                         its handoff to {h:?} creates",
+                        a.name
+                    ));
+                }
             }
             if a.policy.keep_recent == 0 {
                 return Err(format!(
