@@ -158,7 +158,8 @@ describe itself to the model writing it.
 
 ### Verified
 
-326 tests (95 Rust, 231 Python). Clippy clean. `cargo audit` clean.
+336 tests (99 Rust, 237 Python). Clippy clean. `cargo audit` reports no
+vulnerabilities.
 
 ## [0.3.2] — 2026-08-31
 
