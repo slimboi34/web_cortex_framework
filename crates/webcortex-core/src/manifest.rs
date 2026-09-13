@@ -492,7 +492,9 @@ fn default_behaviour_steps() -> u32 {
     50
 }
 fn default_behaviour_model() -> String {
-    "claude-opus-5".into()
+    // The alias, as for agents, so `app.models(default=...)` also applies to a
+    // manifest that leaves the model out.
+    "default".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
