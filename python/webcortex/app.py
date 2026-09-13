@@ -86,6 +86,10 @@ class WebCortex:
         self._upstreams: dict[str, dict] = {}
         self._agents: list[dict] = []
         self._behaviours: list[dict] = []
+        self._flows: list[dict] = []
+        self._contexts: list[dict] = []
+        self._memories: list[dict] = []
+        self._models: dict = {"aliases": {}, "providers": {}, "pricing": {}}
         self._resources: list[Resource] = []
         self._schema_sql: list[str] = []
         self._templates_used: set[str] = set()
@@ -619,6 +623,387 @@ class WebCortex:
         )
 
     # ------------------------------------------------------------------
+    # Models: tiers, providers, prices
+    # ------------------------------------------------------------------
+
+    def models(self, **aliases: str) -> None:
+        """Name model tiers once, and change them in one place.
+
+            app.models(
+                default="claude-opus-5",
+                fast="claude-haiku-4-5-20251001",
+                local="ollama/qwen3.5:9b",
+            )
+
+        Anywhere a model is named — `app.agent(model=...)`, `@app.behaviour`,
+        `ctx.ask(model=...)`, a flow's classifier — an alias resolves here. The
+        token-economy habit this enables is simple: classification and
+        extraction leaves use `"fast"`, judgement uses `"default"`, and moving
+        a workload to a cheaper or local model is one edit.
+
+        A model name selects its provider by prefix: `ollama/…` for a local
+        Ollama server, `openai/…`, `anthropic/…`, or the name of a provider
+        declared with `app.provider(...)`. A bare `claude-*` name is Anthropic.
+        `default` and `fast` have built-in values.
+        """
+        for alias, target in aliases.items():
+            if not isinstance(target, str) or not target:
+                raise ValueError(f"models(): alias {alias!r} must name a model")
+            self._models["aliases"][alias] = target
+
+    def provider(
+        self,
+        name: str,
+        *,
+        base_url: str,
+        kind: str = "openai",
+        api_key_env: str | None = None,
+    ) -> None:
+        """Declare a model endpoint reachable as `<name>/<model>`.
+
+        `kind="openai"` is any Chat-Completions-compatible server — vLLM,
+        LM Studio, Groq, OpenRouter, a second Ollama host. `kind="anthropic"`
+        is a Messages-API gateway. As everywhere else, the credential is named
+        by environment variable, never embedded.
+        """
+        if kind not in ("openai", "anthropic"):
+            raise ValueError("provider(): kind must be 'openai' or 'anthropic'")
+        if not base_url.startswith(("http://", "https://")):
+            raise ValueError(f"provider {name!r}: base_url must start with http:// or https://")
+        self._models["providers"][name] = {
+            "kind": kind,
+            "base_url": base_url,
+            "api_key_env": api_key_env,
+        }
+
+    def pricing(
+        self,
+        model: str,
+        *,
+        input_per_mtok: float,
+        output_per_mtok: float,
+        cache_read_per_mtok: float = 0.0,
+        cache_write_per_mtok: float = 0.0,
+    ) -> None:
+        """Declare what a model costs, in USD per million tokens.
+
+        Nothing is built in: prices change, and a stale number is worse than
+        none. With prices declared, `GET /_webcortex/usage` reports an
+        estimated cost alongside the token counts it always reports.
+        """
+        self._models["pricing"][model] = {
+            "input_per_mtok": float(input_per_mtok),
+            "output_per_mtok": float(output_per_mtok),
+            "cache_read_per_mtok": float(cache_read_per_mtok),
+            "cache_write_per_mtok": float(cache_write_per_mtok),
+        }
+
+    # ------------------------------------------------------------------
+    # Context providers
+    # ------------------------------------------------------------------
+
+    def context(
+        self,
+        name: str,
+        *,
+        sql: str | None = None,
+        params: Sequence[str] = (),
+        returns: str = "many",
+        data: Any = None,
+        description: str = "",
+        max_chars: int = 4000,
+    ) -> Any:
+        """Declare a named source of context for agents and behaviours.
+
+        A run is only as good as what it knows at step one. A context provider
+        is resolved when a run starts and handed to the model as a delimited
+        block in the system prompt — declared once, reused by anything that
+        names it, and bounded in size because it is re-sent on every step.
+
+        Three sources, mirroring `app.page`:
+
+            app.context("catalogue", sql="SELECT title, author FROM books LIMIT 50")
+            app.context("policy", data={"refund_days": 30, "max_auto_refund": 500})
+
+            @app.context("account")
+            def account(req) -> dict:
+                return lookup(req.user["id"])
+
+        A SQL provider may bind `@principal`, the identity of whoever started
+        the run, and any key of the run's input. Agents name providers with
+        `context=[...]`; behaviours declare them the same way and read them on
+        demand with `ctx.context(name)`.
+        """
+        if sql is not None and data is not None:
+            raise ValueError("context(): pass either sql= or data=, not both")
+        if max_chars <= 0:
+            raise ValueError("context(): max_chars must be positive")
+
+        if sql is not None:
+            if not self.database:
+                raise ValueError(f"context {name!r} uses sql= but no database is configured")
+            if returns not in ("many", "one", "affected"):
+                raise ValueError("returns must be 'many', 'one', or 'affected'")
+            self._contexts.append({
+                "name": name, "description": description, "max_chars": max_chars,
+                "source": {"kind": "query", "sql": sql, "params": list(params), "returns": returns},
+            })
+            return None
+
+        if data is not None:
+            self._contexts.append({
+                "name": name, "description": description, "max_chars": max_chars,
+                "source": {"kind": "static", "value": data},
+            })
+            return None
+
+        def decorator(fn: Callable) -> Callable:
+            wants_request = _request_param(fn)
+            handler_index = len(self._handlers)
+            self._handlers.append(_bind_handler(fn, wants_request))
+            self._contexts.append({
+                "name": name,
+                "description": description or (inspect.getdoc(fn) or ""),
+                "max_chars": max_chars,
+                "source": {"kind": "python", "handler": handler_index},
+            })
+            return fn
+
+        return decorator
+
+    # ------------------------------------------------------------------
+    # Memory
+    # ------------------------------------------------------------------
+
+    def memory(
+        self,
+        name: str = "memory",
+        *,
+        scopes: Sequence[str] = (),
+        read_scopes: Sequence[str] | None = None,
+        write_scopes: Sequence[str] | None = None,
+        max_results: int = 10,
+    ) -> list[str]:
+        """Give agents a persistent, per-user memory — four tools, zero Python.
+
+            notes = app.memory("notes", scopes=["read"])
+            app.agent("assistant", memory="notes", ...)
+
+        Creates a table and four routes, all executed in Rust and all exposed
+        as tools: `notes_remember(key, value)`, `notes_recall(key)`,
+        `notes_search(query, limit)` and `notes_forget(key)`. Every row is
+        keyed by the *root* principal — the human or service behind however
+        many agents deep the call is — so an agent writing on someone's behalf
+        writes to that someone's memory and can never read another's.
+
+        Search is substring match, on purpose. Semantic retrieval belongs in a
+        Python handler over the embedding store you already run; this is the
+        durable scratchpad that most assistants need and few frameworks ship.
+
+        Returns the tool names, so they can be given to agents that do not
+        use the `memory=` shorthand.
+        """
+        if not self.database:
+            raise ValueError(f"memory {name!r} needs a database; pass database=... to WebCortex()")
+        if not name.isidentifier():
+            raise ValueError(f"memory name {name!r} must be a valid identifier")
+        if any(m["name"] == name for m in self._memories):
+            raise ValueError(f"memory {name!r} is already declared")
+
+        table = f"wcx_{name}"
+        reads = list(read_scopes if read_scopes is not None else scopes)
+        writes = list(write_scopes if write_scopes is not None else scopes)
+        row = {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "value": {"type": "string"},
+                "updated_at": {"type": "string"},
+            },
+        }
+        tools = [f"{name}_remember", f"{name}_recall", f"{name}_search", f"{name}_forget"]
+
+        self.query(
+            "POST", f"/{name}/remember",
+            f"INSERT INTO {table} (principal, key, value, updated_at) "
+            f"VALUES (?, ?, ?, datetime('now')) "
+            f"ON CONFLICT(principal, key) DO UPDATE SET value = excluded.value, "
+            f"updated_at = excluded.updated_at RETURNING key, value, updated_at",
+            params=["@principal", "key", "value"], returns="one",
+            summary=f"Remember something under a key in the {name} memory",
+            description=(f"Store or overwrite a fact in the caller's {name} memory. "
+                         "Use a short, stable key so it can be recalled later."),
+            input_schema={"type": "object",
+                          "properties": {"key": {"type": "string"}, "value": {"type": "string"}},
+                          "required": ["key", "value"], "additionalProperties": False},
+            output_schema=row, tool=True, tool_name=tools[0], scopes=writes,
+            read_only=False, idempotent=True,
+        )
+        self.query(
+            "GET", f"/{name}/recall/{{key}}",
+            f"SELECT key, value, updated_at FROM {table} WHERE principal = ? AND key = ?",
+            params=["@principal", "key"], returns="one",
+            summary=f"Recall one fact from the {name} memory by key",
+            description=f"Fetch the value stored under a key in the caller's {name} memory. 404 when nothing is stored.",
+            input_schema={"type": "object", "properties": {"key": {"type": "string"}},
+                          "required": ["key"], "additionalProperties": False},
+            output_schema=row, tool=True, tool_name=tools[1], scopes=reads,
+        )
+        self.query(
+            "GET", f"/{name}/search",
+            f"SELECT key, value, updated_at FROM {table} WHERE principal = ? "
+            f"AND (key LIKE '%' || ? || '%' OR value LIKE '%' || ? || '%') "
+            f"ORDER BY updated_at DESC LIMIT COALESCE(?, {int(max_results)})",
+            params=["@principal", "query", "query", "limit"], returns="many",
+            summary=f"Search the {name} memory",
+            description=f"Find facts in the caller's {name} memory whose key or value contains the query, newest first.",
+            input_schema={"type": "object",
+                          "properties": {"query": {"type": "string"},
+                                         "limit": {"type": "integer", "default": int(max_results)}},
+                          "required": ["query"], "additionalProperties": False},
+            output_schema={"type": "array", "items": row}, tool=True, tool_name=tools[2], scopes=reads,
+        )
+        self.query(
+            "DELETE", f"/{name}/forget/{{key}}",
+            f"DELETE FROM {table} WHERE principal = ? AND key = ?",
+            params=["@principal", "key"], returns="affected",
+            summary=f"Forget one fact in the {name} memory",
+            description=f"Delete the value stored under a key in the caller's {name} memory.",
+            input_schema={"type": "object", "properties": {"key": {"type": "string"}},
+                          "required": ["key"], "additionalProperties": False},
+            output_schema={"type": "object", "properties": {"affected": {"type": "integer"}}},
+            tool=True, tool_name=tools[3], scopes=writes,
+        )
+
+        self._schema_sql.append(
+            f"CREATE TABLE IF NOT EXISTS {table} (\n"
+            f"  principal TEXT NOT NULL,\n"
+            f"  key TEXT NOT NULL,\n"
+            f"  value TEXT NOT NULL,\n"
+            f"  updated_at TEXT NOT NULL,\n"
+            f"  PRIMARY KEY (principal, key)\n"
+            f");"
+        )
+        self._memories.append({"name": name, "table": table, "tools": tools})
+        return tools
+
+    # ------------------------------------------------------------------
+    # Flows
+    # ------------------------------------------------------------------
+
+    def flow(
+        self,
+        name: str,
+        *,
+        pipeline: Sequence[Any] | None = None,
+        parallel: Sequence[Any] | None = None,
+        merge: str = "collect",
+        route: dict[str, Any] | None = None,
+        default: Any = None,
+        classify_with: str | None = None,
+        classify_prompt: str | None = None,
+        description: str = "",
+        scopes: Sequence[str] = (),
+        expose_scopes: Sequence[str] | None = None,
+        token_budget: int | None = None,
+        expose_at: str | None = None,
+        tool: bool = True,
+        input_schema: dict | None = None,
+    ) -> None:
+        """Declare an orchestration as data, executed in Rust.
+
+        Three shapes cover most multi-agent arrangements:
+
+            # each step receives the previous step's output
+            app.flow("report", pipeline=["researcher", "writer"], token_budget=200_000)
+
+            # every branch receives the same input, concurrently
+            app.flow("audit", parallel=["security_review", "style_review"], merge="collect")
+
+            # a cheap model picks a branch
+            app.flow("front_desk",
+                     route={"billing": "billing_agent", "technical": "tech_agent"},
+                     default="general_agent", classify_with="fast")
+
+        A step is a tool name — an agent, a behaviour, another flow, or any
+        route marked `tool=True` — or a dict `{"tool": name, "input": {...}}`
+        whose `input` maps arguments: `"$"` is the incoming value, `"$.a.b"` a
+        path into it, `"$input"` the flow's original input. Without a mapping,
+        an agent step receives `{"input": <previous output>}` and any other
+        step receives the previous output as its arguments.
+
+        Every step runs under the flow's delegated principal, one nesting level
+        deeper, against one shared `token_budget` — so a pipeline of three
+        agents costs at most what you said, not three times what each said.
+        A flow is itself a tool, so flows nest and agents can invoke them.
+        """
+        given = [k for k, v in (("pipeline", pipeline), ("parallel", parallel), ("route", route)) if v is not None]
+        if len(given) != 1:
+            raise ValueError("flow(): pass exactly one of pipeline=, parallel=, or route=")
+        if any(f["name"] == name for f in self._flows):
+            raise ValueError(f"flow {name!r} is already declared")
+
+        def step(s: Any) -> dict:
+            if isinstance(s, str):
+                return {"tool": s, "input": None}
+            if isinstance(s, dict) and isinstance(s.get("tool"), str):
+                return {"tool": s["tool"], "input": s.get("input")}
+            raise ValueError(
+                f"flow {name!r}: each step must be a tool name or a dict with a 'tool' key, got {s!r}"
+            )
+
+        if pipeline is not None:
+            steps = [step(s) for s in pipeline]
+            if not steps:
+                raise ValueError(f"flow {name!r}: a pipeline needs at least one step")
+            kind: dict = {"kind": "pipeline", "steps": steps}
+        elif parallel is not None:
+            if merge not in ("collect", "merge"):
+                raise ValueError("flow(): merge must be 'collect' or 'merge'")
+            branches = [step(s) for s in parallel]
+            if not branches:
+                raise ValueError(f"flow {name!r}: a parallel needs at least one branch")
+            kind = {"kind": "parallel", "branches": branches, "merge": merge}
+        else:
+            assert route is not None
+            if not route:
+                raise ValueError(f"flow {name!r}: a router needs at least one route")
+            kind = {
+                "kind": "route",
+                "routes": {str(label): step(s) for label, s in route.items()},
+                "default": step(default) if default is not None else None,
+                "classify_with": classify_with,
+                "classify_prompt": classify_prompt,
+            }
+
+        schema = input_schema or {
+            "type": "object",
+            "properties": {"input": {"type": "string", "description": "The flow's input."}},
+            "additionalProperties": True,
+        }
+        self._flows.append({
+            "name": name,
+            "description": description,
+            "kind": kind,
+            "scopes": list(scopes),
+            "token_budget": token_budget,
+            "input_schema": schema,
+        })
+
+        path = expose_at or f"/flows/{name.replace('_', '-')}"
+        guard = list(expose_scopes if expose_scopes is not None else scopes)
+        self._add_route(
+            "POST", path,
+            {"kind": "flow", "flow": name},
+            summary=description.split("\n", 1)[0] or f"Run the {name} flow",
+            description=description,
+            input_schema=schema,
+            tool=tool, tool_name=name,
+            read_only=False, idempotent=False,
+            scopes=guard,
+        )
+
+    # ------------------------------------------------------------------
     # Behaviours
     # ------------------------------------------------------------------
 
@@ -628,10 +1013,11 @@ class WebCortex:
         *,
         description: str = "",
         tools: Sequence[str] = (),
+        context: Sequence[str] = (),
         scopes: Sequence[str] = (),
         max_steps: int = 50,
         token_budget: int | None = None,
-        model: str = "claude-opus-5",
+        model: str = "default",
         max_tokens: int = 4096,
         temperature: float = 1.0,
         expose_at: str | None = None,
@@ -675,8 +1061,14 @@ class WebCortex:
 
         - `ctx.call(tool, **kwargs)` — invoke one of the app's tools, in-process,
           under this behaviour's delegated principal
-        - `ctx.ask(prompt, schema=...)` — a model call; with a schema the model
-          is *forced* into that shape, so branches switch on real values
+        - `ctx.gather((tool, kwargs), ...)` — several tool calls at once, run
+          concurrently on the Rust runtime
+        - `ctx.ask(prompt, schema=..., model="fast")` — a model call; with a
+          schema the model is *forced* into that shape, so branches switch on
+          real values; `model` may be an alias from `app.models(...)`
+        - `ctx.ask_many([prompts], schema=...)` — the classification loop
+          collapsed into one concurrent wait
+        - `ctx.context(name)` — resolve a declared context provider
         - `ctx.log(msg)`, `ctx.halt(reason)`, `ctx.usage`, `ctx.trace`, `ctx.user`
 
         A behaviour is exposed as a tool by default, so agents can invoke
@@ -706,6 +1098,7 @@ class WebCortex:
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                     "input_schema": input_schema,
+                    "context": list(context),
                 }
             )
 
@@ -742,9 +1135,12 @@ class WebCortex:
         self,
         name: str,
         *,
-        model: str,
+        model: str = "default",
         system: str = "",
         tools: Sequence[str] = (),
+        handoffs: Sequence[str] = (),
+        context: Sequence[str] = (),
+        memory: str | None = None,
         description: str = "",
         max_steps: int | None = 12,
         token_budget: int | None = None,
@@ -753,13 +1149,43 @@ class WebCortex:
         expose_scopes: Sequence[str] | None = None,
         temperature: float = 1.0,
         max_tokens: int = 4096,
+        cache: bool = True,
+        context_window: int | None = None,
+        tool_result_limit: int = 16_384,
+        compact_with: str | None = None,
+        keep_recent: int = 6,
+        tool: bool = True,
     ) -> None:
         """Declare an agent that lives inside the application.
 
-        `tools` names routes exposed with `tool=True`. Because the agent calls
-        them through the same dispatcher the HTTP server uses, a tool call is an
-        in-process function call — not a loopback request — and it inherits the
-        route's declared scopes.
+        `tools` names routes exposed with `tool=True` — including other
+        agents, behaviours and flows, which is all a supervisor needs. Because
+        the agent calls them through the same dispatcher the HTTP server uses,
+        a tool call is an in-process function call, not a loopback request,
+        and it inherits the route's declared scopes.
+
+        **Every agent is a tool.** It is mounted at `expose_at` (default
+        `/agents/<name>`) and exposed under its own name, so another agent can
+        list it in `tools=[...]`. The endpoint takes `{"input": "...",
+        "session_id": "..."}`; a `session_id` continues a conversation.
+
+        `handoffs` names agents this one may transfer the conversation to.
+        Each becomes a `transfer_to_<name>` tool; calling it swaps the agent in
+        control while the conversation, the budget and the caller's authority
+        carry over — and authority can only shrink along the chain.
+
+        `context` names providers declared with `app.context(...)`, resolved
+        at run start into the system prompt. `memory` names a store declared
+        with `app.memory(...)` and adds its four tools plus a hint on how to
+        use them.
+
+        **Token economy.** `cache=True` asks the provider to cache the system
+        prompt and tool definitions across steps. `tool_result_limit` caps
+        what the model sees of any one tool result. `context_window` sets the
+        measured input size beyond which older turns are summarised with
+        `compact_with` (default: the `fast` alias), keeping the last
+        `keep_recent` messages intact. `token_budget` caps the whole run,
+        including every nested agent, behaviour and flow it calls.
 
         `scopes` is what the agent may *use*; `expose_scopes` is who may *start*
         a run. They default to the same set, because an endpoint that spends
@@ -767,36 +1193,79 @@ class WebCortex:
         themselves. Passing `expose_scopes=[]` makes the endpoint public — which
         `webcortex security` will report.
 
-        A typo in `tools` is a boot error, not a runtime surprise.
+        A typo in `tools`, `handoffs` or `context` is a boot error, not a
+        runtime surprise.
         """
+        if keep_recent < 1:
+
+            raise ValueError("agent(): keep_recent must be at least 1")
+
+        tool_list = list(tools)
+        system_text = system
+        if memory is not None:
+            mem = next((m for m in self._memories if m["name"] == memory), None)
+            if mem is None:
+                raise ValueError(
+                    f"agent {name!r} names memory {memory!r}, which is not declared; "
+                    f"call app.memory({memory!r}) first"
+                )
+            for t in mem["tools"]:
+                if t not in tool_list:
+                    tool_list.append(t)
+            hint = (
+                f"You have a persistent memory. Use {memory}_remember to store facts worth "
+                f"keeping across conversations, {memory}_recall or {memory}_search to "
+                f"retrieve them, and {memory}_forget to drop ones that are no longer true."
+            )
+            system_text = f"{system_text}\n\n{hint}".strip()
+
         self._agents.append(
             {
                 "name": name,
                 "description": description,
                 "model": model,
-                "system": system,
-                "tools": list(tools),
+                "system": system_text,
+                "tools": tool_list,
+                "handoffs": list(handoffs),
+                "context": list(context),
                 "max_steps": max_steps,
                 "token_budget": token_budget,
                 "scopes": list(scopes),
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "cache": bool(cache),
+                "policy": {
+                    "max_tool_result_bytes": int(tool_result_limit),
+                    "max_context_tokens": context_window,
+                    "compact_with": compact_with,
+                    "keep_recent": int(keep_recent),
+                },
             }
         )
-        if expose_at:
-            guard = list(expose_scopes if expose_scopes is not None else scopes)
-            self._add_route(
-                "POST", expose_at,
-                {"kind": "agent", "agent": name, "stream": False},
-                summary=f"Invoke the {name} agent",
-                description=description,
-                input_schema={
-                    "type": "object",
-                    "properties": {"input": {"type": "string"}},
-                    "required": ["input"],
+
+        path = expose_at or f"/agents/{name.replace('_', '-')}"
+        guard = list(expose_scopes if expose_scopes is not None else scopes)
+        self._add_route(
+            "POST", path,
+            {"kind": "agent", "agent": name, "stream": False},
+            summary=description.split("\n", 1)[0] or f"Ask the {name} agent",
+            description=description or f"Ask the {name} agent.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "input": {"type": "string", "description": "What to ask the agent."},
+                    "session_id": {
+                        "type": "string",
+                        "description": "Continue an earlier conversation with this id.",
+                    },
                 },
-                scopes=guard,
-            )
+                "required": ["input"],
+                "additionalProperties": False,
+            },
+            tool=tool, tool_name=name,
+            read_only=False, idempotent=False,
+            scopes=guard,
+        )
 
     # ------------------------------------------------------------------
     # Manifest + run
@@ -861,6 +1330,9 @@ class WebCortex:
             "upstreams": self._upstreams,
             "agents": self._agents,
             "behaviours": self._behaviours,
+            "flows": self._flows,
+            "contexts": self._contexts,
+            "models": self._models,
         }
 
     def manifest_json(self) -> str:
@@ -888,6 +1360,19 @@ class WebCortex:
 
         return _core.typescript_client(self.manifest_json())
 
+    def context_pack(self) -> str:
+        """A compact description of this app for an AI coding tool.
+
+        Everything a model needs to extend the app correctly — routes, tools
+        and their schemas, agents, behaviours, flows, context providers,
+        memory, model aliases, security posture — in a few thousand tokens
+        instead of the whole codebase. `webcortex context` prints it.
+        """
+        from . import contextpack
+
+        return contextpack.build(self)
+
+
     def security_report(self) -> dict:
         """What is reachable without a credential, and what is gated.
 
@@ -914,9 +1399,25 @@ class WebCortex:
                 if r.get("approval") == "required"
             ],
             "agents": [
-                {"name": a["name"], "tools": a["tools"], "scopes": a.get("scopes", [])}
+                {
+                    "name": a["name"],
+                    "tools": a["tools"],
+                    "handoffs": a.get("handoffs", []),
+                    "scopes": a.get("scopes", []),
+                    "token_budget": a.get("token_budget"),
+                }
                 for a in self._agents
             ],
+            "flows": [
+                {
+                    "name": f["name"],
+                    "kind": f["kind"]["kind"],
+                    "scopes": f["scopes"],
+                    "token_budget": f.get("token_budget"),
+                }
+                for f in self._flows
+            ],
+            "memories": [m["name"] for m in self._memories],
             "behaviours": [
                 {
                     "name": b["name"],

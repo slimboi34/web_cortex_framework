@@ -83,9 +83,14 @@ nav:
       - Tools and MCP: agents-tools.md
       - Agents: agents.md
       - Behaviours: behaviours.md
+      - Orchestration: orchestration.md
+      - Context and memory: context.md
+      - Models and token economy: models.md
   - Operating:
       - Security: security.md
       - Deployment: deployment.md
+      - AI-native development: ai-development.md
+
   - Reference:
       - Use cases: use-cases.md
       - CLI: cli.md

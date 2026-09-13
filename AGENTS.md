@@ -27,7 +27,10 @@ Python per request.
 
 Every route can simultaneously be a REST endpoint, an OpenAPI operation, and an
 MCP tool. That is the point of the framework: you declare a thing once and it
-shows up in all three surfaces.
+shows up in all three surfaces. Agents, behaviours and flows are routes too,
+so they are tools too, and they compose: a supervisor lists workers in
+`tools=`, a front desk names specialists in `handoffs=`, a flow names any of
+them as steps. One budget bounds the whole tree.
 
 ### The design rule
 
@@ -44,19 +47,26 @@ handler when there is real logic, not as a default.
 
 ```
 crates/webcortex-core/     Rust runtime: router, server, auth, db, mcp, openapi,
-                           templates, typegen, agent loop, behaviour executor
-crates/webcortex-py/       PyO3 bindings. Compiles to webcortex._core
+                           templates, typegen, agent loop (agent.rs), providers
+                           and model registry (agent/), flows (flow.rs), context
+                           providers (context.rs), spend ledger (ledger.rs)
+crates/webcortex-py/       PyO3 bindings. Compiles to webcortex._core. The
+                           behaviour ctx lives in behaviour.rs
 python/webcortex/          The Python package users import
   __init__.py                public exports + __version__
   app.py                     the WebCortex class — the whole declarative API
   _bridge.py                 Request / Response / HTTPError / Dispatcher
   schema.py                  type annotation → JSON Schema
+  contextpack.py             `webcortex context`: the app described for a model
   cli.py                     the `webcortex` command
   starters.py                templates used by `webcortex new`
 tests/                     pytest. test_pentest.py and test_security.py are
-                           adversarial and should not be weakened to pass
+                           adversarial and should not be weakened to pass.
+                           test_orchestration.py drives the whole agent stack
+                           over HTTP against the offline fake provider
 docs/                      MkDocs site (built with --strict; see §10)
-examples/hello/            minimal app
+examples/hello/            a complete app exercising every subsystem
+scout/                     a local-model reviewer for this repository (§13)
 ```
 
 `_core` is a compiled extension. It does not exist until something builds it —
@@ -284,11 +294,70 @@ Template output is HTML-escaped. `tests/test_fullstack.py` asserts this.
 
 ---
 
+## 6a. Models, context providers, memory
+
+```python
+app.models(**aliases)                      # e.g. default=..., fast=..., local="ollama/qwen3.5:9b"
+app.provider(name, *, base_url, kind="openai", api_key_env=None)
+app.pricing(model, *, input_per_mtok, output_per_mtok,
+            cache_read_per_mtok=0.0, cache_write_per_mtok=0.0)
+```
+
+A model name resolves aliases first (`fast` → concrete name; `default` and
+`fast` are built in), then picks a provider by prefix: `ollama/…` (built in,
+no key, `OLLAMA_HOST`), `openai/…` or `gpt-*` (`OPENAI_API_KEY`),
+`anthropic/…` or bare `claude-*` (`ANTHROPIC_API_KEY`), `<declared>/…`. Two
+wire formats exist — Anthropic Messages and OpenAI Chat Completions — and
+`kind` selects one for a declared provider. **Do not add a third abstraction
+layer.** The spend ledger groups by the resolved name, so `fast` shows up as
+whatever it pointed at.
+
+Prices are never built in. `GET /_webcortex/usage` reports
+`estimated_cost_usd: null` when any model that spent tokens is unpriced.
+
+```python
+app.context(name, *, sql=None, params=(), returns="many", data=None,
+            description="", max_chars=4000)        # declarative, or a decorator
+```
+
+Exactly one of `sql=` / `data=` / decorated function. Resolved at run start
+for agents (`context=[...]`, injected into the system prompt as
+`<context name="…">…</context>` blocks) and on demand for behaviours
+(`ctx.context(name)`, only for names in the behaviour's `context=[...]`).
+SQL providers may bind `@principal` and keys of the run's input
+(`{"input": "..."}` for agents; the payload for behaviours). A Python provider
+is a normal handler called with a synthetic POST whose body is that input.
+`max_chars` is a hard cap and is re-sent every step — keep it small.
+
+```python
+app.memory(name="memory", *, scopes=(), read_scopes=None, write_scopes=None,
+           max_results=10) -> list[str]
+```
+
+Creates table `wcx_<name>` (DDL via `app.schema_sql`; applied by `app.run()`
+for SQLite) and four **Query** routes exposed as tools:
+`<name>_remember(key, value)` (upsert), `<name>_recall(key)` (404 when
+absent), `<name>_search(query, limit)` (substring, newest first),
+`<name>_forget(key)`. Every row is keyed by `@principal`, the **root**
+principal — the human or service behind any chain of agent delegation —
+enforced in the SQL, not by the model. Search is substring on purpose; do not
+add embeddings here.
+
+### `@principal`
+
+`WebCortexRequest::lookup("@principal")` returns `principal.root_id()`. A
+delegated principal carries `claims.root`, set on the first delegation and
+preserved through every subsequent one. Use it in `app.query(params=[...])`
+and `app.context(params=[...])` to scope data to the caller without a Python
+handler.
+
+---
+
 ## 7. Behaviours
 
 ```python
-@app.behaviour(name=None, *, description="", tools=(), scopes=(), max_steps=50,
-               token_budget=None, model="claude-opus-5", max_tokens=4096,
+@app.behaviour(name=None, *, description="", tools=(), context=(), scopes=(),
+               max_steps=50, token_budget=None, model="default", max_tokens=4096,
                temperature=1.0, expose_at=None, expose_scopes=None, tool=True)
 def handler(ctx, input): ...
 ```
@@ -329,12 +398,16 @@ The `ctx` surface:
 | call | meaning |
 | --- | --- |
 | `ctx.call(tool, **kwargs)` | invoke one of the app's tools, in-process, under the delegated principal |
-| `ctx.ask(prompt, schema=...)` | a model call; with a schema the model is **forced** into that shape, so branches switch on real values |
+| `ctx.gather(*items, return_exceptions=False)` | several tool calls concurrently; items are `(tool, kwargs)`, a name, or `{"tool": …, **kwargs}`; one step each; admitted/scoped/gated exactly like `call` |
+| `ctx.ask(prompt, *, schema=None, system=None, model=None, max_tokens=None, temperature=None)` | a model call; with a schema the model is **forced** into that shape (tool_choice), and JSON is recovered from prose if a local model answers in text; `model` may be an alias |
+| `ctx.ask_many(prompts, *, schema=None, ..., concurrency=8)` | concurrent `ask`; answers in order; one step per prompt |
+| `ctx.context(name)` | a declared context provider's raw value; `PermissionError` if not declared on the behaviour |
 | `ctx.log(msg)` | structured log line |
 | `ctx.halt(reason)` | stop the behaviour |
-| `ctx.usage` | tokens and steps consumed so far |
+| `ctx.usage` | `steps, max_steps, input_tokens, output_tokens, cache_tokens, token_budget, tree_tokens, tree_budget, depth` |
 | `ctx.trace` | the step trace |
-| `ctx.user` | the calling principal |
+| `ctx.user` | `{id, root_id, authenticated, scopes}` |
+| `ctx.tools` / `ctx.contexts` | what the behaviour may call / read |
 
 `input` is the JSON payload the caller sent.
 
@@ -343,29 +416,117 @@ behaviours and behaviours compose with each other. Default route is
 `/behaviours/<name-with-hyphens>`; override with `expose_at`.
 
 `max_steps` caps total leaf operations and `token_budget` caps spend — **both
-enforced by the runtime**, so a runaway loop costs a bounded amount. Do not
-remove these bounds in generated code.
+enforced by the runtime**, so a runaway loop costs a bounded amount. Tokens are
+also charged to the request tree's shared budget (§8a), so a behaviour started
+by an agent cannot outspend the agent. Do not remove these bounds in generated
+code.
+
+Behaviours run on the sync thread pool and block on `Handle::block_on`;
+`gather`/`ask_many` block once on a `join_all`. Never run a behaviour on an
+event loop.
 
 ---
 
 ## 8. Agents
 
 ```python
-app.agent(name, *, model, system="", tools=(), description="", max_steps=12,
-          token_budget=None, expose_at=None, scopes=(), expose_scopes=None,
-          temperature=1.0, max_tokens=4096) -> None
+app.agent(name, *, model="default", system="", tools=(), handoffs=(), context=(),
+          memory=None, description="", max_steps=12, token_budget=None,
+          expose_at=None, scopes=(), expose_scopes=None, temperature=1.0,
+          max_tokens=4096, cache=True, context_window=None,
+          tool_result_limit=16_384, compact_with=None, keep_recent=6,
+          tool=True) -> None
 ```
 
-`tools` names routes that were declared with `tool=True`. The agent calls them
-through the same dispatcher the HTTP server uses, so **a tool call is an
-in-process function call, not a loopback HTTP request**, and it inherits the
-route's declared scopes.
+`tools` names routes that were declared with `tool=True` — including other
+agents, behaviours and flows. The agent calls them through the same dispatcher
+the HTTP server uses, so **a tool call is an in-process function call, not a
+loopback HTTP request**, and it inherits the route's declared scopes.
 
-A typo in `tools` is a **boot error**, not a runtime surprise. `app.check()`
-raises with the offending name.
+**Every agent is a route and a tool.** It is mounted at `expose_at` (default
+`/agents/<name-with-hyphens>`) with tool name `<name>`, guarded by
+`expose_scopes` (default `scopes`). The route takes
+`{"input": str, "session_id"?: str, "reset"?: bool}`. This is a change from
+0.3, where an agent without `expose_at` had no route: an agent declared with
+`scopes=()` is now a public route, and `webcortex security` reports it.
 
-`expose_at` adds a `POST` route taking `{"input": "..."}`. Passing
-`expose_scopes=[]` makes that endpoint public; `webcortex security` reports it.
+`handoffs` names agents; each becomes a `transfer_to_<name>` tool with the
+target's `description`. On a handoff the active `AgentDef` is swapped, the
+conversation and budget carry over, and the actor is re-delegated from the
+original caller then filtered by the previous actor's scopes. Limits
+(`max_steps`, `token_budget`, `policy`) are always the **entry** agent's.
+`path` in the result lists every agent visited.
+
+`memory="notes"` appends the four memory tools and a one-sentence usage hint
+to `system`. `context=[...]` names providers (§6a).
+
+`cache=True` sends Anthropic `cache_control` breakpoints on the system block
+and the last tool. `tool_result_limit` bounds what the model sees of a tool
+result (the step record keeps the full value). `context_window` compares
+against the **measured** input tokens of the last call; when exceeded, turns
+before the last `keep_recent` are summarised with `compact_with` (default
+`fast`) and replaced by one user message. The cut always lands on an
+assistant message so `tool_use`/`tool_result` pairs stay together.
+
+A typo in `tools`, `handoffs` or `context` is a **boot error** with a "did you
+mean" hint. An agent that lists itself in `handoffs` is rejected.
+
+Result shape: `run_id, agent, path, status, output, steps, usage,
+pending_approval?, session_id?`. `status` ∈ `completed | step_limit |
+budget_exhausted | awaiting_approval | failed`. Step kinds: `model, tool_call,
+tool_refused, approval_requested, approval_denied, handoff, compaction`.
+HTTP status: 202 for `awaiting_approval`, 502 for `failed`, 200 otherwise.
+
+### 8a. The shared budget, sessions, approvals
+
+`WebCortexRequest.budget: Option<Arc<SharedBudget>>` travels with every
+in-process call (`App::call_tool_in_tree`). The outermost agent, behaviour or
+flow creates it from its own `token_budget`; nested runs charge the same
+counter and stop with `budget_exhausted` when it is spent. `usage.tree_tokens`
+reports the total. Steps stay per-run. **Any new op that can re-enter the
+dispatcher must pass `depth + 1` and the budget through**; the 0.3 agent loop
+reset depth to zero on tool calls, which bypassed the nesting ceiling.
+
+Sessions: `SessionStore` keyed by `(agent, principal.id, session_id)`,
+in-memory, `server.session_capacity` (1000) / `session_ttl_secs` (3600),
+LRU-evicted. Saved after any terminal status except `awaiting_approval`.
+
+Approvals: a gated call suspends the run into `App.approvals` with the whole
+`RunState`, the turn's tool calls, the index of the gated one, and the results
+already produced. `POST /_webcortex/approvals/{id}` with
+`{"approve": bool, "note": str}` (admin scope) executes or refuses the gated
+call, runs the **rest of the turn**, and continues the loop. A decision is
+consumed; expiry is `server.approval_ttl_secs` (3600). Denial pushes a
+`tool_result` error carrying the note.
+
+### 8b. Flows
+
+```python
+app.flow(name, *, pipeline=None, parallel=None, merge="collect", route=None,
+         default=None, classify_with=None, classify_prompt=None, description="",
+         scopes=(), expose_scopes=None, token_budget=None, expose_at=None,
+         tool=True, input_schema=None) -> None
+```
+
+Exactly one of `pipeline` / `parallel` / `route`. A step is a tool name or
+`{"tool": name, "input": template}`; every step must be an exposed tool, and a
+flow may not contain itself. Executed in Rust (`flow.rs`) under a delegated
+principal, `depth + 1`, and one shared budget. Mounted at `/flows/<name>` as a
+tool named `<name>`.
+
+Argument rules without a template: agent target → `{"input": <previous>}`
+(an object with an `input` key passes through; anything else is stringified);
+other targets → an object passes through, a scalar becomes `{"input": …}`.
+Agent and flow results are envelopes; the next step receives `output`. A step
+whose run is `awaiting_approval` or `failed` fails the flow. Templates:
+`"$"` incoming, `"$.a.b"` path, `"$input"` original, `"$input.a"` path.
+
+Route flows classify with a forced `choose` tool whose schema enumerates the
+labels; an unknown label falls to `default`, else the flow fails naming the
+label. The classifier is charged to the ledger as `flow:<name>`.
+
+Result: `{flow, run_id, status: completed|budget_exhausted, output, steps:
+[{tool, duration_ms, ok, error?, label?}], usage: {tree_tokens}, duration_ms}`.
 
 ---
 
@@ -373,13 +534,19 @@ raises with the offending name.
 
 | call | returns |
 | --- | --- |
-| `app.check()` | validated report: routes, tools, agents, behaviours. Raises on any invalid declaration |
+| `app.check()` | validated report: routes, tools, agents, behaviours, flows, contexts. Raises on any invalid declaration |
 | `app.manifest()` / `app.manifest_json()` | the manifest the Rust runtime executes |
 | `app.openapi()` | OpenAPI document, with `x-webcortex-tool` and `x-webcortex-op` extensions |
-| `app.schema_sql` | property — DDL for declared resources |
+| `app.schema_sql` | property — DDL for declared resources and memories |
 | `app.typescript_client()` | dependency-free typed TS client source |
-| `app.security_report()` | public attack surface, `auth_configured` flag |
+| `app.security_report()` | public attack surface, `auth_configured` flag, agents, behaviours, flows, memories |
+| `app.context_pack()` | the app described for a coding model (Markdown); `webcortex context` |
 | `app.run()` | hand the manifest to Rust and serve |
+
+Control plane (admin scope once auth is configured): `/health`,
+`/openapi.json`, `/tools`, `/routes`, `/agents`, `/behaviours`, `/flows`,
+`/contexts`, `/models`, `/usage`, `/audit`, `/approvals`,
+`POST /approvals/{id}`, `/security`, `POST /mcp`.
 
 `check()`, `openapi()`, `typescript_client()` and `security_report()` all
 `from . import _core`. They are the first things to fail when the extension is
@@ -401,7 +568,7 @@ precise tool schema. Do not "fix" this by making it raise.
 ## 10. The CLI
 
 ```
-webcortex new NAME [-t api|fullstack|agent|behaviour] [-d DIR] [--description D]
+webcortex new NAME [-t api|fullstack|agent|behaviour|orchestration] [-d DIR] [--description D]
 webcortex keygen
 webcortex dev      [target] [--host H] [--port P] [--workers N]
 webcortex run      [target] [--host H] [--port P] [--workers N]
@@ -411,7 +578,14 @@ webcortex tools    [target]
 webcortex sql      [target]
 webcortex security [target]
 webcortex typegen  [target] [-o client/api.ts]
+webcortex context  [target] [--json]
+webcortex evolve   REQUEST [target] [-m MODEL] [-o FILE] [--json]
 ```
+
+`evolve` calls `_core.ask_model(manifest_json, model, system, prompt, schema,
+max_tokens)`, which builds a `ProviderRegistry` from the app's `models`
+config and the environment, so aliases and declared providers work on the
+command line. It prints a proposal and never edits files.
 
 `target` defaults to `api.py` and accepts `module` or `module:attr`. A `.env`
 file is loaded before the app is imported, for every command except `new` and
@@ -543,3 +717,32 @@ reads.
   `from webcortex import _core` in `ci.yml` exists to prevent a repeat.
 - Do not make `json_schema_for` raise on unknown types (§9).
 - Do not remove `max_steps` / `token_budget` bounds from behaviours (§7).
+- Do not add a route kind that re-enters the dispatcher without passing
+  `depth + 1` and the shared budget (§8a).
+- Do not build in model prices (§6a), a third provider abstraction, an ORM, or
+  a vector store. Memory search is substring on purpose.
+- Do not let a session or approval store grow unbounded; both are capped and
+  expire, and both are documented as ephemeral.
+- Do not make the control plane's new endpoints (`/usage`, `/approvals`,
+  `/models`) reachable without `webcortex:admin` once auth is configured.
+- Do not select `FakeProvider` by anything other than
+  `WEBCORTEX_FAKE_PROVIDER`; it is a test double and logs a warning when on.
+
+---
+
+## 13. The fake provider and the scout
+
+`WEBCORTEX_FAKE_PROVIDER=1` replaces every model call with `FakeProvider`
+(`agent/provider.rs`), which answers from a tiny command language in the last
+user message: `tool:<name> <json>`, `handoff:<agent>`, `json:<object>` (for a
+forced tool), `context?` (echoes the system suffix), anything else is echoed.
+After tool results it summarises them and stops. Input tokens scale with the
+conversation, so compaction is observable. `tests/test_orchestration.py` is
+built on it; extend the DSL rather than mocking around it.
+
+`scout/scout.py` is a stdlib-only script that runs a local Ollama model over
+recent commits and a rotating focus area and appends structured suggestions to
+`scout/suggestions.md` (git-ignored). `scout/README.md` explains the loop:
+the scout proposes, a human or a coding agent decides. It is not part of the
+package and must not be imported by it.
+

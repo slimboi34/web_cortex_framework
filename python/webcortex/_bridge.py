@@ -189,6 +189,12 @@ class Request:
     def scopes(self) -> list:
         return self._raw["scopes"]
 
+    @property
+    def user(self) -> dict:
+        """The authenticated caller: ``{id, authenticated, scopes}``."""
+        return self._raw.get("user", {"id": "anonymous", "authenticated": False, "scopes": []})
+
+
     def json(self) -> Any:
         """Parsed JSON body, cached. ``None`` for an empty body."""
         if self._json is _UNSET:

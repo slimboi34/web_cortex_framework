@@ -5,10 +5,12 @@ A Python web framework with a Rust core, built on one idea:
 !!! quote ""
     **If you declared it, Rust can run it — and an agent can call it.**
 
-Django and Rails were designed when the only client was a browser. Today the
-client is just as likely to be a model. WebCortex treats that as the primary
-case rather than something you bolt on with a second, hand-maintained tool
-server.
+Django and Rails were designed when the only client was a browser and the only
+author was a person. Today the client is just as likely to be a model, and so
+is the author. WebCortex treats both as the primary case: every declaration is
+a route, an OpenAPI operation and an MCP tool; agents, behaviours and flows
+compose under one budget; and the application can describe itself to the
+model that is writing it.
 
 ```python title="api.py"
 from webcortex import WebCortex
@@ -68,7 +70,7 @@ execution model was designed.
 
 ---
 
-## The three things that are actually different
+## The five things that are actually different
 
 ### 1. Every route is a tool
 
@@ -125,17 +127,49 @@ def triage(ctx, input):
 
 [Behaviours :material-arrow-right:](behaviours.md){ .md-button }
 
+### 4. Orchestration that composes under one budget
+
+Every agent is a tool, so a supervisor is one line. Handoffs move a
+conversation to a specialist while authority only shrinks. Flows declare a
+pipeline, a fan-out or a router as data the runtime executes. Sessions
+continue a conversation; gated tools suspend a run a human can resume. And the
+outermost budget is shared by everything underneath it.
+
+```python
+app.agent("front_desk", handoffs=["billing", "technical"], token_budget=100_000)
+app.flow("briefing", pipeline=["researcher", "writer"], token_budget=150_000)
+app.flow("desk", route={"billing": "billing", "technical": "technical"}, classify_with="fast")
+```
+
+[Orchestration :material-arrow-right:](orchestration.md){ .md-button }
+
+### 5. Tokens are a declaration
+
+Name model tiers once and use `fast` for the leaves — a local model if you
+like. Prompt caching is on. Tool results are bounded, long conversations are
+compacted, context is declared and capped, and a ledger says what was spent
+by whom on what.
+
+```python
+app.models(default="claude-opus-5", fast="ollama/qwen3.5:9b")
+app.agent("assistant", context=["policy"], memory="notes",
+          tool_result_limit=8_000, context_window=60_000)
+```
+
+[Models and token economy :material-arrow-right:](models.md){ .md-button }
+
 ---
 
 ## Status
 
 !!! warning "Young"
-    v0.3.1, on PyPI as `web-cortex-framework`. Working and tested, but young.
+    v2.0.0, on PyPI as `web-cortex-framework`. Working and tested, but young.
     Read [Deployment](deployment.md#is-it-production-ready) for an honest
     assessment of what it is and is not ready for.
 
-**Verified:** 251 tests (66 Rust, 185 Python, including a 54-test adversarial
-suite). Clippy clean. `cargo audit` clean. CI builds wheels for Linux
+**Verified:** 326 tests (95 Rust, 231 Python, including a 54-test adversarial
+suite and an offline end-to-end suite that drives the whole agent stack over
+HTTP). Clippy clean. `cargo audit` clean. CI builds wheels for Linux
 (x86_64/aarch64), macOS (arm64/x86_64), and Windows across Python 3.12, 3.13,
 3.14 and free-threaded 3.14 (`3.14t`).
 
@@ -156,6 +190,8 @@ reports them and, deliberately, what was *not* tested.
 - :material-download: **[Installation](installation.md)** — get it running
 - :material-school: **[Tutorial](tutorial.md)** — build a real app end to end
 - :material-lightbulb: **[Use cases](use-cases.md)** — five worked examples
+- :material-robot: **[AI-native development](ai-development.md)** — the context pack and `evolve`
 - :material-shield-lock: **[Security](security.md)** — auth, scopes, hardening
+
 
 </div>

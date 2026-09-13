@@ -38,6 +38,219 @@ pub struct Manifest {
     pub security_headers: SecurityHeaders,
     #[serde(default)]
     pub templates: Option<TemplateConfig>,
+    /// Model aliases, provider endpoints and pricing. See [`ModelsConfig`].
+    #[serde(default)]
+    pub models: ModelsConfig,
+    /// Named context providers agents and behaviours can be given at run start.
+    #[serde(default)]
+    pub contexts: Vec<ContextDef>,
+    /// Declarative orchestrations executed entirely in Rust.
+    #[serde(default)]
+    pub flows: Vec<FlowDef>,
+}
+
+// ---------------------------------------------------------------------------
+// Models: aliases, providers, pricing
+// ---------------------------------------------------------------------------
+
+/// How a model name resolves to a wire protocol and an endpoint.
+///
+/// Deliberately not a universal LLM abstraction. There are two wire formats the
+/// runtime speaks — Anthropic Messages and OpenAI Chat Completions — and a model
+/// name selects one by prefix: `ollama/…`, `openai/…`, or the name of a
+/// declared provider. Aliases (`fast`, `default`, `local`) let an application
+/// name a *tier* once and change the model behind it in one place.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelsConfig {
+    /// `alias -> model name`. `default` and `fast` have built-in values that an
+    /// application may override.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
+    /// `prefix -> provider`. `ollama` and `openai` are built in.
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderDef>,
+    /// USD per million tokens, by model name. Absent means "unknown", and the
+    /// usage ledger reports tokens only. No prices are built in: they change,
+    /// and a stale number is worse than none.
+    #[serde(default)]
+    pub pricing: BTreeMap<String, Price>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderDef {
+    /// `"openai"` for any Chat-Completions-compatible server (Ollama, vLLM,
+    /// LM Studio, OpenAI itself, Groq, OpenRouter); `"anthropic"` for the
+    /// Messages API.
+    #[serde(default = "default_provider_kind")]
+    pub kind: String,
+    pub base_url: String,
+    /// Environment variable holding the API key, if the endpoint needs one.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+fn default_provider_kind() -> String {
+    "openai".into()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct Price {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    #[serde(default)]
+    pub cache_read_per_mtok: f64,
+    #[serde(default)]
+    pub cache_write_per_mtok: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Context: what a run is allowed to carry, and what it is given to start with
+// ---------------------------------------------------------------------------
+
+/// Limits on how much conversation a run drags along.
+///
+/// Tokens are the cost of an agent, and most of them are *re-sent* context:
+/// every step replays the whole conversation. These three knobs are where the
+/// bulk of a bill is decided.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPolicy {
+    /// A tool result larger than this is truncated before the model sees it,
+    /// with a marker saying how much was cut. A `list_*` call returning five
+    /// hundred rows is the classic way a context window fills in one step.
+    #[serde(default = "default_tool_result_bytes")]
+    pub max_tool_result_bytes: usize,
+    /// When the *measured* input size of the last provider call exceeds this,
+    /// older turns are summarised into one message before the next call.
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
+    /// Model used for the summary. Defaults to the `fast` alias.
+    #[serde(default)]
+    pub compact_with: Option<String>,
+    /// How many recent messages survive a compaction untouched.
+    #[serde(default = "default_keep_recent")]
+    pub keep_recent: usize,
+}
+
+fn default_tool_result_bytes() -> usize {
+    16 * 1024
+}
+fn default_keep_recent() -> usize {
+    6
+}
+
+impl Default for ContextPolicy {
+    fn default() -> Self {
+        Self {
+            max_tool_result_bytes: default_tool_result_bytes(),
+            max_context_tokens: None,
+            compact_with: None,
+            keep_recent: default_keep_recent(),
+        }
+    }
+}
+
+/// A named source of context, resolved at run start and injected into the
+/// system prompt as a delimited block. Declared once, reused by any agent or
+/// behaviour that names it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub source: ContextSource,
+    /// Upper bound on the rendered size. Context is re-sent on every step, so
+    /// this multiplies.
+    #[serde(default = "default_context_chars")]
+    pub max_chars: usize,
+}
+
+fn default_context_chars() -> usize {
+    4000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContextSource {
+    /// A constant.
+    Static { value: serde_json::Value },
+    /// SQL executed in Rust. Parameters resolve from the run's input.
+    Query {
+        sql: String,
+        #[serde(default)]
+        params: Vec<String>,
+        #[serde(default)]
+        returns: QueryReturns,
+    },
+    /// A Python function returning any JSON-serialisable value.
+    Python { handler: u32 },
+}
+
+// ---------------------------------------------------------------------------
+// Flows: orchestration as data
+// ---------------------------------------------------------------------------
+
+/// A declarative orchestration. Every step is a tool — an agent, a behaviour,
+/// another flow, or a plain route — so composition is uniform and every step
+/// runs under the same delegated principal, depth ceiling and shared budget.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub kind: FlowKind,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Budget for the whole flow, including every nested agent and behaviour.
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FlowKind {
+    /// Steps run in order; each receives the previous step's output.
+    Pipeline { steps: Vec<FlowStep> },
+    /// Every branch receives the same input and runs concurrently.
+    Parallel {
+        branches: Vec<FlowStep>,
+        #[serde(default)]
+        merge: MergeStrategy,
+    },
+    /// A model classifies the input into one of the labels; that branch runs.
+    Route {
+        routes: BTreeMap<String, FlowStep>,
+        #[serde(default)]
+        default: Option<FlowStep>,
+        #[serde(default)]
+        classify_with: Option<String>,
+        #[serde(default)]
+        classify_prompt: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowStep {
+    pub tool: String,
+    /// Optional argument template. String values of the form `$.a.b` are
+    /// resolved from the incoming value; `$` is the whole value; `$input` is
+    /// the flow's original input. Absent means "pass the incoming value
+    /// through", wrapped as `{"input": …}` when the target is an agent.
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStrategy {
+    /// A list of branch outputs, in declaration order.
+    #[default]
+    Collect,
+    /// Branch outputs that are objects are merged into one object; later
+    /// branches win on key collisions. Non-object outputs are kept under the
+    /// branch's tool name.
+    Merge,
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +483,9 @@ pub struct BehaviourDef {
     pub temperature: f32,
     #[serde(default)]
     pub input_schema: Option<serde_json::Value>,
+    /// Context providers resolved on demand via `ctx.context(name)`.
+    #[serde(default)]
+    pub context: Vec<String>,
 }
 
 fn default_behaviour_steps() -> u32 {
@@ -319,10 +535,28 @@ pub struct ServerConfig {
     /// One request could permanently exhaust the interpreter pool.
     #[serde(default = "default_max_depth")]
     pub max_invocation_depth: u32,
+    /// How many multi-turn agent sessions to keep in memory at once.
+    #[serde(default = "default_session_capacity")]
+    pub session_capacity: usize,
+    /// Idle time after which a session is forgotten.
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: u64,
+    /// How long a suspended run waits for a human before it is discarded.
+    #[serde(default = "default_approval_ttl")]
+    pub approval_ttl_secs: u64,
 }
 
 fn default_max_depth() -> u32 {
     8
+}
+fn default_session_capacity() -> usize {
+    1000
+}
+fn default_session_ttl() -> u64 {
+    3600
+}
+fn default_approval_ttl() -> u64 {
+    3600
 }
 
 fn default_request_timeout() -> u64 {
@@ -352,6 +586,9 @@ impl Default for ServerConfig {
             request_timeout_secs: default_request_timeout(),
             shutdown_timeout_secs: default_shutdown_timeout(),
             max_invocation_depth: default_max_depth(),
+            session_capacity: default_session_capacity(),
+            session_ttl_secs: default_session_ttl(),
+            approval_ttl_secs: default_approval_ttl(),
         }
     }
 }
@@ -502,6 +739,8 @@ pub enum Op {
         #[serde(default = "default_cache_secs")]
         cache_secs: u64,
     },
+    /// Run a declared flow: a pipeline, a parallel fan-out, or a router.
+    Flow { flow: String },
 }
 
 fn default_page_status() -> u16 {
@@ -596,6 +835,23 @@ pub struct AgentDef {
     pub temperature: f32,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Agents this one may hand the conversation to. Each becomes a
+    /// `transfer_to_<name>` tool; calling it swaps the active agent while the
+    /// conversation, the budget and the caller's authority carry over.
+    #[serde(default)]
+    pub handoffs: Vec<String>,
+    /// Context providers resolved at run start and appended to the system
+    /// prompt.
+    #[serde(default)]
+    pub context: Vec<String>,
+    /// Ask the provider to cache the system prompt and tool definitions across
+    /// steps. On Anthropic this is prompt caching; it is what makes a
+    /// twelve-step run cost a little more than a one-step run instead of twelve
+    /// times as much.
+    #[serde(default = "yes")]
+    pub cache: bool,
+    #[serde(default)]
+    pub policy: ContextPolicy,
 }
 
 fn default_temperature() -> f32 {
@@ -609,8 +865,19 @@ impl Manifest {
     /// Validate cross-references that the type system can't catch, so that a
     /// misconfigured app fails at boot instead of on a request.
     pub fn validate(&self) -> Result<(), String> {
+        // Name collisions among agents are reported before route collisions:
+        // every agent owns a route, so a duplicate agent also duplicates a
+        // route, and the generic message would point at the wrong fix.
+        let mut agent_seen = std::collections::HashSet::new();
+        for a in &self.agents {
+            if !agent_seen.insert(a.name.as_str()) {
+                return Err(format!("duplicate agent name {:?}", a.name));
+            }
+        }
+
         let mut seen = std::collections::HashSet::new();
         for r in &self.routes {
+
             if !seen.insert((r.method.as_str(), r.path.as_str())) {
                 return Err(format!("duplicate route {} {}", r.method, r.path));
             }
@@ -625,6 +892,12 @@ impl Manifest {
                     return Err(format!(
                         "route {} {} invokes undeclared agent {:?}",
                         r.method, r.path, agent
+                    ));
+                }
+                Op::Flow { flow } if !self.flows.iter().any(|f| &f.name == flow) => {
+                    return Err(format!(
+                        "route {} {} invokes undeclared flow {:?}",
+                        r.method, r.path, flow
                     ));
                 }
                 Op::Query { .. } if self.database.is_none() => {
@@ -696,7 +969,25 @@ impl Manifest {
             }
         }
 
+        let context_names: std::collections::HashSet<&str> =
+            self.contexts.iter().map(|c| c.name.as_str()).collect();
+        if context_names.len() != self.contexts.len() {
+            return Err("duplicate context provider name".into());
+        }
+        let check_contexts = |owner: &str, kind: &str, names: &[String]| -> Result<(), String> {
+            for c in names {
+                if !context_names.contains(c.as_str()) {
+                    return Err(format!(
+                        "{kind} {owner:?} names context {c:?}, which is not declared; \
+                         declare it with app.context(...)"
+                    ));
+                }
+            }
+            Ok(())
+        };
+
         for b in &self.behaviours {
+            check_contexts(&b.name, "behaviour", &b.context)?;
             for t in &b.tools {
                 // A behaviour may call another behaviour, so both namespaces
                 // are valid targets.
@@ -746,9 +1037,92 @@ impl Manifest {
             if a.max_steps == Some(0) {
                 return Err(format!("agent {:?} has max_steps=0 and could never act", a.name));
             }
+            check_contexts(&a.name, "agent", &a.context)?;
+            for h in &a.handoffs {
+                if h == &a.name {
+                    return Err(format!("agent {:?} lists itself as a handoff target", a.name));
+                }
+                if !agent_names_all(self).contains(h.as_str()) {
+                    let hint = nearest(h, &agent_names_all(self).into_iter().map(String::from).collect());
+                    return Err(match hint {
+                        Some(x) => format!(
+                            "agent {:?} hands off to {:?}, which is not a declared agent. Did you mean {:?}?",
+                            a.name, h, x
+                        ),
+                        None => format!(
+                            "agent {:?} hands off to {:?}, which is not a declared agent",
+                            a.name, h
+                        ),
+                    });
+                }
+            }
+            if a.policy.keep_recent == 0 {
+                return Err(format!(
+                    "agent {:?} has keep_recent=0; a compaction must keep at least one recent turn",
+                    a.name
+                ));
+            }
+        }
+
+        let mut flow_names = std::collections::HashSet::new();
+        for f in &self.flows {
+            if !flow_names.insert(f.name.as_str()) {
+                return Err(format!("duplicate flow name {:?}", f.name));
+            }
+            let steps: Vec<&FlowStep> = match &f.kind {
+                FlowKind::Pipeline { steps } => {
+                    if steps.is_empty() {
+                        return Err(format!("flow {:?} is a pipeline with no steps", f.name));
+                    }
+                    steps.iter().collect()
+                }
+                FlowKind::Parallel { branches, .. } => {
+                    if branches.is_empty() {
+                        return Err(format!("flow {:?} is a parallel with no branches", f.name));
+                    }
+                    branches.iter().collect()
+                }
+                FlowKind::Route { routes, default, .. } => {
+                    if routes.is_empty() {
+                        return Err(format!("flow {:?} is a router with no routes", f.name));
+                    }
+                    routes.values().chain(default.iter()).collect()
+                }
+            };
+            for s in steps {
+                if s.tool == f.name {
+                    return Err(format!("flow {:?} contains itself as a step", f.name));
+                }
+                if !tool_names.contains(s.tool.as_str()) {
+                    let hint = nearest(&s.tool, &tool_names);
+                    return Err(match hint {
+                        Some(h) => format!(
+                            "flow {:?} references tool {:?}, which is not an exposed route. Did you mean {:?}?",
+                            f.name, s.tool, h
+                        ),
+                        None => format!(
+                            "flow {:?} references tool {:?}, which is not an exposed route",
+                            f.name, s.tool
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
+
+    pub fn flow(&self, name: &str) -> Option<&FlowDef> {
+        self.flows.iter().find(|f| f.name == name)
+    }
+
+    pub fn context(&self, name: &str) -> Option<&ContextDef> {
+        self.contexts.iter().find(|c| c.name == name)
+    }
+
+    pub fn agent_def(&self, name: &str) -> Option<&AgentDef> {
+        self.agents.iter().find(|a| a.name == name)
+    }
+
 
     /// Routes reachable without any credential. Surfaced by `webcortex check` so an
     /// operator can see their public attack surface on one screen.
@@ -758,6 +1132,10 @@ impl Manifest {
             .filter(|r| r.scopes.is_empty() && r.tool.scopes.is_empty())
             .collect()
     }
+}
+
+fn agent_names_all(m: &Manifest) -> std::collections::HashSet<&str> {
+    m.agents.iter().map(|a| a.name.as_str()).collect()
 }
 
 /// Closest match by edit distance, for "did you mean" hints on typos.

@@ -27,8 +27,11 @@ ENV_EXAMPLE = """\
 # Copy to .env and fill in. Never commit the real file.
 WEBCORTEX_API_KEY=replace-me-run-webcortex-keygen
 WEBCORTEX_JWT_SECRET=replace-me-at-least-32-bytes-long-abcdefgh
-# Needed only for the agent starter.
+# Hosted models. Either is enough; a model name picks its provider by prefix.
 # ANTHROPIC_API_KEY=sk-ant-...
+# OPENAI_API_KEY=sk-...
+# Local models need no key: ollama/<model> talks to OLLAMA_HOST.
+# OLLAMA_HOST=http://127.0.0.1:11434
 """
 
 README = """\
@@ -332,6 +335,9 @@ def files_for(template: str, name: str, description: str) -> dict[str, str]:
     if template == "behaviour":
         return {**common, "api.py": BEHAVIOUR_API.format(name=name, description=description)}
 
+    if template == "orchestration":
+        return {**common, "api.py": ORCHESTRATION_API.format(name=name, description=description)}
+
     return {
         **common,
         "api.py": FULLSTACK_API.format(name=name, description=description),
@@ -469,4 +475,187 @@ app.agent(
 '''
 
 
-TEMPLATES = ("api", "fullstack", "agent", "behaviour")
+ORCHESTRATION_API = '''\
+"""{name} — a multi-agent application.
+
+Everything an orchestration needs, declared in one file and executed by the
+runtime: a front desk that hands conversations to specialists, a memory each
+caller owns, context the agents start with, a pipeline and a router built from
+agents as steps, and a behaviour that fans work out concurrently. Budgets are
+shared across the whole tree, so the bill is bounded by what you declare.
+"""
+
+from webcortex import WebCortex
+
+app = WebCortex(
+    "{name}",
+    description="{description}",
+    database="sqlite://./{name}.db",
+)
+
+app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write", "webcortex:admin"])
+app.rate_limit(per_second=50, burst=100)
+app.anonymous_scopes("read")
+
+# --- Models -----------------------------------------------------------------
+# Name tiers once. Classification leaves use "fast"; judgement uses "default".
+# Point "fast" at a local model to do the cheap work for free:
+#     app.models(fast="ollama/qwen3.5:9b")
+
+app.models(default="claude-opus-5", fast="claude-haiku-4-5-20251001")
+
+
+# --- Data -------------------------------------------------------------------
+
+app.resource(
+    "tickets",
+    fields={{"id": int, "customer": str, "body": str, "kind": str, "state": str}},
+    tools=True,
+    read_scopes=["read"],
+    write_scopes=["write"],
+)
+
+
+# --- Context: what an agent knows at step one --------------------------------
+# Resolved when a run starts, injected into the system prompt, bounded in size.
+
+app.context(
+    "policy",
+    data={{"refund_window_days": 30, "auto_refund_limit_usd": 500, "escalate_to": "ops@example.com"}},
+    description="Support policy the agents must follow.",
+)
+app.context(
+    "open_queue",
+    sql="SELECT id, customer, kind, state FROM tickets WHERE state = 'open' ORDER BY id DESC LIMIT 20",
+    description="The newest open tickets.",
+)
+
+
+# --- Memory: a durable, per-caller scratchpad -------------------------------
+# Four tools, executed in Rust, keyed by whoever is really asking.
+
+app.memory("notes", read_scopes=["read"], write_scopes=["write"])
+
+
+# --- Specialists ------------------------------------------------------------
+
+app.agent(
+    "billing",
+    description="Handles invoices, refunds and payment questions.",
+    system="You are the billing specialist. Apply the policy exactly.",
+    tools=["list_tickets", "get_tickets", "update_tickets"],
+    context=["policy"],
+    scopes=["read", "write"],
+    max_steps=10,
+    token_budget=60_000,
+)
+
+app.agent(
+    "technical",
+    description="Handles bugs, outages and how-to questions.",
+    system="You are the technical specialist. Be precise and cite ticket ids.",
+    tools=["list_tickets", "get_tickets", "update_tickets"],
+    context=["open_queue"],
+    scopes=["read", "write"],
+    max_steps=10,
+    token_budget=60_000,
+)
+
+
+# --- The front desk: hands off, remembers, stays inside one budget -----------
+# `handoffs` become transfer_to_* tools. The conversation, the budget and the
+# caller's authority carry over — and authority can only shrink.
+
+app.agent(
+    "front_desk",
+    description="First contact. Routes to a specialist or answers directly.",
+    system=(
+        "You are the front desk. Greet briefly, find out what the customer needs, "
+        "and hand off to billing or technical when the request is clearly theirs."
+    ),
+    tools=["list_tickets", "create_tickets"],
+    handoffs=["billing", "technical"],
+    memory="notes",
+    context=["policy"],
+    scopes=["read", "write"],
+    expose_scopes=["read"],
+    max_steps=12,
+    token_budget=120_000,     # caps the whole run, including any handoff
+    context_window=60_000,    # older turns are summarised past this
+    expose_at="/ask",
+)
+
+
+# --- Flows: orchestration as data -------------------------------------------
+
+# A cheap model picks the specialist; no front desk in the loop.
+app.flow(
+    "desk",
+    description="Route a message straight to the right specialist.",
+    route={{"billing": "billing", "technical": "technical"}},
+    default="front_desk",
+    classify_with="fast",
+    scopes=["read", "write"],
+    token_budget=80_000,
+)
+
+# Two agents in sequence, sharing one budget: the writer gets the researcher's answer.
+app.flow(
+    "briefing",
+    description="Research the queue, then write a two-paragraph summary.",
+    pipeline=["technical", "billing"],
+    scopes=["read", "write"],
+    token_budget=100_000,
+)
+
+
+# --- A behaviour that fans out ---------------------------------------------
+# The loop and the branch are Python; only the leaves are probabilistic, and
+# the leaves run concurrently.
+
+@app.behaviour(
+    "triage",
+    description="Classify every open ticket at once and mark the urgent ones.",
+    tools=["list_tickets", "update_tickets"],
+    context=["policy"],
+    scopes=["read", "write"],
+    max_steps=200,
+    token_budget=150_000,
+    model="fast",
+)
+def triage(ctx, input):
+    tickets = [t for t in ctx.call("list_tickets", limit=50) if t["state"] == "open"]
+    if not tickets:
+        ctx.halt("no open tickets")
+
+    policy = ctx.context("policy")
+    verdicts = ctx.ask_many(                     # fifty prompts, one wait
+        [f"Policy: {{policy}}\\n\\nClassify this ticket:\\n{{t['body']}}" for t in tickets],
+        schema={{
+            "type": "object",
+            "properties": {{
+                "kind": {{"enum": ["billing", "technical", "other"]}},
+                "urgent": {{"type": "boolean"}},
+            }},
+            "required": ["kind", "urgent"],
+        }},
+    )
+
+    updates = [
+        ("update_tickets", {{
+            "id": t["id"], "customer": t["customer"], "body": t["body"],
+            "kind": v["kind"], "state": "urgent" if v["urgent"] else "triaged",
+        }})
+        for t, v in zip(tickets, verdicts)
+    ]
+    ctx.gather(*updates)                         # fifty writes, one wait
+    return {{
+        "triaged": len(tickets),
+        "urgent": sum(1 for v in verdicts if v["urgent"]),
+        "usage": ctx.usage,
+    }}
+'''
+
+
+TEMPLATES = ("api", "fullstack", "agent", "behaviour", "orchestration")
+

@@ -44,7 +44,7 @@ Verify:
 ```console
 $ .venv/bin/webcortex --help
 $ .venv/bin/python -c "import webcortex; print(webcortex.__version__)"
-0.3.1
+2.0.0
 ```
 
 ## Free-threaded Python

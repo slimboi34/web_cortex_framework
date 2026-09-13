@@ -35,16 +35,18 @@ $ webcortex check
     Moving the boundary to *build time* means whole classes of route leave the
     interpreter entirely. Most of a CRUD API is exactly that kind of route.
 
-## The seven route kinds
+## The nine route kinds
 
 | Kind | Declared with | Runs in | Typical cost |
 |---|---|---|---|
 | Static | `app.static(...)` | Rust | serialised once at boot |
-| Query | `app.query(...)`, `app.resource(...)` | Rust | SQL + JSON encode |
+| Query | `app.query(...)`, `app.resource(...)`, `app.memory(...)` | Rust | SQL + JSON encode |
 | Page | `app.page(...)` | Rust | SQL + template render |
 | Files | `app.static_files(...)` | Rust | disk read + etag |
 | Proxy | `app.proxy(...)` | Rust | one upstream hop |
-| Agent | `app.agent(..., expose_at=...)` | Rust | model latency |
+| Agent | `app.agent(...)` | Rust | model latency |
+| Flow | `app.flow(...)` | Rust | the steps it runs |
+| Behaviour | `@app.behaviour(...)` | Python worker pool | interpreter + leaves |
 | Python | `@app.get(...)` | Python worker pool | interpreter |
 
 Measured throughput on an M-series machine, 24 concurrent clients:
@@ -86,7 +88,7 @@ A **principal** is established at the edge and carried unchanged. Every consumer
 — an HTTP route, an MCP tool call, an agent step, a Behaviour — reads the same
 one. There is no second authentication path.
 
-When an agent or Behaviour runs, it executes as a *delegate*:
+When an agent, Behaviour or flow runs, it executes as a *delegate*:
 
 ```python
 actor = caller.delegate_to_agent(name, declared_scopes)
@@ -94,10 +96,15 @@ actor = caller.delegate_to_agent(name, declared_scopes)
 
 Delegated scopes are the **intersection** of what the agent declares and what
 the caller holds — never the union. An agent declaring `["read", "write"]`,
-started by a caller holding only `["read"]`, gets `["read"]`.
+started by a caller holding only `["read"]`, gets `["read"]`. A supervisor's
+worker is delegated from the supervisor; a handoff target is delegated from
+the original caller and filtered by what the previous agent held. Authority
+only ever shrinks.
 
 This is the confused-deputy defence, and it is enforced in code rather than left
-to the application author to remember.
+to the application author to remember. The *root* of the chain — the human or
+service that started things — stays reachable as `@principal`, so memory and
+scoped queries belong to that caller however deep the call is.
 
 ## The Python worker pool
 
@@ -127,6 +134,12 @@ Behaviours and agents can call tools, and those tools can reach other Behaviours
 `depth`, checked against `max_invocation_depth` (default 8).
 
 Exceeding it returns **508 Loop Detected**, surfaced as a clean halt.
+
+A second thing travels with the request: the **shared budget**. The outermost
+agent, behaviour or flow creates it from its `token_budget`, and every nested
+run charges the same counter, so a tree of agents spends against one ceiling
+rather than one per frame.
+
 
 !!! danger "This was a real bug"
     Before the depth counter existed, each nested invocation received a *fresh*

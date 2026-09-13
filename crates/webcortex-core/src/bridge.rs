@@ -29,7 +29,9 @@ pub trait PyBridge: Send + Sync + 'static {
         _input: serde_json::Value,
         _principal: crate::auth::Principal,
         _depth: u32,
+        _budget: Option<std::sync::Arc<crate::agent::SharedBudget>>,
     ) -> BoxFuture<'a, Result<serde_json::Value, String>> {
+
         Box::pin(async move {
             Err(format!(
                 "behaviour {:?} requires an interpreter, but this runtime was built without one",

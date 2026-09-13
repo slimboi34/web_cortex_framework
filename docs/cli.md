@@ -17,7 +17,7 @@ $ webcortex new myapp --template fullstack
 
 | Option | Default | |
 |---|---|---|
-| `--template`, `-t` | `api` | `api` · `fullstack` · `agent` · `behaviour` |
+| `--template`, `-t` | `api` | `api` · `fullstack` · `agent` · `behaviour` · `orchestration` |
 | `--directory`, `-d` | `<name>` | Target directory |
 | `--description` | — | Project description |
 
@@ -43,15 +43,20 @@ logging to `info`.
 
 ```console
 $ webcortex dev --port 3000
-  webcortex 0.3.1  ·  supportdesk
-  python 3.14.7 (free-threaded)
-  12 routes, 10 served without touching Python
-  8 agent tools: list_tickets, get_tickets, create_tickets, … +3
-  agents: assistant
+  webcortex 0.1.0  ·  supportdesk
+  python 3.14.4 (free-threaded)
+  21 routes, 19 served without touching Python
+  14 agent tools: list_tickets, get_tickets, create_tickets, … +9
+  agents: billing, technical, front_desk
+  behaviours: triage
+  flows: desk (route), briefing (pipeline)
+  memory: notes
+  models: default=claude-opus-5, fast=ollama/qwen3.5:9b
   security: auth, rate-limited, headers
   ⚠ 1 route(s) need no credential (run `webcortex security` to list them)
   approval-gated tools: create_tickets_purge
   http://127.0.0.1:8000/_webcortex/openapi.json   ·   MCP: http://127.0.0.1:8000/_webcortex/mcp
+  usage: http://127.0.0.1:8000/_webcortex/usage   ·   approvals: http://127.0.0.1:8000/_webcortex/approvals
 ```
 
 | Option | |
@@ -80,9 +85,10 @@ $ webcortex check
 }
 ```
 
-Catches: duplicate routes, duplicate tool names, agents referencing tools that
-do not exist (with suggestions), approval gates on non-tools, queries without a
-database, templates that do not parse, and invalid CORS.
+Catches: duplicate routes, duplicate tool names, agents referencing tools,
+handoffs or context providers that do not exist (with suggestions), flows whose
+steps are not tools or that contain themselves, approval gates on non-tools,
+queries without a database, templates that do not parse, and invalid CORS.
 
 ## `webcortex security`
 
@@ -148,13 +154,43 @@ Wrote src/api.ts (12 typed methods, 284 lines)
 
 ## `webcortex sql`
 
-Print the DDL for declared resources.
+Print the DDL for declared resources and memories.
 
 ```console
 $ webcortex sql > schema.sql
 ```
 
 Nothing is applied — this is for review and for feeding a migration tool.
+
+## `webcortex context`
+
+Print the [context pack](ai-development.md#the-context-pack): the application
+described for an AI coding tool, derived from the manifest.
+
+```console
+$ webcortex context > CONTEXT.md
+$ webcortex context --json        # the raw manifest instead
+```
+
+## `webcortex evolve`
+
+Ask a model to propose an extension, anchored on the context pack.
+
+```console
+$ webcortex evolve "add a reviews resource tied to books" --model fast
+$ webcortex evolve "..." --out proposal.py
+$ webcortex evolve "..." --json    # {summary, code, notes}
+```
+
+| Option | Default | |
+|---|---|---|
+| `--model`, `-m` | `default` | A model or an alias from the app's `app.models(...)` |
+| `--out`, `-o` | stdout | Write the proposal to a file |
+| `--json` | off | Structured output |
+
+It prints a proposal; it never edits `api.py`. Needs the relevant key in the
+environment, or an `ollama/…` model, which needs none.
+
 
 ---
 

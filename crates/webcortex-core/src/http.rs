@@ -28,6 +28,9 @@ pub struct WebCortexRequest {
     /// or agent calls a tool, so a cycle is bounded even though each nested
     /// invocation gets its own step budget.
     pub depth: u32,
+    /// The token ceiling shared by every model-backed op in this request tree.
+    /// `None` at the edge; set once an agent, behaviour or flow starts one.
+    pub budget: Option<std::sync::Arc<crate::agent::SharedBudget>>,
 }
 
 impl WebCortexRequest {
@@ -42,6 +45,7 @@ impl WebCortexRequest {
             route_id: None,
             principal: crate::auth::Principal::anonymous(),
             depth: 0,
+            budget: None,
         }
     }
 
@@ -61,7 +65,16 @@ impl WebCortexRequest {
     /// key of a JSON body. Agents supply arguments as one flat object and
     /// should not have to know which of the three a given route used.
     pub fn lookup(&self, name: &str) -> Option<serde_json::Value> {
+        // The caller's identity is bindable by name, so a declared query can be
+        // scoped to whoever is asking without a Python handler in the way. It
+        // resolves to the *root* principal — the human or service behind any
+        // chain of agent delegation — so memory an agent writes on someone's
+        // behalf is that someone's memory.
+        if name == "@principal" {
+            return Some(serde_json::Value::String(self.principal.root_id().to_string()));
+        }
         if let Some(v) = self.path_params.get(name) {
+
             return Some(coerce_scalar(v));
         }
         if let Some(v) = self.query.get(name) {

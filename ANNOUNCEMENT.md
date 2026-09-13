@@ -298,3 +298,79 @@ would be marketing, and the first person to benchmark it properly would catch it
    yet, and it reads as borrowing someone else's credibility. The "Django was
    built for the browser era; this is built for the agent era" framing makes the
    same point and is yours to own.
+
+---
+
+# v2 launch post — draft
+
+> WebCortex 2 is out. The first release was about one thing: declare a route
+> once and it is a REST endpoint, an OpenAPI operation and an MCP tool, executed
+> in Rust.
+>
+> This one is about what happens when there is more than one agent.
+>
+> 🧵
+
+**2/**
+> Every agent is now a tool. `app.agent("editor", tools=["researcher", "writer"])`
+> is the whole supervisor/worker pattern. Workers run as delegates of the
+> supervisor — less authority, never more — one nesting level deeper, against
+> the supervisor's budget.
+
+**3/**
+> Handoffs. `handoffs=["billing", "technical"]` gives the front desk
+> `transfer_to_*` tools. The conversation moves to the specialist; the budget
+> and the caller's authority carry over; authority can only shrink.
+
+**4/**
+> Flows: orchestration as data, executed in Rust.
+>
+> ```python
+> app.flow("briefing", pipeline=["researcher", "writer"], token_budget=150_000)
+> app.flow("desk", route={"billing": "billing", "tech": "technical"}, classify_with="fast")
+> ```
+>
+> Every step is a tool. A flow is a tool. One budget bounds the tree.
+
+**5/**
+> The budget bit is the one I care most about. In 0.3, each nested run got a
+> fresh budget — a per-frame limit is not a per-request limit. Now the outermost
+> agent's `token_budget` travels with every in-process call. The bill is what
+> you declared.
+
+**6/**
+> Tokens are a declaration now. `app.models(default=..., fast="ollama/qwen3.5:9b")`
+> — judgement on the big model, classification on a local one, for free.
+> Prompt caching on by default. Tool results bounded. Long conversations
+> compacted, not truncated. A ledger at `/_webcortex/usage`.
+
+**7/**
+> Context is declared: `app.context("policy", sql=...)` is resolved at run start
+> and injected, bounded. Memory is four Rust-executed tools keyed by the human
+> behind however many agents deep the call is.
+
+**8/**
+> Approval gates now *resume*. A gated tool suspends the run; a human decides at
+> one endpoint; the run continues — including the rest of the turn it was in.
+> Denial is a tool error the model reads.
+
+**9/**
+> And the framework describes itself to the model writing it.
+> `webcortex context` prints the app's shape in ~2k tokens.
+> `webcortex evolve "add reviews and a summariser"` proposes the code, anchored
+> on that — with a local model if you like. Then `webcortex check` tells you
+> what is wrong, at boot, with a hint.
+
+**10/**
+> 326 tests, including an offline end-to-end suite that drives handoffs,
+> sessions, approvals, flows and memory over HTTP with no API key.
+>
+> `pip install web-cortex-framework`
+> https://slimboi34.github.io/web_cortex_framework/
+
+### Notes on claims
+
+- "326 tests" — 95 Rust + 231 Python at the 2.0.0 commit; recount before posting.
+- "~2k tokens" — the hello example's context pack is ~9 KB; state the KB if
+  in doubt.
+- Do not claim a benchmark against Django or FastAPI; none has been run.

@@ -117,27 +117,34 @@ impl PyBridge for PythonBridge {
         input: serde_json::Value,
         principal: webcortex_core::auth::Principal,
         depth: u32,
+        budget: Option<Arc<webcortex_core::agent::SharedBudget>>,
     ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Captured here, on a tokio thread. The behaviour later runs on a Python
         // worker thread and uses this handle to re-enter the runtime.
         let handle = tokio::runtime::Handle::current();
+        let budget = budget.unwrap_or_else(|| {
+            webcortex_core::agent::SharedBudget::new(format!("behaviour:{}", def.name), def.token_budget)
+        });
 
         let submitted = Python::attach(|py| -> PyResult<()> {
             let ctx = BehaviourContext::new(
                 app.clone(),
                 handle,
                 principal,
-                app.provider().cloned(),
+                app.provider().clone(),
                 uuid::Uuid::new_v4().to_string(),
                 def.name.clone(),
                 def.tools.clone(),
+                def.context.clone(),
                 def.max_steps,
                 def.token_budget,
                 def.model.clone(),
                 def.max_tokens,
                 def.temperature,
                 depth,
+                budget,
+                input.clone(),
             );
             let completer = Py::new(
                 py,
@@ -287,7 +294,11 @@ fn inspect_manifest(manifest_json: &str) -> PyResult<String> {
         "tools": manifest.routes.iter().filter(|r| r.tool.expose)
             .map(|r| r.tool_name()).collect::<Vec<_>>(),
         "agents": manifest.agents.iter().map(|a| &a.name).collect::<Vec<_>>(),
+        "behaviours": manifest.behaviours.iter().map(|b| &b.name).collect::<Vec<_>>(),
+        "flows": manifest.flows.iter().map(|f| &f.name).collect::<Vec<_>>(),
+        "contexts": manifest.contexts.iter().map(|c| &c.name).collect::<Vec<_>>(),
         "openapi": webcortex_core::openapi::generate(&manifest),
+
     });
     Ok(report.to_string())
 }
@@ -317,6 +328,96 @@ fn generate_api_key() -> String {
     webcortex_core::auth::generate_api_key()
 }
 
+/// One model completion, outside any server, using the app's model
+/// configuration (aliases, providers) and the process environment.
+///
+/// This is what `webcortex evolve` uses: the same resolution rules as the
+/// runtime, so `model="fast"` means the same thing on the command line as it
+/// does in a behaviour. Returns the text, or the JSON string of structured
+/// output when `schema_json` is given.
+#[pyfunction]
+#[pyo3(signature = (manifest_json, model, system, prompt, schema_json = None, max_tokens = 8192))]
+fn ask_model(
+    py: Python<'_>,
+    manifest_json: &str,
+    model: &str,
+    system: &str,
+    prompt: &str,
+    schema_json: Option<&str>,
+    max_tokens: u32,
+) -> PyResult<String> {
+    let manifest: Manifest = serde_json::from_str(manifest_json)
+        .map_err(|e| PyValueError::new_err(format!("invalid manifest: {e}")))?;
+    let schema: Option<serde_json::Value> = match schema_json {
+        Some(s) => Some(serde_json::from_str(s).map_err(|e| PyValueError::new_err(format!("invalid schema: {e}")))?),
+        None => None,
+    };
+    let model = model.to_string();
+    let system = system.to_string();
+    let prompt = prompt.to_string();
+
+    py.detach(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+        rt.block_on(async move {
+            use webcortex_core::agent::provider::{CompletionRequest, ModelProvider};
+            use webcortex_core::agent::{Conversation, Message, ToolSpec};
+
+            let registry = webcortex_core::agent::ProviderRegistry::from_env(&manifest.models);
+            let def = webcortex_core::manifest::AgentDef {
+                name: "webcortex-cli".into(),
+                description: String::new(),
+                model,
+                system,
+                tools: Vec::new(),
+                max_steps: Some(1),
+                token_budget: None,
+                scopes: Vec::new(),
+                temperature: 0.2,
+                max_tokens,
+                handoffs: Vec::new(),
+                context: Vec::new(),
+                cache: false,
+                policy: Default::default(),
+            };
+            let conversation = Conversation {
+                messages: vec![Message { role: "user".into(), content: serde_json::json!(prompt) }],
+            };
+            let tools: Vec<ToolSpec> = match &schema {
+                Some(s) => vec![ToolSpec {
+                    name: "respond".into(),
+                    description: "Respond in the required shape.".into(),
+                    input_schema: s.clone(),
+                }],
+                None => Vec::new(),
+            };
+            let req = CompletionRequest {
+                agent: &def,
+                conversation: &conversation,
+                tools: &tools,
+                force_tool: schema.as_ref().map(|_| "respond"),
+                system_suffix: "",
+            };
+            let res = registry.complete(&req).await.map_err(PyRuntimeError::new_err)?;
+            if schema.is_some() {
+                let value = res
+                    .tool_calls
+                    .iter()
+                    .find(|c| c.name == "respond")
+                    .map(|c| c.arguments.clone())
+                    .or_else(|| webcortex_core::agent::recover_json(&res.text))
+                    .ok_or_else(|| PyRuntimeError::new_err(format!(
+                        "model did not return structured output; it said: {}", res.text
+                    )))?;
+                return Ok(value.to_string());
+            }
+            Ok(res.text)
+        })
+    })
+}
+
 // `gil_used = false` marks this extension as free-threading compatible, which is
 // what lets CPython 3.13+/3.14 skip re-enabling the GIL when it is imported.
 #[pymodule(gil_used = false)]
@@ -330,6 +431,7 @@ fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(openapi_for, m)?)?;
     m.add_function(wrap_pyfunction!(typescript_client, m)?)?;
     m.add_function(wrap_pyfunction!(generate_api_key, m)?)?;
+    m.add_function(wrap_pyfunction!(ask_model, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

@@ -18,17 +18,18 @@ An honest answer, because the useful version is qualified.
 
     ---
 
-    Public authenticated browser apps (no CSRF or sessions) · write-heavy
-    Postgres workloads (SQLite only) · long-running durable agent runs ·
-    anything needing streaming responses
+    Public authenticated browser apps (no CSRF or cookie sessions) ·
+    write-heavy Postgres workloads (SQLite only) · agent runs that must
+    survive a restart · anything needing token-level streaming
 
 </div>
 
-**What is verified:** 251 tests, an adversarial security review with six fixes,
+**What is verified:** 326 tests, an adversarial security review with six fixes,
 1.79M requests soaked with zero errors and stable memory, wheels building on
 five platform targets across four interpreter versions.
 
-**What is young:** v0.3.1, one author, no production users yet.
+**What is young:** v2.0.0, one author, a few thousand installs and no known
+production users yet.
 
 ---
 
@@ -59,7 +60,10 @@ Everything overridable by environment, so one image runs everywhere:
 | `WEBCORTEX_DATABASE_URL` | Overrides the declared database |
 | `WEBCORTEX_LOG` | `error` / `warn` / `info` / `debug` |
 | `WEBCORTEX_DEBUG_ERRORS` | **Never set in production** — returns tracebacks |
-| `ANTHROPIC_API_KEY` | Required only if agents or Behaviours are declared |
+| `ANTHROPIC_API_KEY` | For `claude-*` and `anthropic/…` models |
+| `OPENAI_API_KEY` | For `gpt-*` and `openai/…` models; `OPENAI_BASE_URL` for a gateway |
+| `OLLAMA_HOST` | Where `ollama/…` models are served (default `http://127.0.0.1:11434`) |
+| `WEBCORTEX_FAKE_PROVIDER` | **Tests only** — answers every model call deterministically |
 
 Plus every `env_var` you named in `app.api_key(...)` and `app.jwt(...)`.
 
@@ -102,7 +106,7 @@ CMD ["webcortex", "run", "api.py"]
 ```
 
 !!! tip "Pin the version"
-    `pip install web-cortex-framework==0.3.1` in an image you intend to
+    `pip install web-cortex-framework==2.0.0` in an image you intend to
     redeploy. The wheel is prebuilt for Linux x86_64 and aarch64, so the install
     is a download, not a compile.
 
@@ -169,8 +173,9 @@ volumes: { appdata: }
 present an API key.
 
 ```json
-{"status": "ok", "app": "myapp", "version": "0.3.1",
- "routes": 12, "tools": 8, "agents": 1, "python_workers": 10}
+{"status": "ok", "app": "myapp", "version": "0.1.0",
+ "routes": 12, "tools": 8, "agents": 1, "behaviours": 1, "flows": 0,
+ "python_workers": 10, "sessions": 3, "pending_approvals": 0}
 ```
 
 On `SIGTERM` or `SIGINT`, the server stops accepting connections and drains
@@ -232,6 +237,9 @@ Prefer horizontal scaling: instances are stateless apart from the database.
 - [ ] Grace period longer than `shutdown_timeout`
 - [ ] Rate limiting at the edge as well as in-process
 - [ ] Log aggregation capturing `webcortex::audit`
+- [ ] Every agent, behaviour and flow has a `token_budget`; prices declared so `/usage` reports dollars
+- [ ] `session_ttl_secs` and `approval_ttl_secs` suit the workload (both default to an hour)
+
 - [ ] Database backups, if SQLite: the file is your database
 - [ ] `cargo audit` in CI
 

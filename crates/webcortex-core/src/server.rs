@@ -293,6 +293,7 @@ async fn route_request(
             route_id: None,
             principal,
             depth: 0,
+            budget: None,
         });
         // A handler that hangs must not hold a connection forever.
         match tokio::time::timeout(timeout, dispatch).await {
@@ -357,7 +358,70 @@ async fn control_plane(
                 "routes": app.manifest.routes.len(),
                 "tools": app.exposed_tools().len(),
                 "agents": app.manifest.agents.len(),
+                "behaviours": app.manifest.behaviours.len(),
+                "flows": app.manifest.flows.len(),
                 "python_workers": app.bridge().workers(),
+                "sessions": app.sessions().len(),
+                "pending_approvals": app.pending_approvals().len(),
+            }),
+        ),
+
+        // Spend, by model and by what spent it. Cost is reported only when
+        // every model involved has a declared price.
+        ("GET", "/usage") => WebCortexResponse::json(
+            200,
+            &app.ledger().snapshot(|m| app.registry().price_for(m)),
+        ),
+
+        ("GET", "/models") => WebCortexResponse::json(200, &app.registry().describe()),
+
+        ("GET", "/approvals") => WebCortexResponse::json(
+            200,
+            &serde_json::json!({"approvals": app.pending_approvals()}),
+        ),
+
+        // Decide a gated call and continue the run that asked for it.
+        ("POST", path) if path.starts_with("/approvals/") => {
+            let id = path.trim_start_matches("/approvals/").trim_end_matches('/');
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+            let approve = parsed.get("approve").and_then(|v| v.as_bool());
+            let Some(approve) = approve else {
+                return WebCortexResponse::error(400, "body must be {\"approve\": true|false, \"note\": \"…\"}");
+            };
+            let note = parsed.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            match app.resolve_approval(id, approve, note, principal).await {
+                Ok(result) => crate::app::run_result_response(&result),
+                Err(e) => WebCortexResponse::error(404, e),
+            }
+        }
+
+        ("GET", "/flows") => WebCortexResponse::json(
+            200,
+            &serde_json::json!({
+                "flows": app.manifest.flows.iter().map(|f| serde_json::json!({
+                    "name": f.name,
+                    "description": f.description,
+                    "kind": f.kind,
+                    "scopes": f.scopes,
+                    "token_budget": f.token_budget,
+                    "input_schema": f.input_schema,
+                })).collect::<Vec<_>>()
+            }),
+        ),
+
+        ("GET", "/contexts") => WebCortexResponse::json(
+            200,
+            &serde_json::json!({
+                "contexts": app.manifest.contexts.iter().map(|c| serde_json::json!({
+                    "name": c.name,
+                    "description": c.description,
+                    "kind": match c.source {
+                        crate::manifest::ContextSource::Static { .. } => "static",
+                        crate::manifest::ContextSource::Query { .. } => "query",
+                        crate::manifest::ContextSource::Python { .. } => "python",
+                    },
+                    "max_chars": c.max_chars,
+                })).collect::<Vec<_>>()
             }),
         ),
 
@@ -433,9 +497,13 @@ async fn control_plane(
                     "model": a.model,
                     "description": a.description,
                     "tools": a.tools,
+                    "handoffs": a.handoffs,
+                    "context": a.context,
                     "max_steps": a.max_steps,
                     "token_budget": a.token_budget,
                     "scopes": a.scopes,
+                    "cache": a.cache,
+                    "policy": a.policy,
                 })).collect::<Vec<_>>()
             }),
         ),
@@ -479,8 +547,10 @@ fn op_name(op: &crate::manifest::Op) -> &'static str {
         Page { .. } => "page",
         Files { .. } => "files",
         Behaviour { .. } => "behaviour",
+        Flow { .. } => "flow",
     }
 }
+
 
 /// Best-effort extraction of a panic message for the log. Never surfaced to the
 /// client, which only ever sees "internal error".

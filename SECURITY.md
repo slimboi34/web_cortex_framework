@@ -221,6 +221,39 @@ be dropped entirely if `jsonwebtoken` is switched to the `aws_lc_rs` provider,
 which does not depend on the `rsa` crate. That switch was not taken here because
 it introduces a C toolchain dependency into the cross-platform wheel build.
 
+## What v2 added to the surface
+
+The orchestration release (2.0.0) widened what an agent can reach and what a
+request can cost. Each addition is listed with the control that bounds it and
+the test that proves the control holds. None of this has had a second
+adversarial pass yet; that is owed, and the same limits as the review above
+apply.
+
+| Addition | Risk | Control | Proven by |
+|---|---|---|---|
+| Every agent is a route and a tool | An agent declared without scopes is a public endpoint that spends tokens | `expose_scopes` guards the route (defaults to `scopes`); `webcortex security` lists it; a run executes as a delegate of the caller regardless | `test_orchestration.py::test_every_agent_is_a_tool_named_after_itself`, `test_security.py` |
+| Supervisors calling agents as tools | Nested runs each had their own budget; recursion through agents bypassed the depth ceiling in 0.3 | Depth now propagates through agent tool calls; a `SharedBudget` travels with the request tree | `agent.rs::nested_agent_calls_carry_depth_so_a_cycle_is_bounded`, `::a_shared_budget_bounds_a_supervisor_and_its_workers_together`, `test_a_supervisor_and_its_worker_share_one_budget` |
+| Handoffs | A specialist could hold scopes the caller lacked | Re-delegated from the original caller, then intersected with the previous agent's scopes; targets validated at boot | `agent.rs::a_handoff_swaps_the_agent_and_shrinks_authority`, `::a_handoff_to_an_undeclared_agent_is_refused` |
+| Sessions | One caller reading another's conversation | Store key includes the principal id; bounded and expiring | `session.rs::round_trips_and_is_keyed_by_principal`, `test_sessions_carry_the_conversation_and_are_per_principal` |
+| Approval resume | Bypassing the gate, resuming twice, resuming as the approver | Deciding needs `webcortex:admin`; the run resumes as the original delegate; a decision is consumed; suspended runs expire | `test_a_gated_tool_suspends_and_the_run_resumes_after_approval`, `test_approvals_need_the_admin_scope`, `test_a_gate_cannot_be_laundered_through_gather` |
+| `gather` / `ask_many` | Fanning out to bypass admission or budgets | Every item is admitted, scoped, gated and charged as a single call; one step each | `test_gather_runs_tool_calls_concurrently_and_reports_failures`, `test_a_gate_cannot_be_laundered_through_gather` |
+| Memory | Reading another user's memory through an agent | Rows keyed by `@principal`, the root of the delegation chain, in the SQL itself | `test_memory_is_per_root_principal_and_executed_in_rust`, `test_an_agent_writes_memory_as_the_human_behind_it`, `auth.rs::the_root_principal_survives_a_chain_of_delegation` |
+| Context providers | A behaviour reading context it was not given; a SQL provider leaking across callers | Behaviours may read only declared providers; SQL providers bind `@principal` | `test_a_behaviour_reads_only_the_context_it_declared`, `test_context_providers_land_in_the_system_prompt` |
+| Flows | Unbounded fan-out, self-containing flows | Steps validated at boot; a flow cannot contain itself; one shared budget; depth propagates | `manifest.rs` validation, `test_a_flow_cannot_contain_itself`, `test_a_pipeline_feeds_each_agent_the_previous_output` |
+| OpenAI-compatible provider | A second wire format is a second parser | Translation is at the boundary; the canonical shape is unchanged; parsing is unit-tested on malformed input | `provider.rs` tests |
+| Control-plane endpoints (`/usage`, `/models`, `/approvals`, `/flows`, `/contexts`) | Disclosure | All require `webcortex:admin` once any auth is configured, like the rest of the plane | `test_approvals_need_the_admin_scope` |
+| `WEBCORTEX_FAKE_PROVIDER` | Shipping a test double | Selected only by that variable; logs a warning at boot; documented as tests-only | — |
+
+**Known limits specific to v2:** compaction sends earlier turns to a model to
+summarise, so anything a tool returned is re-sent at least once more; the
+summariser prompt is the one probabilistic step in an otherwise deterministic
+loop. Tool results are bounded by size, not by content — a tool that returns a
+secret returns it to the model. Sessions and suspended runs are in memory, so
+a restart forgets them, which is stated but is still a loss. The `evolve`
+command sends the context pack — route paths, tool descriptions, security
+posture, but never credentials — to whichever model is named.
+
 ## Reporting
+
 
 This is a personal project without a disclosure process. Open an issue.
