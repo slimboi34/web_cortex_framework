@@ -164,6 +164,10 @@ describe itself to the model writing it.
   `sqlite3` connection, a separate database the runtime never saw. The runtime
   now applies the DDL through its pool at startup, and holds an in-memory
   database on one long-lived connection so every request sees the same data.
+- A body over the 32 MB limit could get a connection reset instead of its
+  413: the server stopped reading and closed while the client was still
+  sending. It now reads and discards up to 8 MB more (for at most 2 s) before
+  answering, so the 413 arrives; a larger overshoot is still cut off.
 
 ### Verified
 

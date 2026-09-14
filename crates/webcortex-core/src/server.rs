@@ -18,7 +18,7 @@ use crate::http::{WebCortexRequest, WebCortexResponse, parse_query};
 use crate::{mcp, middleware, openapi};
 use bytes::Bytes;
 use futures::FutureExt;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use std::panic::AssertUnwindSafe;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -32,6 +32,13 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// How much of an oversized body is read and thrown away before the 413, and
+/// for how long. Closing on a client that is still sending resets the
+/// connection, and the reset destroys the 413 before the client reads it;
+/// draining a bounded overshoot lets the answer arrive. Past either bound the
+/// connection is cut off, as before.
+const DRAIN_BYTES: usize = 8 * 1024 * 1024;
+const DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub async fn serve(app: Arc<App>) -> Result<(), String> {
     serve_with_shutdown(app, shutdown_signal()).await
@@ -314,14 +321,28 @@ fn finish_cors(app: &Arc<App>, res: &mut WebCortexResponse, origin: Option<&str>
 }
 
 async fn read_body(req: Request<Incoming>) -> Result<Bytes, WebCortexResponse> {
-    let body = Limited::new(req.into_body(), MAX_BODY_BYTES);
-    match body.collect().await {
-        Ok(c) => Ok(c.to_bytes()),
-        Err(_) => Err(WebCortexResponse::error(
-            413,
-            format!("request body exceeds {MAX_BODY_BYTES} bytes"),
-        )),
+    let too_large = || WebCortexResponse::error(413, format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+    let mut body = req.into_body();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else { return Err(too_large()) };
+        let Ok(data) = frame.into_data() else { continue };
+        if buf.len() + data.len() > MAX_BODY_BYTES {
+            let _ = tokio::time::timeout(DRAIN_TIME, async {
+                let mut drained = 0usize;
+                while drained <= DRAIN_BYTES {
+                    match body.frame().await {
+                        Some(Ok(f)) => drained += f.data_ref().map_or(0, |d| d.len()),
+                        _ => break,
+                    }
+                }
+            })
+            .await;
+            return Err(too_large());
+        }
+        buf.extend_from_slice(&data);
     }
+    Ok(buf.freeze())
 }
 
 /// Introspection and operations endpoints, mounted under `control_prefix`.
