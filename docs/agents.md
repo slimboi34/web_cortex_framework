@@ -89,8 +89,8 @@ calls; see [Budgets compose](orchestration.md#budgets-compose).
 }
 ```
 
-Possible outcomes: `completed`, `step_limit`, `budget_exhausted`,
-`awaiting_approval`, `failed`.
+Possible outcomes: `completed`, `max_tokens` (the last response was cut off),
+`step_limit`, `budget_exhausted`, `awaiting_approval`, `failed`.
 
 ### 4. Everything is audited — including refusals
 
@@ -235,8 +235,8 @@ a gate that can never fire is dead configuration giving false confidence.
 | `context_window` | `None` | Measured input tokens beyond which older turns are compacted |
 | `compact_with` | `"fast"` | Model used for compaction |
 | `keep_recent` | `6` | Messages kept verbatim by a compaction |
-| `temperature` | `1.0` | |
-| `max_tokens` | `4096` | Per response |
+| `temperature` | `None` | Sent only when set; Claude Opus 5, Opus 4.7/4.8 and Sonnet 5 reject it |
+| `max_tokens` | `16000` | Per response, thinking included |
 | `expose_at` | `/agents/<name-with-hyphens>` | The POST route |
 | `tool` | `True` | Expose under the agent's own name |
 

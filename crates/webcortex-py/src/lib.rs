@@ -371,7 +371,7 @@ fn ask_model(
                 max_steps: Some(1),
                 token_budget: None,
                 scopes: Vec::new(),
-                temperature: 0.2,
+                temperature: None,
                 max_tokens,
                 handoffs: Vec::new(),
                 context: Vec::new(),

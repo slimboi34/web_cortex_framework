@@ -139,6 +139,12 @@ describe itself to the model writing it.
 - Naming a behaviour declared with `tool=False` in an agent's or a
   behaviour's `tools` is a boot error. It used to pass `check()` and then
   never be callable.
+- `temperature` is unset by default and sent only when an agent or behaviour
+  sets it: Claude Opus 5, Opus 4.7/4.8 and Sonnet 5 reject sampling parameters
+  with a 400. Compaction, flow routing and `evolve` no longer set one.
+  `max_tokens` defaults to 16,000 (4,096 left a thinking model little room for
+  its answer), and a response cut off at `max_tokens` ends the run with status
+  `max_tokens` instead of `completed`, without running any tool call in it.
 
 ### Fixed
 

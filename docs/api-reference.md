@@ -177,8 +177,8 @@ app.agent(
     context_window=None,
     compact_with=None,       # defaults to the "fast" alias
     keep_recent=6,
-    temperature=1.0,
-    max_tokens=4096,
+    temperature=None,        # sent only when set
+    max_tokens=16_000,
     expose_at=None,          # defaults to /agents/<name-with-hyphens>
     tool=True,
 )
@@ -198,8 +198,8 @@ The route takes `{"input": str, "session_id"?: str, "reset"?: bool}`.
     max_steps=50,
     token_budget=None,
     model="default",
-    max_tokens=4096,
-    temperature=1.0,
+    max_tokens=16_000,
+    temperature=None,        # sent only when set
     expose_at=None,
     expose_scopes=None,
     tool=True,               # Behaviours are agent tools by default

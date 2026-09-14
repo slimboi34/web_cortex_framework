@@ -119,7 +119,7 @@ impl AnthropicProvider {
     pub fn new(api_key: String, base_url: String) -> Option<Self> {
         Some(Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
+                .timeout(std::time::Duration::from_secs(600))
                 .build()
                 .ok()?,
             api_key,
@@ -140,54 +140,7 @@ impl ModelProvider for AnthropicProvider {
     ) -> BoxFuture<'a, Result<ProviderResponse, String>> {
         Box::pin(async move {
             let agent = req.agent;
-            let messages: Vec<Value> = req
-                .conversation
-                .messages
-                .iter()
-                .map(|m| json!({"role": m.role, "content": m.content}))
-                .collect();
-
-            let mut body = json!({
-                "model": agent.model,
-                "max_tokens": agent.max_tokens,
-                "temperature": agent.temperature,
-                "messages": messages,
-            });
-
-            let system = full_system(req);
-            if !system.is_empty() {
-                // Block form so a cache breakpoint can sit on it. The system
-                // prompt and tool list are identical on every step of a run,
-                // which is exactly the shape prompt caching rewards.
-                let mut block = json!({"type": "text", "text": system});
-                if agent.cache {
-                    block["cache_control"] = json!({"type": "ephemeral"});
-                }
-                body["system"] = json!([block]);
-            }
-            if !req.tools.is_empty() {
-                let n = req.tools.len();
-                body["tools"] = Value::Array(
-                    req.tools
-                        .iter()
-                        .enumerate()
-                        .map(|(i, t)| {
-                            let mut tool = json!({
-                                "name": t.name,
-                                "description": t.description,
-                                "input_schema": t.input_schema,
-                            });
-                            if agent.cache && i + 1 == n {
-                                tool["cache_control"] = json!({"type": "ephemeral"});
-                            }
-                            tool
-                        })
-                        .collect(),
-                );
-                if let Some(name) = req.force_tool {
-                    body["tool_choice"] = json!({"type": "tool", "name": name});
-                }
-            }
+            let body = anthropic_body(req);
 
             let res = self
                 .client
@@ -218,6 +171,64 @@ impl ModelProvider for AnthropicProvider {
             parse_anthropic(&payload, &agent.model)
         })
     }
+}
+
+/// The Messages API request body for one completion.
+pub fn anthropic_body(req: &CompletionRequest<'_>) -> Value {
+    let agent = req.agent;
+    let messages: Vec<Value> = req
+        .conversation
+        .messages
+        .iter()
+        .map(|m| json!({"role": m.role, "content": m.content}))
+        .collect();
+
+    let mut body = json!({
+        "model": agent.model,
+        "max_tokens": agent.max_tokens,
+        "messages": messages,
+    });
+    // Only when the app set one: Claude Opus 5, Opus 4.7/4.8 and Sonnet 5
+    // reject sampling parameters outright.
+    if let Some(t) = agent.temperature {
+        body["temperature"] = json!(t);
+    }
+
+    let system = full_system(req);
+    if !system.is_empty() {
+        // Block form so a cache breakpoint can sit on it. The system prompt
+        // and tool list are identical on every step of a run, which is exactly
+        // the shape prompt caching rewards.
+        let mut block = json!({"type": "text", "text": system});
+        if agent.cache {
+            block["cache_control"] = json!({"type": "ephemeral"});
+        }
+        body["system"] = json!([block]);
+    }
+    if !req.tools.is_empty() {
+        let n = req.tools.len();
+        body["tools"] = Value::Array(
+            req.tools
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let mut tool = json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    });
+                    if agent.cache && i + 1 == n {
+                        tool["cache_control"] = json!({"type": "ephemeral"});
+                    }
+                    tool
+                })
+                .collect(),
+        );
+        if let Some(name) = req.force_tool {
+            body["tool_choice"] = json!({"type": "tool", "name": name});
+        }
+    }
+    body
 }
 
 pub fn parse_anthropic(payload: &Value, model: &str) -> Result<ProviderResponse, String> {
@@ -332,9 +343,11 @@ impl ModelProvider for OpenAiCompatProvider {
             let mut body = json!({
                 "model": agent.model,
                 "max_tokens": agent.max_tokens,
-                "temperature": agent.temperature,
                 "messages": messages,
             });
+            if let Some(t) = agent.temperature {
+                body["temperature"] = json!(t);
+            }
             if !req.tools.is_empty() {
                 body["tools"] = Value::Array(
                     req.tools
@@ -624,6 +637,8 @@ enum Turn {
     Tool { name: String, arguments: Value },
     Tools(Vec<(String, Value)>),
     Error(String),
+    /// Text cut off at `max_tokens`.
+    Truncated(String),
 }
 
 impl ScriptedProvider {
@@ -676,6 +691,7 @@ impl ScriptedProvider {
                 .map(|(kind, a, b)| match kind {
                     "tool" => Turn::Tool { name: a.into(), arguments: b },
                     "error" => Turn::Error(a.into()),
+                    "truncated" => Turn::Truncated(a.into()),
                     _ => Turn::Text(a.into()),
                 })
                 .collect(),
@@ -740,6 +756,17 @@ impl ModelProvider for ScriptedProvider {
             let model = req.agent.model.clone();
             match turn {
                 Turn::Error(e) => Err(e),
+                Turn::Truncated(text) => Ok(ProviderResponse {
+                    raw_content: json!([{"type": "text", "text": text}]),
+                    text,
+                    tool_calls: Vec::new(),
+                    stop_reason: StopReason::MaxTokens,
+                    input_tokens: self.input_tokens,
+                    output_tokens: self.output_tokens,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    model,
+                }),
                 Turn::Text(text) => Ok(ProviderResponse {
                     raw_content: json!([{"type": "text", "text": text}]),
                     text,
@@ -951,6 +978,25 @@ impl ModelProvider for FakeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temperature_is_sent_only_when_the_app_set_one() {
+        let mut agent: AgentDef =
+            serde_json::from_value(json!({"name": "a", "model": "claude-opus-5"})).unwrap();
+        let conversation = Conversation::default();
+        let body = |agent: &AgentDef| {
+            anthropic_body(&CompletionRequest {
+                agent,
+                conversation: &conversation,
+                tools: &[],
+                force_tool: None,
+                system_suffix: "",
+            })
+        };
+        assert!(body(&agent).get("temperature").is_none(), "Opus 5 rejects any sampling parameter");
+        agent.temperature = Some(0.2);
+        assert_eq!(body(&agent)["temperature"], json!(0.2f32));
+    }
 
     #[test]
     fn parses_a_text_response() {

@@ -65,6 +65,9 @@ pub struct RunResult {
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Completed,
+    /// The last response was cut off at `max_tokens`: `output` may be
+    /// incomplete, and any tool call in that response was not run.
+    MaxTokens,
     /// Hit `max_steps` before the model stopped asking for tools.
     StepLimit,
     /// Hit the token budget — its own, or the request tree's.
@@ -569,6 +572,11 @@ impl AgentRuntime {
                 content: response.raw_content.clone(),
             });
 
+            // A truncated response may hold a half-written tool call; running
+            // it would act on arguments the model never finished.
+            if response.stop_reason == StopReason::MaxTokens {
+                return self.finish(app, st, RunStatus::MaxTokens, None);
+            }
             if response.stop_reason != StopReason::ToolUse || response.tool_calls.is_empty() {
                 return self.finish(app, st, RunStatus::Completed, None);
             }
@@ -789,8 +797,8 @@ impl AgentRuntime {
             max_steps: Some(1),
             token_budget: None,
             scopes: Vec::new(),
-            temperature: 0.0,
-            max_tokens: 1024,
+            temperature: None,
+            max_tokens: 4096,
             handoffs: Vec::new(),
             context: Vec::new(),
             cache: false,
@@ -1436,6 +1444,14 @@ mod tests {
         assert_eq!(failed, vec![2, 4, 8]);
         let attempts = provider.snapshots().iter().filter(|s| s.system.starts_with("You compress")).count();
         assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn a_response_cut_off_at_max_tokens_is_reported_as_such() {
+        let (app, _, _) = app_with(ScriptedProvider::sequence(vec![("truncated", "half an ans", json!(null))])).await;
+        let out = run(&app, "a", &caller(&[]), "go").await;
+        assert_eq!(out.status, RunStatus::MaxTokens);
+        assert_eq!(out.output, "half an ans");
     }
 
     #[tokio::test]

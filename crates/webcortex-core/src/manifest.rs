@@ -479,8 +479,9 @@ pub struct BehaviourDef {
     pub model: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
+    /// Sent only when set: recent Anthropic models reject sampling parameters.
+    #[serde(default)]
+    pub temperature: Option<f32>,
     #[serde(default)]
     pub input_schema: Option<serde_json::Value>,
     /// Context providers resolved on demand via `ctx.context(name)`.
@@ -842,8 +843,9 @@ pub struct AgentDef {
     /// whoever started the run — an agent is a delegate, never an escalation.
     #[serde(default)]
     pub scopes: Vec<String>,
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
+    /// Sent only when set: recent Anthropic models reject sampling parameters.
+    #[serde(default)]
+    pub temperature: Option<f32>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     /// Agents this one may hand the conversation to. Each becomes a
@@ -865,11 +867,10 @@ pub struct AgentDef {
     pub policy: ContextPolicy,
 }
 
-fn default_temperature() -> f32 {
-    1.0
-}
 fn default_max_tokens() -> u32 {
-    4096
+    // Room for adaptive thinking as well as the answer: 4096 could leave a
+    // thinking model with little or no text.
+    16_000
 }
 
 impl Manifest {

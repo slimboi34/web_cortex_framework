@@ -312,6 +312,11 @@ wire formats exist — Anthropic Messages and OpenAI Chat Completions — and
 layer.** The spend ledger groups by the resolved name, so `fast` shows up as
 whatever it pointed at.
 
+`temperature` is sent only when an agent or behaviour sets it: Claude Opus 5,
+Opus 4.7/4.8 and Sonnet 5 reject sampling parameters with a 400. Nothing in the
+runtime sets one for you — compaction, flow routing and `evolve` included.
+`max_tokens` (default 16,000) caps thinking and answer together.
+
 Prices are never built in. `GET /_webcortex/usage` reports
 `estimated_cost_usd: null` when any model that spent tokens is unpriced.
 
@@ -361,8 +366,8 @@ it would pool their data.
 
 ```python
 @app.behaviour(name=None, *, description="", tools=(), context=(), scopes=(),
-               max_steps=50, token_budget=None, model="default", max_tokens=4096,
-               temperature=1.0, expose_at=None, expose_scopes=None, tool=True)
+               max_steps=50, token_budget=None, model="default", max_tokens=16_000,
+               temperature=None, expose_at=None, expose_scopes=None, tool=True)
 def handler(ctx, input): ...
 ```
 
@@ -438,8 +443,8 @@ event loop.
 ```python
 app.agent(name, *, model="default", system="", tools=(), handoffs=(), context=(),
           memory=None, description="", max_steps=12, token_budget=None,
-          expose_at=None, scopes=(), expose_scopes=None, temperature=1.0,
-          max_tokens=4096, cache=True, context_window=None,
+          expose_at=None, scopes=(), expose_scopes=None, temperature=None,
+          max_tokens=16_000, cache=True, context_window=None,
           tool_result_limit=16_384, compact_with=None, keep_recent=6,
           tool=True) -> None
 ```
@@ -481,8 +486,9 @@ mean" hint. An agent that lists itself in `handoffs` is rejected, and so is one
 whose `tools` include `transfer_to_<h>` for one of its own handoffs `h`.
 
 Result shape: `run_id, agent, path, status, output, steps, usage,
-pending_approval?, session_id?`. `status` ∈ `completed | step_limit |
-budget_exhausted | awaiting_approval | failed`. Step kinds: `model, tool_call,
+pending_approval?, session_id?`. `status` ∈ `completed | max_tokens |
+step_limit | budget_exhausted | awaiting_approval | failed` (`max_tokens`: the
+last response was cut off, and no tool call in it was run). Step kinds: `model, tool_call,
 tool_refused, approval_requested, approval_denied, handoff, compaction`.
 HTTP status: 202 for `awaiting_approval`, 502 for `failed`, 200 otherwise.
 
