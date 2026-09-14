@@ -179,8 +179,8 @@ Cost is computed only from prices you declare, because prices change and a
 stale number is worse than none:
 
 ```python
-app.pricing("claude-opus-5", input_per_mtok=15, output_per_mtok=75,
-            cache_read_per_mtok=1.5, cache_write_per_mtok=18.75)
+app.pricing("claude-opus-5", input_per_mtok=5, output_per_mtok=25,
+            cache_read_per_mtok=0.5, cache_write_per_mtok=6.25)
 ```
 
 `estimated_cost_usd` is a number only when every model that spent anything

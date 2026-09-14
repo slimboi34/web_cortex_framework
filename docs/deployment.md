@@ -24,7 +24,7 @@ An honest answer, because the useful version is qualified.
 
 </div>
 
-**What is verified:** 326 tests, an adversarial security review with six fixes,
+**What is verified:** 355 tests, an adversarial security review with six fixes,
 1.79M requests soaked with zero errors and stable memory, wheels building on
 five platform targets across four interpreter versions.
 

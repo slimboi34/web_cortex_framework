@@ -63,7 +63,7 @@ Everything else in this document is downstream of those five ideas.
 
 ## 2. What exists and has been measured
 
-Working today, with **99 Rust tests and 237 Python tests** passing and clippy
+Working today, with **106 Rust tests and 249 Python tests** passing and clippy
 clean:
 
 **Runtime**

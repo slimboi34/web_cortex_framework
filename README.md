@@ -235,7 +235,7 @@ carries, and how many calls are made. Each has a declaration.
 app.models(default="claude-opus-5", fast="claude-haiku-4-5-20251001",
            local="ollama/qwen3.5:9b")
 app.provider("groq", base_url="https://api.groq.com/openai/v1", api_key_env="GROQ_API_KEY")
-app.pricing("claude-opus-5", input_per_mtok=15, output_per_mtok=75)
+app.pricing("claude-opus-5", input_per_mtok=5, output_per_mtok=25)
 ```
 
 - **Tiers, not models.** Judgement uses `default`; classification, extraction
@@ -306,8 +306,11 @@ whose scopes are *intersected* with the caller's — never unioned — and a
 handoff intersects again. An anonymous caller cannot launch a privileged agent.
 
 **Human approval gates.** Mark a route `approval="required"` and an agent asking
-for it does not get it — the run suspends until a human decides, on every path:
-the agent loop, MCP, behaviours, `gather`, flows.
+for it does not get it. An agent's run suspends until a human decides, then
+resumes with the rest of its turn. Every other path is refused: a direct MCP
+call is rejected, a behaviour (alone or in `gather`) halts, and a flow step
+fails. Resuming continues the agent that hit the gate, not a supervisor that
+called it, so give gated tools to the agents people call directly.
 
 **Runtime-enforced budgets that compose.** `max_steps` per run;
 `token_budget` for the run and everything under it.
@@ -404,7 +407,7 @@ sessions, resumable approval gates, composing budgets, tool-result bounding and
 compaction, context providers, memory, flows, two providers (Anthropic and
 OpenAI-compatible, which covers local models), prompt caching, the spend
 ledger, the audit trail, OpenAPI, the MCP server, TypeScript generation, the
-context pack and `evolve`. **326 tests** (95 Rust, 231 Python, including a
+context pack and `evolve`. **355 tests** (106 Rust, 249 Python, including a
 54-test adversarial suite and an offline end-to-end suite that drives the whole
 agent stack over HTTP), clippy clean.
 

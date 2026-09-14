@@ -167,7 +167,7 @@ app.agent("assistant", context=["policy"], memory="notes",
     Read [Deployment](deployment.md#is-it-production-ready) for an honest
     assessment of what it is and is not ready for.
 
-**Verified:** 326 tests (95 Rust, 231 Python, including a 54-test adversarial
+**Verified:** 355 tests (106 Rust, 249 Python, including a 54-test adversarial
 suite and an offline end-to-end suite that drives the whole agent stack over
 HTTP). Clippy clean. `cargo audit` clean. CI builds wheels for Linux
 (x86_64/aarch64), macOS (arm64/x86_64), and Windows across Python 3.12, 3.13,
