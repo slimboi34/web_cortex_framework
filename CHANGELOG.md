@@ -50,6 +50,9 @@ describe itself to the model writing it.
 - `ctx.gather(...)` and `ctx.ask_many(...)` run tool calls and model calls
   concurrently from a behaviour — one wait instead of a loop of round trips —
   with the same admission, scoping, gating and charging as `call` and `ask`.
+- `WebCortex(agent_timeout=600)`: agent, flow and behaviour routes have their
+  own ceiling. They used to share the 30-second `request_timeout`, which cut a
+  multi-step run off with a 504 and lost it.
 
 ### Added — token economy
 

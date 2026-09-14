@@ -288,7 +288,15 @@ async fn route_request(
     let mut res = if let Some(rest) = path.strip_prefix(&prefix) {
         control_plane(app, &method, rest, &body, &principal, request_id).await
     } else {
-        let timeout = std::time::Duration::from_secs(app.manifest.server.request_timeout_secs);
+        // A model loop routinely outlasts an ordinary handler's ceiling, and a
+        // timeout drops the run mid-flight.
+        let limits = &app.manifest.server;
+        let secs = if app.runs_a_model_loop(&method, &path) {
+            limits.agent_timeout_secs.max(limits.request_timeout_secs)
+        } else {
+            limits.request_timeout_secs
+        };
+        let timeout = std::time::Duration::from_secs(secs);
         let dispatch = app.dispatch(WebCortexRequest {
             method,
             path,

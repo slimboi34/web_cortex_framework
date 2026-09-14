@@ -74,6 +74,7 @@ app = WebCortex(
     port=8000,
     workers=None,          # defaults to CPU count on free-threaded builds
     request_timeout=30,
+    agent_timeout=600,     # agent, flow and behaviour routes: a multi-step run outlasts 30s
     shutdown_timeout=25,
 )
 ```

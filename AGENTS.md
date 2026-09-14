@@ -93,6 +93,7 @@ app = WebCortex(
     control_prefix="/_webcortex",  # str
     templates=None,                # str | None — directory of templates
     request_timeout=30,            # int, seconds
+    agent_timeout=600,             # int, seconds — agent, flow and behaviour routes
     shutdown_timeout=25,           # int, seconds
 )
 ```

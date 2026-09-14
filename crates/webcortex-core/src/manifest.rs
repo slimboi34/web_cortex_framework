@@ -523,6 +523,10 @@ pub struct ServerConfig {
     /// from pinning a connection indefinitely.
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+    /// Ceiling for routes that run a model loop (agents, flows, behaviours),
+    /// which routinely outlast `request_timeout_secs`.
+    #[serde(default = "default_agent_timeout")]
+    pub agent_timeout_secs: u64,
     /// How long to drain in-flight connections on shutdown.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
@@ -561,6 +565,9 @@ fn default_approval_ttl() -> u64 {
 fn default_request_timeout() -> u64 {
     30
 }
+fn default_agent_timeout() -> u64 {
+    600
+}
 fn default_shutdown_timeout() -> u64 {
     25
 }
@@ -582,6 +589,7 @@ impl Default for ServerConfig {
             port: default_port(),
             control_prefix: default_control_prefix(),
             request_timeout_secs: default_request_timeout(),
+            agent_timeout_secs: default_agent_timeout(),
             shutdown_timeout_secs: default_shutdown_timeout(),
             max_invocation_depth: default_max_depth(),
             session_capacity: default_session_capacity(),

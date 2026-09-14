@@ -18,6 +18,7 @@ app = WebCortex(
     workers=None,            # None = CPU count
     control_prefix="/_webcortex",
     request_timeout=30,
+    agent_timeout=600,       # agent, flow and behaviour routes
     shutdown_timeout=25,
 )
 ```

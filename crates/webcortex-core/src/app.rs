@@ -311,6 +311,16 @@ impl App {
         self.routes_by_id.get(&id)
     }
 
+    /// True when `method path` runs a model loop — an agent, a flow or a
+    /// behaviour — and so is bounded by `agent_timeout_secs`.
+    pub fn runs_a_model_loop(&self, method: &str, path: &str) -> bool {
+        self.router
+            .find(method, path)
+            .ok()
+            .and_then(|m| self.routes_by_id.get(&m.route_id))
+            .is_some_and(|r| matches!(r.op, Op::Agent { .. } | Op::Flow { .. } | Op::Behaviour { .. }))
+    }
+
     pub fn route_for_tool(&self, name: &str) -> Option<&Route> {
         self.tools_by_name.get(name).and_then(|id| self.routes_by_id.get(id))
     }

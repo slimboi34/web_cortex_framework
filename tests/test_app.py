@@ -201,6 +201,12 @@ def test_the_banner_prints_the_address_the_server_will_bind(monkeypatch, capsys)
     assert "127.0.0.1:9123" in capsys.readouterr().out
 
 
+def test_model_loop_routes_get_their_own_timeout():
+    assert make_app().manifest()["server"]["agent_timeout_secs"] == 600
+    server = make_app(request_timeout=5, agent_timeout=900).manifest()["server"]
+    assert (server["request_timeout_secs"], server["agent_timeout_secs"]) == (5, 900)
+
+
 def test_generated_ddl_marks_the_primary_key():
     app = make_app()
     app.resource("books", fields={"id": int, "title": str, "year": int})

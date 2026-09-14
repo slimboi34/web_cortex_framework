@@ -56,6 +56,7 @@ class WebCortex:
         control_prefix: str = "/_webcortex",
         templates: str | None = None,
         request_timeout: int = 30,
+        agent_timeout: int = 600,
         shutdown_timeout: int = 25,
     ) -> None:
         self.name = name
@@ -68,6 +69,7 @@ class WebCortex:
         self.control_prefix = control_prefix
         self.templates_dir = templates
         self.request_timeout = request_timeout
+        self.agent_timeout = agent_timeout
         self.shutdown_timeout = shutdown_timeout
 
         # Security posture. Every one of these defaults to the safe setting;
@@ -1311,6 +1313,7 @@ class WebCortex:
                 "port": int(os.environ.get("WEBCORTEX_PORT", self.port)),
                 "control_prefix": self.control_prefix,
                 "request_timeout_secs": self.request_timeout,
+                "agent_timeout_secs": self.agent_timeout,
                 "shutdown_timeout_secs": self.shutdown_timeout,
             },
             "auth": self._auth,

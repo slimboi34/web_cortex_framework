@@ -1455,6 +1455,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_loop_routes_are_recognised_for_their_own_timeout() {
+        let (app, _, _) = app_with(ScriptedProvider::text("x")).await;
+        assert!(app.runs_a_model_loop("POST", "/agents/worker"));
+        assert!(!app.runs_a_model_loop("GET", "/safe"));
+        assert!(!app.runs_a_model_loop("GET", "/no-such-route"));
+    }
+
+    #[tokio::test]
     async fn sessions_carry_the_conversation_between_runs() {
         let (app, _, provider) = app_with(ScriptedProvider::sequence(vec![
             ("text", "one", json!(null)),
