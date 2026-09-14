@@ -62,7 +62,13 @@ pub async fn resolve_one(
                     .iter()
                     .map(|n| {
                         if n == "@principal" {
-                            Value::String(principal.root_id().to_string())
+                            // Anonymous callers share one id: bind nothing
+                            // rather than pool their data.
+                            if principal.root_is_anonymous() {
+                                Value::Null
+                            } else {
+                                Value::String(principal.root_id().to_string())
+                            }
                         } else {
                             input.get(n).cloned().unwrap_or(Value::Null)
                         }

@@ -205,7 +205,8 @@ $ curl -X POST localhost:8000/ask -H "x-api-key: $KEY" \
 ```
 
 The store key includes the **principal**, so two callers using the same id
-never see each other's history. `"reset": true` discards it first.
+never see each other's history. Anonymous callers share one identity, so a
+`session_id` from one is refused with 401. `"reset": true` discards it first.
 
 Sessions live in memory — bounded (`session_capacity`, default 1000) and
 expiring (`session_ttl_secs`, default 3600), both fixed for now rather than

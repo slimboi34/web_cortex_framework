@@ -538,6 +538,17 @@ def test_an_agent_writes_memory_as_the_human_behind_it(server):
     assert server.raw("/notes/recall/pet", key=ADMIN_KEY)[0] == 404
 
 
+def test_anonymous_callers_get_no_session_and_no_per_caller_data(server):
+    # Every anonymous caller is the same principal, so none of this may be pooled.
+    status, _ = server.ask("/ask", "hello", session_id="shared")
+    assert status == 401
+    assert server.raw("/notes/remember", "POST", {"key": "k", "value": "v"})[0] == 401
+    assert server.raw("/notes/recall/k")[0] == 401
+    status, out = server.ask("/ask", "context?")
+    assert status == 200, out
+    assert '"me": null' in out["output"], "@principal binds nothing for an anonymous caller"
+
+
 # --- approvals that resume ----------------------------------------------------
 
 

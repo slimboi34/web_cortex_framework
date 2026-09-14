@@ -384,6 +384,9 @@ impl App {
             Op::Python { handler } => self.bridge.call(*handler, req).await,
 
             Op::Query { sql, params, returns } => {
+                if binds_principal(params) && req.principal.root_is_anonymous() {
+                    return Ok(anonymous_principal_refused());
+                }
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.as_ref().ok_or("no database configured")?;
@@ -553,6 +556,9 @@ impl App {
                 context.insert("data".into(), value.clone());
             }
             PageData::Query { sql, params, returns, bind } => {
+                if binds_principal(params) && req.principal.root_is_anonymous() {
+                    return Ok(anonymous_principal_refused());
+                }
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.as_ref().ok_or("no database configured")?;
@@ -628,6 +634,15 @@ impl App {
             .lookup("reset")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Every anonymous caller is the same `anonymous` principal, so a session
+        // keyed by it would be one conversation shared by strangers.
+        if session_id.is_some() && req.principal.root_is_anonymous() {
+            return Ok(WebCortexResponse::error(
+                401,
+                "sessions need an authenticated caller: anonymous callers share one identity, \
+                 so they would share one conversation",
+            ));
+        }
 
         let opts = RunOptions {
             depth: req.depth,
@@ -892,6 +907,20 @@ pub fn run_result_response(result: &RunResult) -> WebCortexResponse {
         Ok(v) => WebCortexResponse::json(status, &v),
         Err(e) => WebCortexResponse::error(500, e.to_string()),
     }
+}
+
+/// Whether a declared query binds the caller's identity.
+fn binds_principal(params: &[String]) -> bool {
+    params.iter().any(|p| p == "@principal")
+}
+
+/// Every anonymous caller shares the id `anonymous`, so a route scoped to
+/// `@principal` would pool their data. It needs a real caller instead.
+fn anonymous_principal_refused() -> WebCortexResponse {
+    WebCortexResponse::error(
+        401,
+        "this route is scoped to the caller (@principal) and needs an authenticated caller",
+    )
 }
 
 /// True when a value could alter the structure of a URL path it is spliced into.

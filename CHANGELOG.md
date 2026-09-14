@@ -32,7 +32,8 @@ describe itself to the model writing it.
   classify with a forced structured call on the `fast` tier and fall back to
   `default`. A flow is itself a tool and a route.
 - **Sessions.** Agent routes accept `session_id` (and `reset`); the
-  conversation is kept between requests, keyed by principal as well as id.
+  conversation is kept between requests, keyed by principal as well as id;
+  anonymous callers, who all share one identity, are refused a session.
   In memory, bounded (`session_capacity`) and expiring (`session_ttl_secs`).
 - **Approvals that resume.** `GET /_webcortex/approvals` lists suspended
   runs; `POST /_webcortex/approvals/{id}` with `{"approve": bool, "note"}`
@@ -87,7 +88,9 @@ describe itself to the model writing it.
   `ctx.context(name)` and may only read what they declared.
 - `app.memory(name)`: a per-principal key-value store as four Rust-executed
   tools (`remember`, `recall`, `search`, `forget`). `app.agent(memory=...)`
-  adds them plus a usage hint.
+  adds them plus a usage hint. Memory, and any route that binds `@principal`,
+  answers 401 to anonymous callers for the same reason; a context provider
+  binds it as NULL for them.
 - `@principal` binds the **root** principal — the human behind any chain of
   agent delegation — in `app.query` and `app.context` parameters.
 

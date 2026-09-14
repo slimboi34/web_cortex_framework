@@ -216,7 +216,7 @@ composition is uniform, and a flow is itself a tool. Steps map arguments with
 
 **Sessions.** Post `{"input": "...", "session_id": "..."}` and the conversation
 continues; the key includes the principal, so callers never see each other's
-history. Long sessions are compacted, not truncated.
+history, and anonymous callers, who share one identity, cannot open one. Long sessions are compacted, not truncated.
 
 **Approvals that resume.** A gated tool suspends the run; a human decides at
 `POST /_webcortex/approvals/{id}` with `{"approve": true|false, "note": "..."}`;

@@ -56,6 +56,14 @@ impl Principal {
         self.kind == PrincipalKind::Anonymous
     }
 
+    /// True when the root of the delegation chain presented no credential.
+    /// Every such caller shares the one id `anonymous`, so nothing keyed by
+    /// identity — a session, an `@principal` binding — may be handed to one.
+    pub fn root_is_anonymous(&self) -> bool {
+        self.is_anonymous()
+            || self.claims.get("root_anonymous").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
     pub fn has_scope(&self, scope: &str) -> bool {
         // A wildcard is spelled exactly `*`; no prefix matching, because
         // `admin:*` style globs invite mistakes that are invisible in review.
@@ -103,6 +111,9 @@ impl Principal {
         claims
             .entry("root".into())
             .or_insert_with(|| serde_json::Value::String(self.id.clone()));
+        claims
+            .entry("root_anonymous".into())
+            .or_insert_with(|| serde_json::Value::Bool(self.is_anonymous()));
         Self {
             id: format!("agent:{agent_name}#{}", self.id),
             kind: PrincipalKind::Agent,
@@ -396,6 +407,14 @@ mod tests {
         let agent = principal_with(&["read"]).delegate_to_agent("librarian", &[]);
         assert_eq!(agent.claims["on_behalf_of"], serde_json::json!("u1"));
         assert_eq!(agent.claims["agent"], serde_json::json!("librarian"));
+    }
+
+    #[test]
+    fn an_anonymous_root_is_remembered_through_delegation() {
+        let a = Principal::anonymous().delegate_to_agent("a", &[]);
+        let b = a.delegate_to_agent("b", &[]);
+        assert!(a.root_is_anonymous() && b.root_is_anonymous());
+        assert!(!principal_with(&["read"]).delegate_to_agent("a", &[]).root_is_anonymous());
     }
 
     #[test]

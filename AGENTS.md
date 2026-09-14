@@ -340,7 +340,8 @@ for SQLite) and four **Query** routes exposed as tools:
 absent), `<name>_search(query, limit)` (substring, newest first),
 `<name>_forget(key)`. Every row is keyed by `@principal`, the **root**
 principal — the human or service behind any chain of agent delegation —
-enforced in the SQL, not by the model. Search is substring on purpose; do not
+enforced in the SQL, not by the model. Anonymous callers get a 401 from all
+four, because they share one identity. Search is substring on purpose; do not
 add embeddings here.
 
 ### `@principal`
@@ -349,7 +350,10 @@ add embeddings here.
 delegated principal carries `claims.root`, set on the first delegation and
 preserved through every subsequent one. Use it in `app.query(params=[...])`
 and `app.context(params=[...])` to scope data to the caller without a Python
-handler.
+handler. When the root caller is anonymous (`Principal::root_is_anonymous`), a
+query or page route that binds `@principal` answers 401 and a context provider
+binds it as NULL: every anonymous caller shares the id `anonymous`, so binding
+it would pool their data.
 
 ---
 
@@ -497,7 +501,7 @@ reset depth to zero on tool calls, which bypassed the nesting ceiling.
 Sessions: `SessionStore` keyed by `(agent, principal.id, session_id)`,
 in-memory, `server.session_capacity` (1000) / `session_ttl_secs` (3600),
 LRU-evicted. Those, `approval_ttl_secs` and `max_invocation_depth` are
-manifest defaults that `WebCortex(...)` does not set yet. Saved after any terminal status except `awaiting_approval`.
+manifest defaults that `WebCortex(...)` does not set yet. Saved after any terminal status except `awaiting_approval`. A `session_id` from an anonymous root caller is a 401.
 
 Approvals: a gated call suspends the run into `App.approvals` with the whole
 `RunState`, the turn's tool calls, the index of the gated one, and the results
