@@ -178,6 +178,18 @@ describe itself to the model writing it.
   sending. It now reads and discards up to 8 MB more (for at most 2 s) before
   answering, so the 413 arrives; a larger overshoot is still cut off.
 
+### Security
+
+- `rustls` 0.23.43 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with
+  it) in `Cargo.lock` for [RUSTSEC-2026-0285]: TLS 1.3 handshake messages were
+  accepted across encryption-level boundaries. The advisory was published on
+  14 September, after this release was reviewed, and the release gate's
+  `cargo audit` rightly refused it. `rustls` is transitive, via reqwest's TLS
+  for outbound calls to model providers and proxied upstreams; no API is
+  involved.
+
+[RUSTSEC-2026-0285]: https://rustsec.org/advisories/RUSTSEC-2026-0285
+
 ### Verified
 
 355 tests (106 Rust, 249 Python). Clippy clean. `cargo audit` reports no
