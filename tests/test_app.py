@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from webcortex import WebCortex
+from webcortex import Request, WebCortex
 
 
 def make_app(**kw) -> WebCortex:
@@ -168,6 +168,45 @@ def test_openapi_strips_path_params_from_the_request_body():
     assert "title" in body_props
 
 
+def test_gated_tools_are_reported_under_the_names_agents_call():
+    app = make_app()
+
+    @app.post("/items/purge", tool=True, approval="required")
+    def purge() -> dict:
+        return {}
+
+    assert app.security_report()["gated_tools"] == ["create_items_purge"]
+    assert "create_items_purge" in app.check()["tools"]
+
+
+def test_a_request_annotation_binds_under_postponed_annotations():
+    # This module has `from __future__ import annotations`, so the annotation
+    # below is the string "Request" until something resolves it.
+    app = make_app()
+
+    @app.post("/hook")
+    def hook(r: Request) -> dict:
+        return {}
+
+    route = next(r for r in app.manifest()["routes"] if r["path"] == "/hook")
+    assert "r" not in (route["input_schema"] or {}).get("properties", {})
+
+
+def test_the_banner_prints_the_address_the_server_will_bind(monkeypatch, capsys):
+    from webcortex.cli import _banner
+
+    monkeypatch.delenv("WEBCORTEX_HOST", raising=False)
+    monkeypatch.setenv("WEBCORTEX_PORT", "9123")
+    _banner(make_app())
+    assert "127.0.0.1:9123" in capsys.readouterr().out
+
+
+def test_model_loop_routes_get_their_own_timeout():
+    assert make_app().manifest()["server"]["agent_timeout_secs"] == 600
+    server = make_app(request_timeout=5, agent_timeout=900).manifest()["server"]
+    assert (server["request_timeout_secs"], server["agent_timeout_secs"]) == (5, 900)
+
+
 def test_generated_ddl_marks_the_primary_key():
     app = make_app()
     app.resource("books", fields={"id": int, "title": str, "year": int})
@@ -175,3 +214,13 @@ def test_generated_ddl_marks_the_primary_key():
     assert "CREATE TABLE IF NOT EXISTS books" in sql
     assert "id INTEGER PRIMARY KEY" in sql
     assert "title TEXT" in sql
+
+
+def test_the_manifest_hands_the_ddl_to_the_runtime():
+    # `run()` used to apply this on its own sqlite3 connection, which a
+    # `sqlite://:memory:` pool never saw. The runtime applies it now.
+    app = make_app()
+    app.resource("books", fields={"id": int, "title": str})
+    database = app.manifest()["database"]
+    assert database["schema"] == app.schema_sql
+    assert "CREATE TABLE IF NOT EXISTS books" in database["schema"]

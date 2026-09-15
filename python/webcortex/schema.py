@@ -102,6 +102,16 @@ def _dataclass_schema(cls: Any) -> dict:
     return out
 
 
+def type_hints(fn: Any) -> dict:
+    """A callable's resolved annotations, or its raw ones when a forward
+    reference cannot be resolved: an exotic annotation must not stop an app
+    from booting."""
+    try:
+        return typing.get_type_hints(fn)
+    except Exception:
+        return getattr(fn, "__annotations__", {})
+
+
 def schema_from_signature(
     fn: Any, path_params: list[str], skip: set[str] | None = None
 ) -> tuple[dict, dict]:
@@ -113,11 +123,7 @@ def schema_from_signature(
     each name back to the right part of the request.
     """
     skip = skip or set()
-    try:
-        hints = typing.get_type_hints(fn)
-    except Exception:
-        # Unresolvable forward references shouldn't stop the app from booting.
-        hints = getattr(fn, "__annotations__", {})
+    hints = type_hints(fn)
 
     sig = inspect.signature(fn)
     props: dict[str, dict] = {}

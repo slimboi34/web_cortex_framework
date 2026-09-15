@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .starters import TEMPLATES
+
 DEFAULT_MODULE = "api.py"
 
 
@@ -85,6 +87,15 @@ def _banner(app: Any) -> None:
     behaviours = security.get("behaviours", [])
     if behaviours:
         print(f"  behaviours: {', '.join(b['name'] for b in behaviours)}")
+    flows = security.get("flows", [])
+    if flows:
+        print(f"  flows: {', '.join(f'{f['name']} ({f['kind']})' for f in flows)}")
+    if security.get("memories"):
+        print(f"  memory: {', '.join(security['memories'])}")
+    manifest = app.manifest()
+    aliases = manifest.get("models", {}).get("aliases", {})
+    if aliases:
+        print(f"  models: {', '.join(f'{k}={v}' for k, v in aliases.items())}")
 
     posture = []
     posture.append("auth" if security["auth_configured"] else "NO AUTH")
@@ -104,9 +115,72 @@ def _banner(app: Any) -> None:
     if security["gated_tools"]:
         print(f"  approval-gated tools: {', '.join(security['gated_tools'])}")
 
-    prefix, host, port = app.control_prefix, app.host, app.port
+    # The manifest applies WEBCORTEX_HOST and WEBCORTEX_PORT: print what binds.
+    server = manifest["server"]
+    prefix, host, port = server["control_prefix"], server["host"], server["port"]
     print(f"  http://{host}:{port}{prefix}/openapi.json   ·   MCP: http://{host}:{port}{prefix}/mcp")
+    if report["agents"] or behaviours or flows:
+        print(f"  usage: http://{host}:{port}{prefix}/usage   ·   approvals: http://{host}:{port}{prefix}/approvals")
     print()
+
+
+EVOLVE_SYSTEM = """\
+You extend applications built on WebCortex 2, a Python web framework with a Rust
+core where every declared route is also an agent tool. You will be given a
+context pack describing the current application and a cheat sheet of the
+framework's API, then a request.
+
+Respond with Python only: the code to add to api.py, complete and runnable,
+with a one-line comment above each declaration saying what it is for. Prefer
+declarations (app.resource, app.query, app.context, app.flow, app.memory) over
+Python handlers; use a handler only for logic that cannot be declared. Declare
+scopes on everything; gate destructive tools with approval="required". Use the
+`fast` model alias for classification and extraction leaves. Do not repeat
+declarations that already exist. Do not wrap the answer in prose.
+"""
+
+
+def _cmd_evolve(app: Any, args: argparse.Namespace) -> int:
+    """Ask a model to propose an extension, anchored on the context pack."""
+    from . import _core
+
+    pack = app.context_pack()
+    prompt = f"{pack}\n\n## Request\n\n{args.request}\n"
+    if args.json:
+        schema = json.dumps({
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "code": {"type": "string"},
+                "notes": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["summary", "code"],
+        })
+        out = _core.ask_model(app.manifest_json(), args.model, EVOLVE_SYSTEM, prompt, schema, 8192)
+        text = json.dumps(json.loads(out), indent=2)
+    else:
+        text = _core.ask_model(app.manifest_json(), args.model, EVOLVE_SYSTEM, prompt, None, 8192)
+        text = _strip_fence(text)
+
+    if args.out:
+        path = Path(args.out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text.rstrip() + "\n")
+        print(f"Wrote {path} ({len(text.splitlines())} lines) using model {args.model!r}. Review before merging into api.py.",
+              file=sys.stderr)
+    else:
+        print(text.rstrip())
+    return 0
+
+
+def _strip_fence(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        first_newline = t.find("\n")
+        t = t[first_newline + 1:] if first_newline != -1 else t[3:]
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t
 
 
 def _cmd_new(args: argparse.Namespace) -> int:
@@ -147,9 +221,10 @@ def main(argv: list[str] | None = None) -> int:
     new.add_argument("name")
     new.add_argument(
         "--template", "-t", default="api",
-        choices=("api", "fullstack", "agent", "behaviour"),
+        choices=TEMPLATES,
         help=("api: JSON+MCP · fullstack: adds pages · agent: adds an approval gate · "
-              "behaviour: adds programmable procedures"),
+              "behaviour: adds programmable procedures · orchestration: handoffs, flows, "
+              "memory, context and a local model"),
     )
     new.add_argument("--directory", "-d", default=None)
     new.add_argument("--description", default=None)
@@ -165,8 +240,12 @@ def main(argv: list[str] | None = None) -> int:
         ("sql", "print the DDL for declared resources"),
         ("security", "report the public attack surface"),
         ("typegen", "generate a typed TypeScript client"),
+        ("context", "print the context pack: the app described for an AI coding tool"),
+        ("evolve", "ask a model to propose an extension, anchored on the context pack"),
     ]:
         p = sub.add_parser(name, help=help_text)
+        if name == "evolve":
+            p.add_argument("request", help="what to add, in plain language")
         p.add_argument("target", nargs="?", default=DEFAULT_MODULE,
                        help="module path or module:attr (default: api.py)")
         if name in ("dev", "run"):
@@ -175,6 +254,14 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--workers", type=int, default=None)
         if name == "typegen":
             p.add_argument("--out", "-o", default="client/api.ts")
+        if name == "context":
+            p.add_argument("--json", action="store_true", help="emit the raw manifest instead")
+        if name == "evolve":
+            p.add_argument("--model", "-m", default="default",
+                           help="model or alias, e.g. default, fast, ollama/qwen3.5:9b")
+            p.add_argument("--out", "-o", default=None, help="write the proposal to a file")
+            p.add_argument("--json", action="store_true",
+                           help="ask for {summary, code, notes} as JSON")
 
     args = parser.parse_args(argv)
 
@@ -205,7 +292,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check":
         report = app.check()
-        report.pop("openapi", None)
         print(json.dumps({**report, "security": app.security_report()}, indent=2))
         return 0
 
@@ -244,6 +330,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sql":
         print(app.schema_sql or "-- no resources declared")
         return 0
+
+    if args.command == "context":
+        if args.json:
+            print(json.dumps(app.manifest(), indent=2))
+        else:
+            print(app.context_pack(), end="")
+        return 0
+
+    if args.command == "evolve":
+        return _cmd_evolve(app, args)
+
 
     if args.command == "typegen":
         code = app.typescript_client()

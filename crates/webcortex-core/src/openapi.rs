@@ -35,9 +35,11 @@ pub fn generate(m: &Manifest) -> Value {
             "mcp_endpoint": format!("{}/mcp", m.server.control_prefix),
             "tools": m.routes.iter().filter(|r| r.tool.expose).map(|r| r.tool_name()).collect::<Vec<_>>(),
             "agents": m.agents.iter().map(|a| &a.name).collect::<Vec<_>>(),
+            "flows": m.flows.iter().map(|f| &f.name).collect::<Vec<_>>(),
         }
     })
 }
+
 
 fn operation(r: &Route) -> Value {
     let mut params = Vec::new();
@@ -67,7 +69,7 @@ fn operation(r: &Route) -> Value {
                 }
             }
         },
-        "x-webcortex-op": op_kind(&r.op),
+        "x-webcortex-op": r.op.kind(),
         "x-webcortex-tool": r.tool.expose,
     });
 
@@ -119,17 +121,4 @@ fn body_schema(r: &Route) -> Option<Value> {
         req.retain(|v| v.as_str().map(|s| !in_path.contains(&s.to_string())).unwrap_or(true));
     }
     Some(cloned)
-}
-
-fn op_kind(op: &Op) -> &'static str {
-    match op {
-        Op::Static { .. } => "static",
-        Op::Python { .. } => "python",
-        Op::Query { .. } => "query",
-        Op::Proxy { .. } => "proxy",
-        Op::Agent { .. } => "agent",
-        Op::Page { .. } => "page",
-        Op::Files { .. } => "files",
-        Op::Behaviour { .. } => "behaviour",
-    }
 }

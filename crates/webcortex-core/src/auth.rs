@@ -56,10 +56,27 @@ impl Principal {
         self.kind == PrincipalKind::Anonymous
     }
 
+    /// True when the root of the delegation chain presented no credential.
+    /// Every such caller shares the one id `anonymous`, so nothing keyed by
+    /// identity — a session, an `@principal` binding — may be handed to one.
+    pub fn root_is_anonymous(&self) -> bool {
+        self.is_anonymous()
+            || self.claims.get("root_anonymous").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
     pub fn has_scope(&self, scope: &str) -> bool {
         // A wildcard is spelled exactly `*`; no prefix matching, because
         // `admin:*` style globs invite mistakes that are invisible in review.
         self.scopes.iter().any(|s| s == scope || s == "*")
+    }
+
+    /// The principal at the root of a delegation chain: the human or service
+    /// that started things, however many agents deep this one is.
+    pub fn root_id(&self) -> &str {
+        self.claims
+            .get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&self.id)
     }
 
     pub fn missing_scopes(&self, required: &[String]) -> Vec<String> {
@@ -91,6 +108,12 @@ impl Principal {
             "on_behalf_of".into(),
             serde_json::Value::String(self.id.clone()),
         );
+        claims
+            .entry("root".into())
+            .or_insert_with(|| serde_json::Value::String(self.id.clone()));
+        claims
+            .entry("root_anonymous".into())
+            .or_insert_with(|| serde_json::Value::Bool(self.is_anonymous()));
         Self {
             id: format!("agent:{agent_name}#{}", self.id),
             kind: PrincipalKind::Agent,
@@ -387,7 +410,27 @@ mod tests {
     }
 
     #[test]
+    fn an_anonymous_root_is_remembered_through_delegation() {
+        let a = Principal::anonymous().delegate_to_agent("a", &[]);
+        let b = a.delegate_to_agent("b", &[]);
+        assert!(a.root_is_anonymous() && b.root_is_anonymous());
+        assert!(!principal_with(&["read"]).delegate_to_agent("a", &[]).root_is_anonymous());
+    }
+
+    #[test]
+    fn the_root_principal_survives_a_chain_of_delegation() {
+        let human = principal_with(&["read"]);
+        let a = human.delegate_to_agent("a", &[]);
+        let b = a.delegate_to_agent("b", &[]);
+        assert_eq!(human.root_id(), "u1");
+        assert_eq!(a.root_id(), "u1");
+        assert_eq!(b.root_id(), "u1");
+        assert_ne!(b.id, "u1");
+    }
+
+    #[test]
     fn generated_keys_are_prefixed_and_unique() {
+
         let a = generate_api_key();
         let b = generate_api_key();
         assert!(a.starts_with("wcx_") && a.len() > 40);

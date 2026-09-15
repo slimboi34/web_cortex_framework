@@ -1,7 +1,199 @@
 # Changelog
 
-Notable changes per release. Versions follow [semantic versioning](https://semver.org);
-while the major version is 0, minor bumps may contain breaking changes.
+Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
+bumps could contain breaking changes.
+
+## [2.0.0] — 2026-09-14
+
+The orchestration generation. The version jumps from 0.3 to 2.0 because this
+is a second design rather than a polish of the first: 0.3 established that one
+declaration is a route, a tool and a document; 2.0 establishes that agents,
+behaviours and flows compose under one budget, and that the application can
+describe itself to the model writing it.
+
+### Added — orchestration
+
+- **Every agent is a tool.** An agent is mounted at `/agents/<name-with-hyphens>` (or
+  `expose_at`) and exposed under its own name, so
+  `app.agent("editor", tools=["researcher", "writer"])` is the whole
+  supervisor/worker pattern. Workers run as delegates of the supervisor, one
+  nesting level deeper, against the supervisor's budget.
+- **Handoffs.** `app.agent(..., handoffs=["billing"])` adds a
+  `transfer_to_billing` tool. Calling it moves the conversation to the target
+  agent — its system prompt, tools and context apply from the next step —
+  while the budget and the caller's authority carry over. Authority is
+  re-derived from the original caller and filtered by what the previous agent
+  held, so it can only shrink. The result records the `path`. A declared tool
+  that collides with a handoff's `transfer_to_<name>` is a boot error.
+- **Flows.** `app.flow(name, pipeline=[...] | parallel=[...] | route={...})`
+  declares an orchestration as data, executed in Rust. Steps are any tools;
+  agent results are unwrapped for the next step; `{"tool": ..., "input": {...}}`
+  maps arguments with `$`, `$.path`, `$input` and `$input.path`. Routers
+  classify with a forced structured call on the `fast` tier and fall back to
+  `default`. A flow is itself a tool and a route.
+- **Sessions.** Agent routes accept `session_id` (and `reset`); the
+  conversation is kept between requests, keyed by principal as well as id;
+  anonymous callers, who all share one identity, are refused a session.
+  In memory, bounded (`session_capacity`) and expiring (`session_ttl_secs`).
+- **Approvals that resume.** `GET /_webcortex/approvals` lists suspended
+  runs; `POST /_webcortex/approvals/{id}` with `{"approve": bool, "note"}`
+  continues one — executing or refusing the gated call, then the **rest of
+  the interrupted turn**, then the loop. A denial reaches the model as a tool
+  error carrying the note. Decisions are consumed; runs expire after
+  `approval_ttl_secs`.
+- **A shared budget.** The outermost agent, behaviour or flow creates a
+  `SharedBudget` from its `token_budget`; it travels with every in-process
+  call, and nested runs charge the same counter. `usage.tree_tokens` reports
+  the total. This generalises the 0.3 depth counter: a per-frame limit is not
+  a per-request limit. Token arithmetic saturates, so an upstream reporting an
+  absurd `usage` cannot wrap the counter and reopen an exhausted budget.
+- `ctx.gather(...)` and `ctx.ask_many(...)` run tool calls and model calls
+  concurrently from a behaviour — one wait instead of a loop of round trips —
+  with the same admission, scoping, gating and charging as `call` and `ask`.
+- `WebCortex(agent_timeout=600)`: agent, flow and behaviour routes have their
+  own ceiling. They used to share the 30-second `request_timeout`, which cut a
+  multi-step run off with a 504 and lost it.
+
+### Added — token economy
+
+- `app.models(**aliases)`: name tiers once (`default`, `fast`, `local`, …)
+  and use them anywhere a model is named. `default` and `fast` are built in.
+- **OpenAI-compatible provider**, selected by prefix (`ollama/…`, `openai/…`,
+  `gpt-*`, or a name from `app.provider(...)`). This is how Ollama, vLLM,
+  LM Studio, Groq and OpenRouter arrive. `ollama/<model>` needs no key.
+  Conversations stay in one canonical shape; the provider translates at its
+  boundary, so a session can move between providers.
+- **Prompt caching** on Anthropic (`cache=True`, the default): the system
+  prompt, context and tool definitions are cached across the steps of a run.
+  Usage reports `cache_read_tokens` and `cache_write_tokens`.
+- **Tool-result bounding.** `tool_result_limit` (default 16 KB) caps what the
+  model sees of any result, with a marker; the step record keeps the whole
+  value.
+- **Compaction.** `context_window` is checked against the *measured* input of
+  the last call; older turns are summarised with `compact_with` (default the
+  `fast` alias), keeping `keep_recent` messages verbatim. The cut lands on an
+  assistant turn so tool pairs stay intact. A failed compaction is recorded
+  as a step naming the model, and the run continues uncompacted; the next
+  attempt waits 2, then 4, 8… steps, so a summariser that keeps failing is not
+  called on every remaining step.
+- **The ledger.** `GET /_webcortex/usage` reports tokens by caller and model,
+  and dollars only from prices declared with `app.pricing(...)` — `null`, not
+  zero, where none are.
+- Structured output is now *forced* (`tool_choice`) on both providers, and
+  JSON is recovered from prose or code fences when a small local model answers
+  in text.
+
+### Added — context and memory
+
+- `app.context(name, sql=|data=|@decorator)`: named providers resolved at run
+  start and injected into the system prompt as delimited blocks, bounded by
+  `max_chars`. Agents name them with `context=[...]`; behaviours read them with
+  `ctx.context(name)` and may only read what they declared.
+- `app.memory(name)`: a per-principal key-value store as four Rust-executed
+  tools (`remember`, `recall`, `search`, `forget`). `app.agent(memory=...)`
+  adds them plus a usage hint. Memory, and any route that binds `@principal`,
+  answers 401 to anonymous callers for the same reason; a context provider
+  binds it as NULL for them.
+- `@principal` binds the **root** principal — the human behind any chain of
+  agent delegation — in `app.query` and `app.context` parameters.
+
+### Added — AI-native development
+
+- `webcortex context`: the context pack — the app described for a coding
+  model, derived from the manifest, plus a cheat sheet of the API.
+- `webcortex evolve "..."`: a model proposes an extension anchored on the
+  context pack, using the app's own aliases and providers (so `--model fast`
+  can be a local model). Prints a proposal; never edits files.
+- `webcortex new --template orchestration`.
+- `scout/`: a stdlib-only local-model reviewer for this repository, with a
+  launchd installer, that appends suggestions to a Markdown file.
+- `WEBCORTEX_FAKE_PROVIDER=1` selects a deterministic fake provider, and
+  `tests/test_orchestration.py` drives handoffs, sessions, approval resume,
+  flows, memory, context, `gather`, `ask_many` and the ledger over HTTP with
+  no key. Agents were previously untested end to end.
+- Control plane: `/flows`, `/contexts`, `/models`, `/usage`, `/approvals`.
+  `/health` counts flows, sessions and pending approvals.
+
+### Changed
+
+- **An agent without `expose_at` now has a route** at `/agents/<name-with-hyphens>`,
+  guarded by `expose_scopes` (default `scopes`). An agent declared with no
+  scopes is therefore a public route; `webcortex security` reports it.
+- `app.agent(model=...)` is optional and defaults to the `default` alias;
+  `@app.behaviour(model=...)` likewise.
+- A missing `input` on an agent route is a 400, not a 500.
+- An app with agents but no hosted key boots without the previous warning
+  when a local model could serve them; a run that needs a missing key fails
+  with a message naming the variable.
+- `Request.user` exists (it was documented in 0.3 but not implemented).
+- The agent runtime now propagates nesting depth into its tool calls. In 0.3
+  it reset depth to zero, so an agent calling a behaviour calling the agent
+  bypassed the nesting ceiling that behaviours alone respected.
+- Unused dependencies are gone: five Rust crates (`anyhow`, `thiserror`,
+  `hmac`, `async-stream`, `pin-project-lite`), four features nothing used
+  (sqlx `json` and `macros`, reqwest `stream` and `charset`), and `httpx` from
+  the `dev` extra.
+- `app.check()` no longer embeds a full OpenAPI document that nothing read
+  (every banner and `webcortex check` built one); `app.openapi()` has it.
+- The manifest no longer carries fields the runtime never read: `stream` on
+  agent ops (results are not streamed yet), `handler` on behaviour ops (it is
+  on the behaviour), `validate_body` on routes (body validation was never
+  implemented) and `server.python_workers` (workers are passed to `serve`).
+- Naming a behaviour declared with `tool=False` in an agent's or a
+  behaviour's `tools` is a boot error. It used to pass `check()` and then
+  never be callable.
+- `temperature` is unset by default and sent only when an agent or behaviour
+  sets it: Claude Opus 5, Opus 4.7/4.8 and Sonnet 5 reject sampling parameters
+  with a 400. Compaction, flow routing and `evolve` no longer set one.
+  `max_tokens` defaults to 16,000 (4,096 left a thinking model little room for
+  its answer), and a response cut off at `max_tokens` ends the run with status
+  `max_tokens` instead of `completed`, without running any tool call in it.
+
+### Fixed
+
+- Percent-decoding panicked on a `%` followed by a multi-byte character (a 500
+  through the request path's panic boundary). The three copies of the decoder,
+  for query strings, the file server and the proxy path-traversal check, are
+  now one that works on bytes.
+- A behaviour treated any failed tool call whose error mentioned "508" (say,
+  "order 5080 not found") as the nesting ceiling and halted, instead of
+  raising an exception it could catch. It now matches the status the runtime
+  reports.
+- `security_report()["gated_tools"]`, and with it `webcortex check`, the
+  startup banner and the context pack, listed a gated route without an
+  explicit `tool_name` as `METHOD /path`. It now uses the tool name agents
+  call, as `/_webcortex/security` always did.
+- A handler parameter annotated `Request` in a module that uses
+  `from __future__ import annotations` was bound as an ordinary required
+  input instead of receiving the request. Annotations are resolved first now.
+- The `webcortex dev` / `run` banner printed the declared host and port even
+  when `WEBCORTEX_HOST` or `WEBCORTEX_PORT` moved the server. It prints the
+  address that binds.
+- `sqlite://:memory:` served no tables: `run()` applied the DDL on its own
+  `sqlite3` connection, a separate database the runtime never saw. The runtime
+  now applies the DDL through its pool at startup, and holds an in-memory
+  database on one long-lived connection so every request sees the same data.
+- A body over the 32 MB limit could get a connection reset instead of its
+  413: the server stopped reading and closed while the client was still
+  sending. It now reads and discards up to 8 MB more (for at most 2 s) before
+  answering, so the 413 arrives; a larger overshoot is still cut off.
+
+### Security
+
+- `rustls` 0.23.43 → 0.23.45 (and `rustls-webpki` 0.103.13 → 0.103.15 with
+  it) in `Cargo.lock` for [RUSTSEC-2026-0285]: TLS 1.3 handshake messages were
+  accepted across encryption-level boundaries. The advisory was published on
+  14 September, after this release was reviewed, and the release gate's
+  `cargo audit` rightly refused it. `rustls` is transitive, via reqwest's TLS
+  for outbound calls to model providers and proxied upstreams; no API is
+  involved.
+
+[RUSTSEC-2026-0285]: https://rustsec.org/advisories/RUSTSEC-2026-0285
+
+### Verified
+
+355 tests (106 Rust, 249 Python). Clippy clean. `cargo audit` reports no
+vulnerabilities.
 
 ## [0.3.2] — 2026-08-31
 

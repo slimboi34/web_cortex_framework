@@ -44,7 +44,7 @@ Verify:
 ```console
 $ .venv/bin/webcortex --help
 $ .venv/bin/python -c "import webcortex; print(webcortex.__version__)"
-0.3.1
+2.0.0
 ```
 
 ## Free-threaded Python
@@ -119,7 +119,7 @@ $ export WEBCORTEX_API_KEY=$(webcortex keygen)
 $ webcortex dev
 ```
 
-Four starters are available:
+Five starters are available:
 
 | Template | What you get |
 |---|---|
@@ -127,6 +127,7 @@ Four starters are available:
 | `fullstack` | The above, plus server-rendered pages and static assets |
 | `agent` | The above, plus an agent with an approval-gated tool |
 | `behaviour` | The above, plus Behaviours — programmable procedures |
+| `orchestration` | Handoffs, flows, memory, context providers and a local-model tier |
 
 Every starter boots with authentication, rate limiting, and security headers
 already enabled. A starter that generates an insecure app teaches an insecure

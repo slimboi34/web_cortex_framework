@@ -42,13 +42,28 @@ probabilistic, which is the opposite of the usual arrangement and the reason a
 behaviour can be given a budget, a scope set, and an audit trail that mean
 something.
 
-Everything else in this document is downstream of those three ideas.
+**Consequence D — composition is a property of the runtime, not of the prompt.**
+Once every agent, behaviour and flow is a route, a supervisor is a tool list,
+a handoff is a tool the runtime interprets, and a pipeline is data. What makes
+that safe rather than merely convenient is that the runtime carries three
+things through every in-process call: the delegated principal (authority only
+shrinks), the nesting depth (cycles are bounded), and a shared token budget
+(the tree spends against one ceiling). None of those can be forgotten by a
+prompt or a generated file, because none of them live there.
+
+**Consequence E — the application should describe itself to the model writing
+it.** A framework built to be authored with a model should be small enough to
+hold in a prompt. The context pack is the manifest rendered for that purpose;
+`webcortex evolve` is the loop that uses it. The framework's own review loop
+(`scout/`) is the same idea applied to the repository.
+
+Everything else in this document is downstream of those five ideas.
 
 ---
 
 ## 2. What exists and has been measured
 
-Working today, with **66 Rust tests and 104 Python tests** passing and clippy
+Working today, with **106 Rust tests and 249 Python tests** passing and clippy
 clean:
 
 **Runtime**
@@ -67,17 +82,34 @@ clean:
 - Static server hardened against traversal, symlink escape, and dotfile leaks
 
 **Agents and Behaviours**
-- Tool loop with an Anthropic provider and a scripted provider for tests
-- Scope delegation by intersection; approval gates; step and token budgets
+- Tool loop with two providers — Anthropic Messages, and OpenAI Chat
+  Completions for Ollama, vLLM, LM Studio, OpenAI, Groq, OpenRouter — chosen by
+  model-name prefix through a registry with aliases (`default`, `fast`, …)
+- Scope delegation by intersection; approval gates that suspend a run and
+  **resume** it after a human decides, including the rest of the interrupted
+  turn; step budgets per run and a token budget **shared by the request tree**
+- Handoffs between agents; every agent, behaviour and flow is a tool, so
+  supervisors are a tool list; multi-turn sessions keyed by principal
+- Context bounding: tool results capped before the model sees them, and
+  conversation compaction against the measured input size
+- Context providers (constant / SQL / Python) and a per-principal memory as
+  four Rust-executed tools
+- Flows — pipeline, parallel, route — executed in Rust
 - Behaviours: Python control flow bridged back into the runtime, exposed as
-  tools, composable, with the same budgets, scopes, gates, and audit
-- Audit trail including refused calls
+  tools, composable, with the same budgets, scopes, gates, and audit; `gather`
+  and `ask_many` run leaves concurrently
+- Prompt caching on Anthropic; a spend ledger by caller and model
+- Audit trail including refused calls, handoffs, compactions and decisions
+- A deterministic fake provider so the whole stack is tested end to end over
+  HTTP with no key
 
 **Developer surface**
 - OpenAPI 3.1, MCP (`initialize`, `tools/list`, `tools/call`, batching,
   notifications), TypeScript client generation
 - `webcortex` CLI: `new`, `dev`, `run`, `check`, `security`, `openapi`, `tools`,
-  `typegen`, `sql`, `keygen`
+  `typegen`, `sql`, `keygen`, `context`, `evolve`
+- The context pack and `webcortex evolve`; the scout
+
 
 ### Measured numbers
 
@@ -151,10 +183,12 @@ Graded by risk of *not working well*, not by effort.
 
 | Component | Risk | The honest assessment |
 |---|---|---|
-| **Agent runtime in Rust** | **Medium–High** | The loop itself (call model → parse tool calls → dispatch → repeat) is easy; the runtime already has in-process tool dispatch, which is the valuable half. The hard parts are provider drift (every vendor's streaming tool-call format differs and changes), and cancellation/timeout semantics mid-stream. Mitigation: implement one provider properly rather than a leaky universal abstraction. |
+| **Agent runtime in Rust** | **Shipped; medium ongoing risk** | The loop, handoffs, compaction and approval resume are done and tested. The remaining risk is provider drift: two wire formats are implemented properly and a third is refused on principle. Non-streaming keeps cancellation simple — a request timeout bounds a hung provider — and is why token streaming is still deferred. |
+| **Orchestration (flows, shared budget)** | **Shipped, low ongoing risk** | Flows are data executed by the same dispatcher; the shared budget is an `Arc` on the request. The one genuinely subtle part — resuming a run mid-turn after an approval — is covered by tests for the approve and deny paths. |
+| **Compaction** | **Shipped, medium ongoing risk** | Correctness depends on cutting where the provider allows (an assistant turn, so tool pairs stay intact) and on the summariser preserving what later steps need. The first is enforced; the second is a prompt, and prompts are the probabilistic part. Mitigation: `keep_recent` keeps the tail verbatim, and every compaction is a visible step. |
 | **Behaviour runtime** | **Shipped, low ongoing risk** | The bridge is `Handle::block_on` from Python worker threads, which are deliberately not tokio contexts. The design constraint that keeps it sound: behaviours run on the thread pool, never on a shared event loop, because `ctx.call` blocks. Budgets, scope checks, and approval gates all sit on the Rust side of the boundary rather than being enforced in Python, so a behaviour cannot talk its way past them. |
-| **Durable / resumable agent runs** | **High** | This is what separates a demo from production: checkpointing each step so a run survives a deploy. It is essentially building a small workflow engine, and getting exactly-once tool execution right is genuinely hard. **Recommendation: do not build this in v1.** Make agent runs explicitly ephemeral and say so. |
-| **Local model hosting** | **High** | You asked about running local agents in-process. Be precise about what is feasible: *supervising* a llama.cpp or vLLM sidecar and routing to it over an OpenAI-compatible socket is very doable (Tier 2, honestly). *Embedding* inference in the server process, with GPU memory management and continuous batching, is a different project — that is what vLLM is, and it is years of work. **Recommendation: supervise, never embed.** |
+| **Durable / resumable agent runs** | **High** | This is what separates a demo from production: checkpointing each step so a run survives a deploy. It is essentially building a small workflow engine, and getting exactly-once tool execution right is genuinely hard. v2 resumes a run *within* a process (approvals, sessions) and says plainly that neither survives a restart. **Recommendation: still do not build the durable version until there is a real design for exactly-once tool execution.** |
+| **Local models** | **Shipped as routing, not hosting** | `ollama/<model>` and any OpenAI-compatible endpoint work today with no key. *Embedding* inference in the server process, with GPU memory management and continuous batching, is a different project — that is what vLLM is. **Supervise or route to a sidecar; never embed.** Process supervision of the sidecar itself is not built and probably should not be: `ollama serve` and systemd already do it. |
 | **Own ORM** | **High** | See §5. |
 
 ---
@@ -201,7 +235,20 @@ Migrations must be versioned, reviewable, and explicit.
 tool-call format differs and changes underneath you. One provider done properly
 beats five done leakily.
 
-**Do not embed inference.** Supervise a sidecar. See Tier 3.
+**Do not embed inference.** Route to a sidecar. See Tier 3.
+
+**Do not build in model prices.** They change monthly; a stale number is worse
+than none. `app.pricing` is the operator's statement, and the ledger reports
+`null` rather than zero for anything unpriced.
+
+**Do not build a vector store.** `app.memory` is substring search over a
+table, on purpose. Semantic retrieval belongs in a Python handler over the
+embedding store the operator already runs.
+
+**Do not build a third provider abstraction.** Two wire formats cover
+Anthropic and everything OpenAI-compatible, which is everything that matters
+locally. A universal layer would hide exactly the differences (tool-choice
+forcing, cache semantics, usage fields) that the token economy depends on.
 
 ---
 
@@ -220,23 +267,30 @@ Ordered by what unblocks the most.
 ✅ Behaviours: programmable procedures with deterministic control flow,
    composable, budget-capped, and exposed as tools.
 
-**v0.4 — the streaming release**
-5. SSE responses. Agent token streaming depends on it, and it is invasive
-   enough that delaying it makes it worse.
-6. Postgres dialect.
-7. Session cookies + CSRF, so the page layer is usable for real apps.
-8. Resume an agent run after an approval is granted. The gate records the
-   request today; the resume endpoint is not wired up, so a gated run currently
-   ends rather than continuing. **This is the most visible unfinished edge.**
+**v2.0 — shipped: the orchestration generation**
+✅ Agents as tools, handoffs, flows (pipeline / parallel / route), sessions,
+   approvals that resume mid-turn, a shared budget across the request tree,
+   tool-result bounding and compaction, context providers, memory, a second
+   wire format (OpenAI-compatible, which is how local models arrive), prompt
+   caching, the spend ledger, `gather` / `ask_many`, the context pack and
+   `evolve`, an offline end-to-end suite, and the scout.
 
-**v0.5 — operational depth**
-9. Local model *supervision* (sidecar process management + routing).
-10. `webcortex.toml` for environment/deploy configuration.
-11. A real load benchmark against Django and FastAPI (see §2).
+**v2.1 — the streaming release**
+5. SSE step events on agent and flow routes, then token deltas. The response
+   body has to become a stream; that touches every op signature and is the
+   most invasive change left, so it goes first.
+6. Postgres dialect for `Query`, memory and context providers.
+7. Session cookies + CSRF, so the page layer is usable for public apps.
+
+**v2.2 — operational depth**
+8. Trusted-proxy configuration for the rate limiter.
+9. `webcortex.toml` for environment/deploy configuration.
+10. A real load benchmark against Django and FastAPI (see §2).
+11. Ledger export (OpenTelemetry metrics) so spend leaves the process.
 
 **Later, if warranted**
 12. Durable agent runs — only with a real design for exactly-once tool
-    execution.
+    execution. Sessions and approvals stay in memory until then, and say so.
 
 ---
 
@@ -265,7 +319,9 @@ same bug a crash loop instead of a contained 500.
 The novel, defensible idea here is **"declared once, executed by Rust, callable
 by agents"** — and it is demonstrated working end to end today, not sketched.
 The free-threading result (4.82x vs 1.38x) is real and measured, and it is the
-technical justification for the whole approach.
+technical justification for the whole approach. v2 adds the second idea:
+**composition belongs to the runtime.** A supervisor, a handoff, a pipeline
+and a budget are things the dispatcher carries, not things a prompt promises.
 
 The performance story against Django/FastAPI is **not yet proven** — the current
 benchmark is client-limited and a proper one is owed.
@@ -278,14 +334,17 @@ tests while building v0.2 — MCP substituting route scopes for caller scopes,
 creating an unauthenticated agent endpoint. That is the argument for the test
 suite, not for the absence of remaining bugs.
 
-**Known unfinished edges**, stated plainly: a gated agent run records its
-approval request and stops, but cannot yet be resumed; the Anthropic provider is
-not exercised against the live API in CI, so `ctx.ask` and the agent loop are
-tested against a scripted provider rather than the real one; there is no CSRF or
-session support, so the page layer suits internal tools more than public
-authenticated apps; and a Behaviour holds a worker thread for its whole run,
-which is fine for procedures measured in seconds and wrong for ones measured in
-hours.
+**Known unfinished edges**, stated plainly: neither provider is exercised
+against a live API in CI, so the agent loop is tested against a scripted
+provider in Rust and a deterministic fake over HTTP rather than the real
+thing; sessions and suspended approvals live in memory and do not survive a
+restart; responses are returned whole, with no token streaming; there is no
+CSRF or cookie-session support, so the page layer suits internal tools more
+than public authenticated apps; compaction quality depends on a summarisation
+prompt, which is the probabilistic part of an otherwise deterministic loop;
+and a Behaviour holds a worker thread for its whole run, which is fine for
+procedures measured in seconds and wrong for ones measured in hours.
+
 
 The largest genuine risk is still not technical, it is scope. A framework that
 also tries to be an ORM, a migration tool, a workflow engine, and an inference

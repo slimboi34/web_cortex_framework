@@ -6,18 +6,19 @@
 //! implementation for agents to drift away from, and in particular no second
 //! place where an authorization check could be forgotten.
 
-use crate::agent::{AgentRuntime, RunResult};
+use crate::agent::{AgentRuntime, ProviderRegistry, RunOptions, RunResult, SessionStore, SharedBudget, SuspendedRun};
 use crate::audit::{AuditSink, MemoryAudit};
 use crate::auth::{Authenticator, Principal};
 use crate::bridge::{NoBridge, PyBridge};
 use crate::files::FileServer;
 use crate::http::{WebCortexRequest, WebCortexResponse};
+use crate::ledger::Ledger;
 use crate::manifest::{Manifest, Op, PageData, Route};
 use crate::middleware::{Cors, RateLimiter};
 use crate::router::{MatchError, Router};
 use crate::templates::Templates;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(feature = "sqlite")]
@@ -41,8 +42,13 @@ pub struct App {
     file_servers: HashMap<u32, FileServer>,
     pub audit: Arc<dyn AuditSink>,
     agent_runtime: Option<AgentRuntime>,
-    provider: Option<Arc<dyn crate::agent::ModelProvider>>,
+    registry: Arc<ProviderRegistry>,
+    provider: Arc<dyn crate::agent::ModelProvider>,
     behaviours: HashMap<String, crate::manifest::BehaviourDef>,
+    ledger: Arc<Ledger>,
+    sessions: SessionStore,
+    /// Runs waiting on a human. Bounded and expired by `approval_ttl_secs`.
+    approvals: Mutex<HashMap<String, SuspendedRun>>,
     /// Set once the App is wrapped in an Arc. A Behaviour needs a handle to the
     /// application in order to call tools, and that reference is necessarily
     /// cyclic; a Weak keeps it from leaking.
@@ -119,28 +125,29 @@ impl App {
 
         let audit: Arc<dyn AuditSink> = Arc::new(MemoryAudit::default());
 
-        // An app with declared agents but no API key still boots; the agent
-        // routes report a clear 503 instead of the process refusing to start.
-        let needs_model = !manifest.agents.is_empty() || !manifest.behaviours.is_empty();
-        let provider: Option<Arc<dyn crate::agent::ModelProvider>> = if needs_model {
-            match crate::agent::provider::AnthropicProvider::from_env() {
-                Some(p) => Some(Arc::new(p)),
-                None => {
-                    tracing::warn!(
-                        "agents or behaviours are declared but ANTHROPIC_API_KEY is unset; \
-                         model-backed routes will fail until it is set"
-                    );
-                    None
-                }
+        // Model access is resolved per call, by name, so an app with declared
+        // agents and no key still boots; a run that needs a missing key fails
+        // with a message naming the variable, and everything else keeps
+        // serving. Ollama needs no key, so local models always resolve.
+        let registry = Arc::new(ProviderRegistry::from_env(&manifest.models));
+        let needs_model = !manifest.agents.is_empty()
+            || !manifest.behaviours.is_empty()
+            || !manifest.flows.is_empty();
+        if needs_model {
+            let d = registry.describe();
+            let hosted = d["anthropic"] == true || d["openai"] == true || d["fake"] == true;
+            if !hosted {
+                tracing::warn!(
+                    "agents, behaviours or flows are declared but neither ANTHROPIC_API_KEY \
+                     nor OPENAI_API_KEY is set; only prefixed local models (ollama/…) and \
+                     declared providers will resolve"
+                );
             }
-        } else {
-            None
-        };
-
-        let agent_runtime = provider
-            .clone()
-            .filter(|_| !manifest.agents.is_empty())
-            .map(|p| AgentRuntime::new(p, audit.clone()));
+        }
+        let provider: Arc<dyn crate::agent::ModelProvider> = registry.clone();
+        let agent_runtime = Some(AgentRuntime::new(provider.clone(), audit.clone()));
+        let ledger = Arc::new(Ledger::default());
+        let sessions = SessionStore::new(manifest.server.session_capacity, manifest.server.session_ttl_secs);
 
         let behaviours: HashMap<String, crate::manifest::BehaviourDef> = manifest
             .behaviours
@@ -170,8 +177,12 @@ impl App {
             file_servers,
             audit,
             agent_runtime,
+            registry,
             provider,
             behaviours,
+            ledger,
+            sessions,
+            approvals: Mutex::new(HashMap::new()),
             self_ref: std::sync::OnceLock::new(),
         })
     }
@@ -193,8 +204,83 @@ impl App {
             .ok_or_else(|| "app was not created with App::into_arc()".to_string())
     }
 
-    pub fn provider(&self) -> Option<&Arc<dyn crate::agent::ModelProvider>> {
-        self.provider.as_ref()
+    pub fn provider(&self) -> &Arc<dyn crate::agent::ModelProvider> {
+        &self.provider
+    }
+
+    pub fn registry(&self) -> &ProviderRegistry {
+        &self.registry
+    }
+
+    pub fn ledger(&self) -> &Ledger {
+        &self.ledger
+    }
+
+    pub fn sessions(&self) -> &SessionStore {
+        &self.sessions
+    }
+
+    pub fn agent_runtime(&self) -> Option<&AgentRuntime> {
+        self.agent_runtime.as_ref()
+    }
+
+    /// Park a run that is waiting on a human.
+    pub fn suspend(&self, run: SuspendedRun) {
+        let ttl = Duration::from_secs(self.manifest.server.approval_ttl_secs);
+        let mut map = self.approvals.lock().unwrap_or_else(|p| p.into_inner());
+        map.retain(|_, r| r.created.elapsed() <= ttl);
+        if map.len() >= 1000 {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, r)| r.created)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(run.approval_id.clone(), run);
+    }
+
+    /// Everything currently waiting on a human, oldest first.
+    pub fn pending_approvals(&self) -> Vec<serde_json::Value> {
+        let ttl = Duration::from_secs(self.manifest.server.approval_ttl_secs);
+        let mut map = self.approvals.lock().unwrap_or_else(|p| p.into_inner());
+        map.retain(|_, r| r.created.elapsed() <= ttl);
+        let mut runs: Vec<&SuspendedRun> = map.values().collect();
+        runs.sort_by_key(|r| r.created);
+        runs.iter().map(|r| r.summary()).collect()
+    }
+
+    /// Approve or deny a suspended run and continue it. The decision is
+    /// consumed: a second call with the same id is an error.
+    pub async fn resolve_approval(
+        &self,
+        approval_id: &str,
+        approve: bool,
+        note: &str,
+        approver: &Principal,
+    ) -> Result<RunResult, String> {
+        let run = {
+            let mut map = self.approvals.lock().unwrap_or_else(|p| p.into_inner());
+            map.remove(approval_id)
+        }
+        .ok_or_else(|| format!("no pending approval {approval_id:?}; it may have expired or already been decided"))?;
+        let runtime = self
+            .agent_runtime
+            .as_ref()
+            .ok_or("agent runtime is unavailable")?;
+        self.audit.record(crate::audit::AuditEvent {
+            kind: "approval_resolved".into(),
+            run_id: String::new(),
+            actor: Some(approver.id.clone()),
+            tool: None,
+            detail: serde_json::json!({
+                "approval_id": approval_id,
+                "approved": approve,
+                "on_behalf_of": run.caller().id,
+            }),
+        });
+        Ok(runtime.resume_approval(self, run, approve, note).await)
     }
 
     pub fn behaviour(&self, name: &str) -> Option<&crate::manifest::BehaviourDef> {
@@ -205,8 +291,9 @@ impl App {
         Self::build(manifest, Arc::new(NoBridge)).await
     }
 
-    /// Swap in a deterministic provider. Used by tests and `webcortex dev --offline`.
+    /// Swap in a deterministic provider. Used by tests.
     pub fn with_agent_runtime(mut self, rt: AgentRuntime) -> Self {
+        self.provider = rt.provider().clone();
         self.agent_runtime = Some(rt);
         self
     }
@@ -222,6 +309,16 @@ impl App {
 
     pub fn route(&self, id: u32) -> Option<&Route> {
         self.routes_by_id.get(&id)
+    }
+
+    /// True when `method path` runs a model loop — an agent, a flow or a
+    /// behaviour — and so is bounded by `agent_timeout_secs`.
+    pub fn runs_a_model_loop(&self, method: &str, path: &str) -> bool {
+        self.router
+            .find(method, path)
+            .ok()
+            .and_then(|m| self.routes_by_id.get(&m.route_id))
+            .is_some_and(|r| matches!(r.op, Op::Agent { .. } | Op::Flow { .. } | Op::Behaviour { .. }))
     }
 
     pub fn route_for_tool(&self, name: &str) -> Option<&Route> {
@@ -297,6 +394,9 @@ impl App {
             Op::Python { handler } => self.bridge.call(*handler, req).await,
 
             Op::Query { sql, params, returns } => {
+                if binds_principal(params) && req.principal.root_is_anonymous() {
+                    return Ok(anonymous_principal_refused());
+                }
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.as_ref().ok_or("no database configured")?;
@@ -350,13 +450,33 @@ impl App {
                 }
                 self.run_behaviour(behaviour, req).await
             }
+
+            Op::Flow { flow } => {
+                if let Some(res) = self.depth_exceeded(&req) {
+                    return Ok(res);
+                }
+                self.run_flow(flow, req).await
+            }
+        }
+    }
+
+    async fn run_flow(&self, name: &str, req: WebCortexRequest) -> Result<WebCortexResponse, String> {
+        let def = self
+            .manifest
+            .flow(name)
+            .ok_or_else(|| format!("unknown flow {name:?}"))?
+            .clone();
+        let input = req.json_body().unwrap_or(serde_json::Value::Null);
+        match crate::flow::run(self, &def, input, &req.principal, req.depth, req.budget.clone()).await {
+            Ok(value) => Ok(WebCortexResponse::json(200, &value)),
+            Err(e) => Ok(WebCortexResponse::error(500, e)),
         }
     }
 
     /// Refuse an invocation nested deeper than the configured ceiling.
     ///
-    /// Checked only for behaviour and agent ops, because those are the ones that
-    /// can re-enter the dispatcher and form a cycle.
+    /// Checked for agent, behaviour and flow ops, because those are the ones
+    /// that can re-enter the dispatcher and form a cycle.
     fn depth_exceeded(&self, req: &WebCortexRequest) -> Option<WebCortexResponse> {
         let max = self.manifest.server.max_invocation_depth;
         if req.depth < max {
@@ -405,9 +525,13 @@ impl App {
         });
 
         let app = self.arc_self()?;
+        let budget = req
+            .budget
+            .clone()
+            .unwrap_or_else(|| SharedBudget::new(format!("behaviour:{}", def.name), def.token_budget));
         match self
             .bridge
-            .call_behaviour(app, def.clone(), input, actor.clone(), req.depth + 1)
+            .call_behaviour(app, def.clone(), input, actor.clone(), req.depth + 1, budget)
             .await
         {
             Ok(value) => Ok(WebCortexResponse::json(200, &value)),
@@ -442,6 +566,9 @@ impl App {
                 context.insert("data".into(), value.clone());
             }
             PageData::Query { sql, params, returns, bind } => {
+                if binds_principal(params) && req.principal.root_is_anonymous() {
+                    return Ok(anonymous_principal_refused());
+                }
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.as_ref().ok_or("no database configured")?;
@@ -497,30 +624,44 @@ impl App {
 
     async fn run_agent(&self, name: &str, req: WebCortexRequest) -> Result<WebCortexResponse, String> {
         let Some(runtime) = &self.agent_runtime else {
-            return Ok(WebCortexResponse::error(
-                503,
-                "agent runtime is unavailable; set ANTHROPIC_API_KEY to enable agents",
-            ));
+            return Ok(WebCortexResponse::error(503, "agent runtime is unavailable"));
         };
         let def = self
             .agent(name)
             .ok_or_else(|| format!("unknown agent {name:?}"))?;
 
-        let input = req
-            .lookup("input")
-            .and_then(|v| v.as_str().map(str::to_string))
-            .ok_or("agent invocation requires an 'input' string")?;
-
-        let result = runtime.run(self, def, &req.principal, &input).await;
-        let status = match result.status {
-            crate::agent::RunStatus::Failed => 502,
-            crate::agent::RunStatus::AwaitingApproval => 202,
-            _ => 200,
+        let Some(input) = req.lookup("input").and_then(|v| v.as_str().map(str::to_string)) else {
+            return Ok(WebCortexResponse::error(
+                400,
+                "agent invocation requires an 'input' string",
+            ));
         };
-        Ok(WebCortexResponse::json(
-            status,
-            &serde_json::to_value(&result).map_err(|e| e.to_string())?,
-        ))
+        let session_id = req
+            .lookup("session_id")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty());
+        let reset_session = req
+            .lookup("reset")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Every anonymous caller is the same `anonymous` principal, so a session
+        // keyed by it would be one conversation shared by strangers.
+        if session_id.is_some() && req.principal.root_is_anonymous() {
+            return Ok(WebCortexResponse::error(
+                401,
+                "sessions need an authenticated caller: anonymous callers share one identity, \
+                 so they would share one conversation",
+            ));
+        }
+
+        let opts = RunOptions {
+            depth: req.depth,
+            budget: req.budget.clone(),
+            session_id,
+            reset_session,
+        };
+        let result = runtime.run(self, def, &req.principal, &input, opts).await;
+        Ok(run_result_response(&result))
     }
 
     /// Run an agent directly. Used by the control plane and by tests.
@@ -529,13 +670,14 @@ impl App {
         name: &str,
         input: &str,
         caller: &Principal,
+        opts: RunOptions,
     ) -> Result<RunResult, String> {
         let runtime = self
             .agent_runtime
             .as_ref()
-            .ok_or("agent runtime is unavailable; set ANTHROPIC_API_KEY")?;
+            .ok_or("agent runtime is unavailable")?;
         let def = self.agent(name).ok_or_else(|| format!("unknown agent {name:?}"))?;
-        Ok(runtime.run(self, def, caller, input).await)
+        Ok(runtime.run(self, def, caller, input, opts).await)
     }
 
     async fn proxy(
@@ -658,7 +800,21 @@ impl App {
         principal: &'a Principal,
         depth: u32,
     ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
-        Box::pin(async move { self.call_tool_inner(tool_name, args, principal, depth).await })
+        self.call_tool_in_tree(tool_name, args, principal, depth, None)
+    }
+
+    /// The full in-process call: depth *and* the request tree's shared budget,
+    /// so a nested agent or behaviour spends against the same ceiling as the
+    /// thing that called it.
+    pub fn call_tool_in_tree<'a>(
+        &'a self,
+        tool_name: &'a str,
+        args: &'a serde_json::Value,
+        principal: &'a Principal,
+        depth: u32,
+        budget: Option<Arc<SharedBudget>>,
+    ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
+        Box::pin(async move { self.call_tool_inner(tool_name, args, principal, depth, budget).await })
     }
 
     async fn call_tool_inner(
@@ -667,6 +823,7 @@ impl App {
         args: &serde_json::Value,
         principal: &Principal,
         depth: u32,
+        budget: Option<Arc<SharedBudget>>,
     ) -> Result<serde_json::Value, String> {
         let route_id = *self
             .tools_by_name
@@ -715,6 +872,7 @@ impl App {
             route_id: Some(route_id),
             principal: principal.clone(),
             depth,
+            budget,
         };
 
         let res = self.dispatch(req).await;
@@ -746,6 +904,35 @@ impl App {
     }
 }
 
+/// HTTP status for an agent run: 202 while a human is being waited on, 502
+/// when the model side failed, 200 otherwise (including limits, which are
+/// outcomes rather than errors).
+pub fn run_result_response(result: &RunResult) -> WebCortexResponse {
+    let status = match result.status {
+        crate::agent::RunStatus::Failed => 502,
+        crate::agent::RunStatus::AwaitingApproval => 202,
+        _ => 200,
+    };
+    match serde_json::to_value(result) {
+        Ok(v) => WebCortexResponse::json(status, &v),
+        Err(e) => WebCortexResponse::error(500, e.to_string()),
+    }
+}
+
+/// Whether a declared query binds the caller's identity.
+fn binds_principal(params: &[String]) -> bool {
+    params.iter().any(|p| p == "@principal")
+}
+
+/// Every anonymous caller shares the id `anonymous`, so a route scoped to
+/// `@principal` would pool their data. It needs a real caller instead.
+fn anonymous_principal_refused() -> WebCortexResponse {
+    WebCortexResponse::error(
+        401,
+        "this route is scoped to the caller (@principal) and needs an authenticated caller",
+    )
+}
+
 /// True when a value could alter the structure of a URL path it is spliced into.
 ///
 /// Deliberately blunt: a path *parameter* is a single segment, so a slash or a
@@ -767,30 +954,8 @@ fn is_traversal(value: &str) -> bool {
 }
 
 fn percent_decode_twice(s: &str) -> String {
-    fn once(s: &str) -> String {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    Ok(b) => {
-                        out.push(b);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-            } else {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-    once(&once(s))
+    use crate::http::percent_decode;
+    percent_decode(&percent_decode(s, false), false)
 }
 
 fn json_to_path_string(v: &serde_json::Value) -> String {

@@ -13,7 +13,7 @@ Overridable at runtime with `WEBCORTEX_DATABASE_URL`, so the same image runs in
 every environment.
 
 !!! info "SQLite today; Postgres next"
-    v0.3 supports SQLite. The `Query` op assumes `?` placeholders and SQLite's
+    v2 supports SQLite. The `Query` op assumes `?` placeholders and SQLite's
     `RETURNING` semantics; Postgres needs a small dialect layer and is the next
     milestone. For a Postgres-backed app today, use a Python handler with
     `asyncpg` or SQLAlchemy — that path works, it just runs in the interpreter.

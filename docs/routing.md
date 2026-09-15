@@ -1,7 +1,9 @@
 # Routing
 
-Seven kinds of route. Six of them never enter the Python interpreter at request
-time.
+Nine kinds of route. Seven never enter the Python interpreter at request time;
+Python handlers and behaviours do. Flows are covered in
+[Orchestration](orchestration.md) and behaviours in [Behaviours](behaviours.md);
+this page covers the rest.
 
 Choosing between them is the main design decision in a WebCortex app, so this
 page covers each one and when to reach for it.

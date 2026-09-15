@@ -18,17 +18,18 @@ An honest answer, because the useful version is qualified.
 
     ---
 
-    Public authenticated browser apps (no CSRF or sessions) · write-heavy
-    Postgres workloads (SQLite only) · long-running durable agent runs ·
-    anything needing streaming responses
+    Public authenticated browser apps (no CSRF or cookie sessions) ·
+    write-heavy Postgres workloads (SQLite only) · agent runs that must
+    survive a restart · anything needing token-level streaming
 
 </div>
 
-**What is verified:** 251 tests, an adversarial security review with six fixes,
+**What is verified:** 355 tests, an adversarial security review with six fixes,
 1.79M requests soaked with zero errors and stable memory, wheels building on
 five platform targets across four interpreter versions.
 
-**What is young:** v0.3.1, one author, no production users yet.
+**What is young:** v2.0.0, one author, a few thousand installs and no known
+production users yet.
 
 ---
 
@@ -59,7 +60,10 @@ Everything overridable by environment, so one image runs everywhere:
 | `WEBCORTEX_DATABASE_URL` | Overrides the declared database |
 | `WEBCORTEX_LOG` | `error` / `warn` / `info` / `debug` |
 | `WEBCORTEX_DEBUG_ERRORS` | **Never set in production** — returns tracebacks |
-| `ANTHROPIC_API_KEY` | Required only if agents or Behaviours are declared |
+| `ANTHROPIC_API_KEY` | For `claude-*` and `anthropic/…` models; `ANTHROPIC_BASE_URL` for a gateway |
+| `OPENAI_API_KEY` | For `gpt-*` and `openai/…` models; `OPENAI_BASE_URL` for a gateway |
+| `OLLAMA_HOST` | Where `ollama/…` models are served (default `http://127.0.0.1:11434`) |
+| `WEBCORTEX_FAKE_PROVIDER` | **Tests only** — answers every model call deterministically |
 
 Plus every `env_var` you named in `app.api_key(...)` and `app.jwt(...)`.
 
@@ -70,6 +74,7 @@ app = WebCortex(
     port=8000,
     workers=None,          # defaults to CPU count on free-threaded builds
     request_timeout=30,
+    agent_timeout=600,     # agent, flow and behaviour routes: a multi-step run outlasts 30s
     shutdown_timeout=25,
 )
 ```
@@ -82,8 +87,7 @@ There is no build stage: `pip install` pulls a prebuilt wheel, so the image
 needs no Rust toolchain and no compiler.
 
 ```dockerfile title="Dockerfile"
-# 3.13, or 3.14t for free-threading. Not python:3.14-slim — the extension does
-# not import on GIL-enabled 3.14. See Installation.
+# 3.12–3.14, or 3.14t for free-threading.
 FROM python:3.13-slim
 
 RUN useradd --create-home --uid 10001 app
@@ -102,7 +106,7 @@ CMD ["webcortex", "run", "api.py"]
 ```
 
 !!! tip "Pin the version"
-    `pip install web-cortex-framework==0.3.1` in an image you intend to
+    `pip install web-cortex-framework==2.0.0` in an image you intend to
     redeploy. The wheel is prebuilt for Linux x86_64 and aarch64, so the install
     is a download, not a compile.
 
@@ -169,8 +173,9 @@ volumes: { appdata: }
 present an API key.
 
 ```json
-{"status": "ok", "app": "myapp", "version": "0.3.1",
- "routes": 12, "tools": 8, "agents": 1, "python_workers": 10}
+{"status": "ok", "app": "myapp", "version": "0.1.0",
+ "routes": 12, "tools": 8, "agents": 1, "behaviours": 1, "flows": 0,
+ "python_workers": 10, "sessions": 3, "pending_approvals": 0}
 ```
 
 On `SIGTERM` or `SIGINT`, the server stops accepting connections and drains
@@ -218,7 +223,11 @@ INFO audit kind=tool_called run_id=… actor=agent:assistant#service
 - **SQLite writes serialise.** For write-heavy work, wait for Postgres or use a
   Python handler against a real connection pool.
 
-Prefer horizontal scaling: instances are stateless apart from the database.
+Prefer horizontal scaling, with one caveat. Instances are stateless apart from
+the database *and* agent state: sessions and suspended approvals live in the
+memory of the instance that created them. Route a session's requests, and the
+`POST /_webcortex/approvals/{id}` that resumes a run, back to that instance
+(sticky routing), or run one instance while you rely on them.
 
 ---
 
@@ -232,6 +241,9 @@ Prefer horizontal scaling: instances are stateless apart from the database.
 - [ ] Grace period longer than `shutdown_timeout`
 - [ ] Rate limiting at the edge as well as in-process
 - [ ] Log aggregation capturing `webcortex::audit`
+- [ ] Every agent, behaviour and flow has a `token_budget`; prices declared so `/usage` reports dollars
+- [ ] Sessions and pending approvals expiring after an hour suits the workload (`session_ttl_secs` and `approval_ttl_secs` are fixed defaults, not yet settable from Python)
+
 - [ ] Database backups, if SQLite: the file is your database
 - [ ] `cargo audit` in CI
 

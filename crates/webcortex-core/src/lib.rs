@@ -10,8 +10,11 @@ pub mod app;
 pub mod audit;
 pub mod auth;
 pub mod bridge;
+pub mod context;
 pub mod files;
+pub mod flow;
 pub mod http;
+pub mod ledger;
 pub mod manifest;
 pub mod mcp;
 pub mod middleware;
@@ -24,13 +27,15 @@ pub mod typegen;
 #[cfg(feature = "sqlite")]
 pub mod db;
 
-pub use agent::{AgentRuntime, RunResult, RunStatus};
+pub use agent::{AgentRuntime, ProviderRegistry, RunOptions, RunResult, RunStatus, SharedBudget, SuspendedRun};
 pub use app::App;
 pub use audit::{AuditSink, MemoryAudit, TracingAudit};
 pub use auth::{Principal, PrincipalKind};
 pub use bridge::{NoBridge, PyBridge};
 pub use http::{WebCortexRequest, WebCortexResponse};
+pub use ledger::Ledger;
 pub use manifest::Manifest;
+
 
 /// Install the default tracing subscriber unless the host already did.
 pub fn init_tracing(default_level: &str) {

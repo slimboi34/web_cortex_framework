@@ -28,6 +28,9 @@ pub struct WebCortexRequest {
     /// or agent calls a tool, so a cycle is bounded even though each nested
     /// invocation gets its own step budget.
     pub depth: u32,
+    /// The token ceiling shared by every model-backed op in this request tree.
+    /// `None` at the edge; set once an agent, behaviour or flow starts one.
+    pub budget: Option<std::sync::Arc<crate::agent::SharedBudget>>,
 }
 
 impl WebCortexRequest {
@@ -42,6 +45,7 @@ impl WebCortexRequest {
             route_id: None,
             principal: crate::auth::Principal::anonymous(),
             depth: 0,
+            budget: None,
         }
     }
 
@@ -61,7 +65,16 @@ impl WebCortexRequest {
     /// key of a JSON body. Agents supply arguments as one flat object and
     /// should not have to know which of the three a given route used.
     pub fn lookup(&self, name: &str) -> Option<serde_json::Value> {
+        // The caller's identity is bindable by name, so a declared query can be
+        // scoped to whoever is asking without a Python handler in the way. It
+        // resolves to the *root* principal — the human or service behind any
+        // chain of agent delegation — so memory an agent writes on someone's
+        // behalf is that someone's memory.
+        if name == "@principal" {
+            return Some(serde_json::Value::String(self.principal.root_id().to_string()));
+        }
         if let Some(v) = self.path_params.get(name) {
+
             return Some(coerce_scalar(v));
         }
         if let Some(v) = self.query.get(name) {
@@ -151,30 +164,37 @@ pub fn parse_query(raw: &str) -> BTreeMap<String, String> {
             Some((k, v)) => (k, v),
             None => (pair, ""),
         };
-        out.insert(percent_decode(k), percent_decode(v));
+        out.insert(percent_decode(k, true), percent_decode(v, true));
     }
     out
 }
 
-fn percent_decode(s: &str) -> String {
+/// Decode `%XX` escapes, and `+` as a space when `plus_as_space` (query
+/// strings). A `%` not followed by two hex digits is kept as it is.
+///
+/// Works on bytes throughout. Slicing the `&str` at `i + 3` panicked when a
+/// multi-byte character followed a `%`, and path parameters can carry any text
+/// a model put in a tool call's arguments.
+pub(crate) fn percent_decode(s: &str, plus_as_space: bool) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    Ok(b) => {
-                        out.push(b);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi << 4) | lo);
+                    i += 3;
                 }
-            }
-            b'+' => {
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -185,4 +205,24 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode;
+
+    #[test]
+    fn percent_decoding_handles_escapes_plus_and_junk() {
+        assert_eq!(percent_decode("a%2Fb%2e", false), "a/b.");
+        assert_eq!(percent_decode("a+b", true), "a b");
+        assert_eq!(percent_decode("a+b", false), "a+b");
+        assert_eq!(percent_decode("100%", false), "100%");
+        assert_eq!(percent_decode("%zz%4", false), "%zz%4");
+    }
+
+    #[test]
+    fn a_percent_before_a_multibyte_character_does_not_panic() {
+        assert_eq!(percent_decode("%aé", false), "%aé");
+        assert_eq!(percent_decode("x%é%2F", true), "x%é/");
+    }
 }

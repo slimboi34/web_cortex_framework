@@ -139,17 +139,37 @@ app.proxy(
 
 
 # ---------------------------------------------------------------------------
-# 7. An agent.
+# 7. Models, context and memory.
+#
+#    Tiers are named once. Point `fast` at a local model to do the cheap work
+#    for free: app.models(fast="ollama/qwen3.5:9b").
+# ---------------------------------------------------------------------------
+
+app.models(default="claude-opus-5", fast="claude-haiku-4-5-20251001")
+
+app.context(
+    "shelf",
+    sql="SELECT title, author, year FROM books ORDER BY year DESC LIMIT 25",
+    description="The newest books in stock.",
+)
+app.context("house_style", data={"tone": "warm, specific, never gushing", "max_words": 60})
+
+# Four Rust-executed tools, keyed by whoever is really asking.
+app.memory("notes", read_scopes=["read"], write_scopes=["write"])
+
+
+# ---------------------------------------------------------------------------
+# 8. Agents.
 #
 #    `scopes` is what a run may do; `expose_scopes` is who may start one. Both
 #    are intersected with the caller's own scopes at run time, so the agent can
 #    never hold authority its caller lacks. Steps and tokens are capped by the
-#    runtime rather than trusted to the model.
+#    runtime rather than trusted to the model, and the librarian's budget is
+#    shared by anything it calls.
 # ---------------------------------------------------------------------------
 
 app.agent(
     "librarian",
-    model="claude-opus-5",
     description="Answers questions about the catalogue.",
     system=(
         "You are a librarian for this bookstore. Prefer the local catalogue; "
@@ -162,9 +182,92 @@ app.agent(
         "get_books_by_id_blurb",
         "search_open_library",
     ],
-    scopes=["read"],
+    context=["shelf"],
+    memory="notes",
+    scopes=["read", "write"],
     expose_scopes=["read"],
     max_steps=8,
     token_budget=50_000,
+    tool_result_limit=8_000,
     expose_at="/ask",
 )
+
+app.agent(
+    "copywriter",
+    description="Writes a blurb in the house style from whatever it is given.",
+    system="Write one blurb. Follow the house style exactly.",
+    context=["house_style"],
+    scopes=["read"],
+    max_steps=2,
+    token_budget=10_000,
+)
+
+# The front desk hands off rather than answering itself. The conversation and
+# the budget carry over; authority can only shrink.
+app.agent(
+    "front_desk",
+    description="First contact. Hands book questions to the librarian.",
+    system="Greet briefly. Hand off to the librarian for anything about books.",
+    handoffs=["librarian"],
+    scopes=["read"],
+    expose_scopes=["read"],
+    token_budget=60_000,
+    context_window=40_000,
+    expose_at="/desk",
+)
+
+
+# ---------------------------------------------------------------------------
+# 9. A flow: orchestration as data, executed in Rust.
+#
+#    The librarian researches, the copywriter writes, one shared budget bounds
+#    both. Every step is a tool, so this flow is itself a tool an agent could
+#    call.
+# ---------------------------------------------------------------------------
+
+app.flow(
+    "pitch",
+    description="Research a request against the catalogue, then write the blurb.",
+    pipeline=["librarian", "copywriter"],
+    scopes=["read"],
+    token_budget=80_000,
+)
+
+
+# ---------------------------------------------------------------------------
+# 10. A behaviour with concurrent leaves.
+#
+#     The loop is Python; the fifty classifications happen in one wait on the
+#     fast tier.
+# ---------------------------------------------------------------------------
+
+
+@app.behaviour(
+    "shelve",
+    description="Tag every book with a genre, concurrently, on the fast model.",
+    tools=["list_books", "update_books"],
+    context=["house_style"],
+    scopes=["read", "write"],
+    max_steps=200,
+    token_budget=100_000,
+    model="fast",
+)
+def shelve(ctx, input):
+    books = ctx.call("list_books", limit=50)
+    if not books:
+        ctx.halt("nothing to shelve")
+    genres = ctx.ask_many(
+        [f"Genre for '{b['title']}' by {b['author']} ({b['year']})?" for b in books],
+        schema={
+            "type": "object",
+            "properties": {"genre": {"enum": ["fiction", "non-fiction", "poetry", "reference"]}},
+            "required": ["genre"],
+        },
+    )
+    ctx.gather(*[
+        ("update_books", {"id": b["id"], "title": b["title"], "author": b["author"],
+                          "year": b["year"]})
+        for b in books
+    ])
+    return {"shelved": len(books), "genres": [g["genre"] for g in genres], "usage": ctx.usage}
+

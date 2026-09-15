@@ -134,10 +134,14 @@ Mounted under `/_webcortex` (configurable via `control_prefix`).
 | `GET /openapi.json` | OpenAPI 3.1 document |
 | `GET /tools` | Plain tool listing |
 | `GET /routes` | Route table with the engine serving each |
-| `GET /agents` | Declared agents, their tools and budgets |
+| `GET /agents` · `/behaviours` · `/flows` · `/contexts` | Declarations |
+| `GET /models` | Model aliases, live providers, priced models |
+| `GET /usage` | The spend ledger, by caller and model |
+| `GET /approvals` · `POST /approvals/{id}` | Runs waiting on a human, and deciding them |
 | `GET /audit` | Recent agent activity |
 | `GET /security` | Public attack surface |
 | `POST /mcp` | MCP JSON-RPC |
+
 
 !!! warning "The control plane needs `webcortex:admin`"
     Once any authentication is configured, everything except `/health` requires

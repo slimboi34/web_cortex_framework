@@ -4,8 +4,8 @@
 //!
 //! 1. CORS preflight — answered before anything else can reject it
 //! 2. Request id — so every subsequent log line correlates
-//! 3. Rate limit — cheapest rejection, applied before authentication work
-//! 4. Authenticate — establish the principal once
+//! 3. Authenticate — establish the principal once
+//! 4. Rate limit — keyed by that principal, or by client IP when anonymous
 //! 5. Dispatch — scope checks happen inside, next to the op
 //! 6. Response headers — security headers and CORS applied to every exit path
 //!
@@ -18,7 +18,7 @@ use crate::http::{WebCortexRequest, WebCortexResponse, parse_query};
 use crate::{mcp, middleware, openapi};
 use bytes::Bytes;
 use futures::FutureExt;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use std::panic::AssertUnwindSafe;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -29,8 +29,16 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// How much of an oversized body is read and thrown away before the 413, and
+/// for how long. Closing on a client that is still sending resets the
+/// connection, and the reset destroys the 413 before the client reads it;
+/// draining a bounded overshoot lets the answer arrive. Past either bound the
+/// connection is cut off, as before.
+const DRAIN_BYTES: usize = 8 * 1024 * 1024;
+const DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub async fn serve(app: Arc<App>) -> Result<(), String> {
     serve_with_shutdown(app, shutdown_signal()).await
@@ -122,8 +130,6 @@ where
     }
     Ok(())
 }
-
-use tokio::sync::Semaphore;
 
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -282,7 +288,15 @@ async fn route_request(
     let mut res = if let Some(rest) = path.strip_prefix(&prefix) {
         control_plane(app, &method, rest, &body, &principal, request_id).await
     } else {
-        let timeout = std::time::Duration::from_secs(app.manifest.server.request_timeout_secs);
+        // A model loop routinely outlasts an ordinary handler's ceiling, and a
+        // timeout drops the run mid-flight.
+        let limits = &app.manifest.server;
+        let secs = if app.runs_a_model_loop(&method, &path) {
+            limits.agent_timeout_secs.max(limits.request_timeout_secs)
+        } else {
+            limits.request_timeout_secs
+        };
+        let timeout = std::time::Duration::from_secs(secs);
         let dispatch = app.dispatch(WebCortexRequest {
             method,
             path,
@@ -293,6 +307,7 @@ async fn route_request(
             route_id: None,
             principal,
             depth: 0,
+            budget: None,
         });
         // A handler that hangs must not hold a connection forever.
         match tokio::time::timeout(timeout, dispatch).await {
@@ -314,14 +329,28 @@ fn finish_cors(app: &Arc<App>, res: &mut WebCortexResponse, origin: Option<&str>
 }
 
 async fn read_body(req: Request<Incoming>) -> Result<Bytes, WebCortexResponse> {
-    let body = Limited::new(req.into_body(), MAX_BODY_BYTES);
-    match body.collect().await {
-        Ok(c) => Ok(c.to_bytes()),
-        Err(_) => Err(WebCortexResponse::error(
-            413,
-            format!("request body exceeds {MAX_BODY_BYTES} bytes"),
-        )),
+    let too_large = || WebCortexResponse::error(413, format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+    let mut body = req.into_body();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else { return Err(too_large()) };
+        let Ok(data) = frame.into_data() else { continue };
+        if buf.len() + data.len() > MAX_BODY_BYTES {
+            let _ = tokio::time::timeout(DRAIN_TIME, async {
+                let mut drained = 0usize;
+                while drained <= DRAIN_BYTES {
+                    match body.frame().await {
+                        Some(Ok(f)) => drained += f.data_ref().map_or(0, |d| d.len()),
+                        _ => break,
+                    }
+                }
+            })
+            .await;
+            return Err(too_large());
+        }
+        buf.extend_from_slice(&data);
     }
+    Ok(buf.freeze())
 }
 
 /// Introspection and operations endpoints, mounted under `control_prefix`.
@@ -357,7 +386,70 @@ async fn control_plane(
                 "routes": app.manifest.routes.len(),
                 "tools": app.exposed_tools().len(),
                 "agents": app.manifest.agents.len(),
+                "behaviours": app.manifest.behaviours.len(),
+                "flows": app.manifest.flows.len(),
                 "python_workers": app.bridge().workers(),
+                "sessions": app.sessions().len(),
+                "pending_approvals": app.pending_approvals().len(),
+            }),
+        ),
+
+        // Spend, by model and by what spent it. Cost is reported only when
+        // every model involved has a declared price.
+        ("GET", "/usage") => WebCortexResponse::json(
+            200,
+            &app.ledger().snapshot(|m| app.registry().price_for(m)),
+        ),
+
+        ("GET", "/models") => WebCortexResponse::json(200, &app.registry().describe()),
+
+        ("GET", "/approvals") => WebCortexResponse::json(
+            200,
+            &serde_json::json!({"approvals": app.pending_approvals()}),
+        ),
+
+        // Decide a gated call and continue the run that asked for it.
+        ("POST", path) if path.starts_with("/approvals/") => {
+            let id = path.trim_start_matches("/approvals/").trim_end_matches('/');
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+            let approve = parsed.get("approve").and_then(|v| v.as_bool());
+            let Some(approve) = approve else {
+                return WebCortexResponse::error(400, "body must be {\"approve\": true|false, \"note\": \"…\"}");
+            };
+            let note = parsed.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            match app.resolve_approval(id, approve, note, principal).await {
+                Ok(result) => crate::app::run_result_response(&result),
+                Err(e) => WebCortexResponse::error(404, e),
+            }
+        }
+
+        ("GET", "/flows") => WebCortexResponse::json(
+            200,
+            &serde_json::json!({
+                "flows": app.manifest.flows.iter().map(|f| serde_json::json!({
+                    "name": f.name,
+                    "description": f.description,
+                    "kind": f.kind,
+                    "scopes": f.scopes,
+                    "token_budget": f.token_budget,
+                    "input_schema": f.input_schema,
+                })).collect::<Vec<_>>()
+            }),
+        ),
+
+        ("GET", "/contexts") => WebCortexResponse::json(
+            200,
+            &serde_json::json!({
+                "contexts": app.manifest.contexts.iter().map(|c| serde_json::json!({
+                    "name": c.name,
+                    "description": c.description,
+                    "kind": match c.source {
+                        crate::manifest::ContextSource::Static { .. } => "static",
+                        crate::manifest::ContextSource::Query { .. } => "query",
+                        crate::manifest::ContextSource::Python { .. } => "python",
+                    },
+                    "max_chars": c.max_chars,
+                })).collect::<Vec<_>>()
             }),
         ),
 
@@ -397,7 +489,7 @@ async fn control_plane(
                     "id": r.id,
                     "method": r.method,
                     "path": r.path,
-                    "op": op_name(&r.op),
+                    "op": r.op.kind(),
                     "tool": r.tool.expose.then(|| r.tool_name()),
                     "scopes": r.scopes,
                 })).collect::<Vec<_>>()
@@ -433,9 +525,13 @@ async fn control_plane(
                     "model": a.model,
                     "description": a.description,
                     "tools": a.tools,
+                    "handoffs": a.handoffs,
+                    "context": a.context,
                     "max_steps": a.max_steps,
                     "token_budget": a.token_budget,
                     "scopes": a.scopes,
+                    "cache": a.cache,
+                    "policy": a.policy,
                 })).collect::<Vec<_>>()
             }),
         ),
@@ -465,20 +561,6 @@ async fn control_plane(
             404,
             format!("no control endpoint {method} {rest} (request {request_id})"),
         ),
-    }
-}
-
-fn op_name(op: &crate::manifest::Op) -> &'static str {
-    use crate::manifest::Op::*;
-    match op {
-        Static { .. } => "static",
-        Python { .. } => "python",
-        Query { .. } => "query",
-        Proxy { .. } => "proxy",
-        Agent { .. } => "agent",
-        Page { .. } => "page",
-        Files { .. } => "files",
-        Behaviour { .. } => "behaviour",
     }
 }
 

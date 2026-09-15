@@ -31,7 +31,16 @@ Free-threading is the fast path for Python-backed routes — measured 4.82x vers
 Yes, inside a Python handler. `app.query` is not an ORM and there will not be
 one — see [Database](database.md#using-python-instead).
 
+### How does `webcortex evolve` differ from asking a chat model?
+
+It sends the model the [context pack](ai-development.md#the-context-pack) —
+the app's actual routes, tools, schemas, agents and security posture — plus a
+cheat sheet of the framework's API, and asks for declarations rather than
+handlers. The result is anchored on what exists. It still prints a proposal
+for you to review; it does not edit files.
+
 ### Why is there no auto-migration?
+
 
 Because silently issuing `ALTER TABLE` because a Python dict changed is how
 frameworks destroy production data. `create_table=True` emits
@@ -39,8 +48,36 @@ frameworks destroy production data. `create_table=True` emits
 
 ### Does it support Postgres?
 
-Not in v0.3 — SQLite only for `Query` ops. Postgres needs a small dialect layer
+Not in v2 — SQLite only for `Query` ops. Postgres needs a small dialect layer
 and is the next milestone. You can use Postgres today from a Python handler.
+
+### Can I use a local model?
+
+Yes. `app.models(fast="ollama/qwen3.5:9b")` and no key is needed; any
+OpenAI-compatible server works via `app.provider(...)`. Structured output from
+small local models is recovered from prose when they answer in text rather
+than through the forced tool call. See [Models](models.md#local-models).
+
+### How do I stop an agent system from running up a bill?
+
+Give the outermost agent, behaviour or flow a `token_budget`; it is shared by
+everything it calls. Use `model="fast"` on leaves. Set `tool_result_limit` and
+`context_window` on agents that talk a lot. Watch `GET /_webcortex/usage`.
+The [cost checklist](models.md#a-cost-checklist) is the short version.
+
+### Do sessions and approvals survive a restart?
+
+No. Both are in memory, bounded and expiring, and the runtime says so rather
+than pretending otherwise. Durable state is application data — put it in a
+table. See [Limits worth knowing](agents.md#limits-worth-knowing).
+
+### What is the difference between a supervisor, a handoff and a flow?
+
+A **supervisor** lists other agents in `tools=` and stays in charge. A
+**handoff** moves the conversation to a specialist who answers the human
+directly. A **flow** is an arrangement known in advance — pipeline, fan-out,
+router — declared as data. [Orchestration](orchestration.md) has the
+comparison.
 
 ### Can agents modify my data?
 

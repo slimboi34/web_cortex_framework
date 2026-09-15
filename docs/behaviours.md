@@ -89,6 +89,41 @@ if verdict["legitimate"]:
 
 Without `schema` you get text.
 
+### `ctx.gather(*items, return_exceptions=False)`
+
+Several tool calls at once. Each item is `(tool, kwargs)`, a bare tool name,
+or `{"tool": name, **kwargs}`. The calls run concurrently on the Rust runtime,
+so a loop of fifty `ctx.call`s becomes one wait, and every one is admitted,
+scoped, gated and charged exactly as `call` is — one step per item.
+
+```python
+rows = ctx.gather(("get_orders", {"id": 1}), ("get_orders", {"id": 2}), "ping")
+```
+
+By default the first failure is raised after every call has finished. With
+`return_exceptions=True`, failures come back in place as
+`{"error": "...", "ok": False}`.
+
+### `ctx.ask_many(prompts, *, schema=None, model=None, concurrency=8, ...)`
+
+The classification loop collapsed into one wait: the prompts are sent
+concurrently, at most `concurrency` in flight, and the answers come back in
+order. Same tokens, a fraction of the wall-clock.
+
+```python
+verdicts = ctx.ask_many(
+    [f"Classify: {t['body']}" for t in tickets],
+    schema={"type": "object", "properties": {"urgent": {"type": "boolean"}}},
+    model="fast",
+)
+```
+
+### `ctx.context(name)`
+
+Resolve a declared [context provider](context.md#context-providers) and return
+its raw value. Only providers named in the behaviour's `context=[...]` are
+reachable.
+
 ### `ctx.run(name, **kwargs)`
 
 Run another Behaviour or agent, composing procedures. Nesting is bounded by
@@ -113,6 +148,9 @@ if not tickets:
 | Member | Type | Meaning |
 |---|---|---|
 | `ctx.tools` | `list[str]` | Tools available to this run |
+| `ctx.contexts` | `list[str]` | Context providers available to this run |
+| `ctx.user` | `dict` | `{id, root_id, authenticated, scopes}` — the delegated principal and the human behind it |
+| `ctx.usage` | `dict` | Steps and tokens for this run, plus `tree_tokens` for everything the request tree has spent |
 | `ctx.run_id` | `str` | Correlates trace and audit entries |
 | `ctx.depth` | `int` | Nesting depth; `0` when started over HTTP |
 
@@ -126,7 +164,17 @@ either halts the run — it does not raise.
 ```
 
 The step charge happens *before* the provider call, so a runaway loop stops at
-the boundary rather than after paying for it.
+the boundary rather than after paying for it. Tokens are also charged to the
+request tree's shared budget, so a behaviour launched by an agent cannot
+outspend the agent — see [Budgets compose](orchestration.md#budgets-compose).
+
+Pick the model per leaf. `model="fast"` on the behaviour, or on an individual
+`ctx.ask`, is the cheapest single change you can make to an agentic app:
+
+```python
+@app.behaviour("triage", tools=[...], model="fast")
+```
+
 
 ## Exposing a Behaviour
 
@@ -217,7 +265,9 @@ model that felt differently that day.
 |---|---|
 | **Route** | Deterministic. No model involved. |
 | **Behaviour** | Known procedure with model judgment at specific points. |
+| **Flow** | Known *arrangement* of agents and behaviours — a pipeline, a fan-out, a router — with no logic between the steps. |
 | **Agent** | Open-ended. The sequence of steps is not known in advance. |
+
 
 Reach for a Behaviour whenever you catch yourself writing "first do X, then for
 each Y, if Z…" into a system prompt. That sentence is a program; write it as one.

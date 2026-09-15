@@ -58,7 +58,13 @@ impl AuditEvent {
                 "tool_calls": usage.tool_calls,
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
+                "cache_read_tokens": usage.cache_read_tokens,
+                "cache_write_tokens": usage.cache_write_tokens,
+                "handoffs": usage.handoffs,
+                "compactions": usage.compactions,
+                "tree_tokens": usage.tree_tokens,
             }),
+
         }
     }
 
@@ -112,6 +118,55 @@ impl AuditEvent {
             actor: Some(actor.id.clone()),
             tool: Some(tool.into()),
             detail: json!({"arguments": arguments, "approval_id": approval_id}),
+        }
+    }
+}
+
+impl AuditEvent {
+    pub fn approval_decided(
+        run_id: &str,
+        actor: &Principal,
+        tool: &str,
+        approval_id: &str,
+        approved: bool,
+        note: &str,
+    ) -> Self {
+        Self {
+            kind: "approval_decided".into(),
+            run_id: run_id.into(),
+            actor: Some(actor.id.clone()),
+            tool: Some(tool.into()),
+            detail: json!({"approval_id": approval_id, "approved": approved, "note": note}),
+        }
+    }
+
+    pub fn handoff(run_id: &str, actor: &Principal, from: &str, to: &str, reason: &str) -> Self {
+        Self {
+            kind: "handoff".into(),
+            run_id: run_id.into(),
+            actor: Some(actor.id.clone()),
+            tool: Some(format!("transfer_to_{to}")),
+            detail: json!({"from": from, "to": to, "reason": reason}),
+        }
+    }
+
+    pub fn flow_started(run_id: &str, flow: &str, actor: &Principal) -> Self {
+        Self {
+            kind: "flow_started".into(),
+            run_id: run_id.into(),
+            actor: Some(actor.id.clone()),
+            tool: Some(flow.into()),
+            detail: json!({"granted_scopes": actor.scopes}),
+        }
+    }
+
+    pub fn flow_finished(run_id: &str, flow: &str, status: &str, tree_tokens: u64) -> Self {
+        Self {
+            kind: "flow_finished".into(),
+            run_id: run_id.into(),
+            actor: None,
+            tool: Some(flow.into()),
+            detail: json!({"status": status, "tree_tokens": tree_tokens}),
         }
     }
 }

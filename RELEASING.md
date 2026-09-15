@@ -20,9 +20,12 @@ That is the whole process. The workflow runs CI as a gate, and publishes the
 wheels and sdist that CI built — it does not rebuild them, so the artifact that
 was tested is the artifact that ships.
 
-Supported interpreters are **3.12, 3.13, and free-threaded 3.14 (`3.14t`)**
-across Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows (x64).
-GIL-enabled 3.14 is deliberately excluded — see [AGENTS.md §11](AGENTS.md).
+Supported interpreters are **3.12, 3.13, 3.14 and free-threaded 3.14
+(`3.14t`)** across Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows
+(x64). GIL-enabled 3.14 was briefly excluded in 0.3.1 on the strength of a
+cache-poisoning false alarm — see [AGENTS.md §11](AGENTS.md) — and has been
+supported again since 0.3.2.
+
 
 `workflow_dispatch` runs the same thing without a tag, which is useful for
 re-running a failed publish. It is a no-op if the version is already on PyPI.
