@@ -3,7 +3,7 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
-## [2.0.0] — 2026-09-14
+## [2.0.0] — 2026-09-17
 
 The orchestration generation. The version jumps from 0.3 to 2.0 because this
 is a second design rather than a polish of the first: 0.3 established that one
