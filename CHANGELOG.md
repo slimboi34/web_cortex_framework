@@ -3,6 +3,19 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.0.1] — 2026-09-29
+
+### Fixed
+
+- **Path parameters are percent-decoded.** A captured path segment reached the
+  query, the Python handler and the tool arguments exactly as it appeared on the
+  wire, so `GET /books/by-author/Frank%20Herbert` bound `author = "Frank%20Herbert"`
+  and matched nothing, and `GET /books/%31/blurb` handed an `id: int` handler the
+  string `"%31"`. The router now decodes each captured value once, *after*
+  matching, so an encoded `%2F` can never become a segment separator and change
+  which route is chosen; a value that is not valid UTF-8 once decoded is kept as
+  sent. Query-string values were already decoded and are unchanged.
+
 ## [2.0.0] — 2026-09-17
 
 The orchestration generation. The version jumps from 0.3 to 2.0 because this

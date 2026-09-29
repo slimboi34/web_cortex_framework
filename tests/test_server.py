@@ -28,6 +28,16 @@ app = WebCortex("itest", description="integration", database="sqlite://./itest.d
 
 app.resource("books", fields={{"id": int, "title": str, "author": str}}, tools=True)
 
+# A Rust-executed query with a path parameter: the captured segment is what the
+# SQL binds, so it has to arrive decoded.
+app.query(
+    "GET", "/books/by-author/{{author}}",
+    "SELECT * FROM books WHERE author = ? ORDER BY id",
+    params=["author"], returns="many", summary="An author's books",
+    input_schema={{"type": "object", "properties": {{"author": {{"type": "string"}}}}, "required": ["author"]}},
+    tool=True, tool_name="books_by_author",
+)
+
 app.static("GET", "/ping", {{"pong": True}}, tool=True, tool_name="ping")
 
 app.static("GET", "/vault", {{"secret": 1}}, tool=True, tool_name="vault", scopes=["admin"])
@@ -308,3 +318,26 @@ def test_mcp_batch(server):
     assert status == 200
     assert len(body) == 2
     assert {r["id"] for r in body} == {1, 2}
+
+
+# ---------------------------------------------------------------- path parameters
+
+
+def test_path_parameters_are_percent_decoded_before_the_query_and_the_handler(server):
+    status, _ = server.request("/books", "POST", {"title": "Dune", "author": "Frank Herbert"})
+    assert status == 200
+
+    # Rust-executed query: the segment binds as "Frank Herbert", not "Frank%20Herbert".
+    status, rows = server.request("/books/by-author/Frank%20Herbert")
+    assert status == 200
+    assert [r["title"] for r in rows] == ["Dune"]
+
+    # Python handler declared `id: int`: "%31" decodes to "1" and coerces to the integer 1.
+    status, body = server.request("/books/%31/blurb")
+    assert status == 200
+    assert body["id"] == 1 and body["text"] == "book 1"
+
+    # Matching still happens on the raw path: an encoded slash is one segment and
+    # cannot reach the blurb handler by decoding into two.
+    status, body = server.request("/books/1%2Fblurb")
+    assert not (status == 200 and isinstance(body, dict) and "text" in body)

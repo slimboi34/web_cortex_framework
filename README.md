@@ -399,7 +399,7 @@ tested, the known limits, and what v2 added to the surface.
 
 ## Status
 
-v2.0.0. Working and tested: the manifest IR, router, native ops (static /
+v2.0.1. Working and tested: the manifest IR, router, native ops (static /
 query / proxy / page / files / flow), the free-threaded Python bridge,
 authentication and scopes, rate limiting, CORS, security headers, graceful
 shutdown, Behaviours with concurrent leaves, the agent runtime with handoffs,
