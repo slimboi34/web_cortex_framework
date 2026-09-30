@@ -183,6 +183,20 @@ def _strip_fence(text: str) -> str:
     return t
 
 
+def mcp_config(app: Any, key: str | None = None) -> dict:
+    """The `mcpServers` entry an MCP client needs to reach this app.
+
+    Streamable HTTP at the app's MCP endpoint; the API key travels as the same
+    `x-api-key` header the REST side uses, so the client gets exactly the scopes
+    that key has and nothing more.
+    """
+    host = os.environ.get("WEBCORTEX_HOST", app.host)
+    port = int(os.environ.get("WEBCORTEX_PORT", app.port))
+    url = f"http://{host}:{port}/_webcortex/mcp"
+    name = getattr(app, "name", None) or "webcortex"
+    return {"mcpServers": {name: {"type": "http", "url": url, "headers": {"x-api-key": key} if key else {}}}}
+
+
 def _cmd_new(args: argparse.Namespace) -> int:
     from . import starters
 
@@ -241,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         ("security", "report the public attack surface"),
         ("typegen", "generate a typed TypeScript client"),
         ("context", "print the context pack: the app described for an AI coding tool"),
+        ("mcp-config", "print the MCP client configuration for this app (Claude Code, Claude Desktop, Cursor)"),
         ("evolve", "ask a model to propose an extension, anchored on the context pack"),
     ]:
         p = sub.add_parser(name, help=help_text)
@@ -336,6 +351,18 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(app.manifest(), indent=2))
         else:
             print(app.context_pack(), end="")
+        return 0
+
+    if args.command == "mcp-config":
+        key = os.environ.get("WEBCORTEX_API_KEY")
+        cfg = mcp_config(app, key)
+        name = next(iter(cfg["mcpServers"]))
+        url = cfg["mcpServers"][name]["url"]
+        header = f'"x-api-key: {key}"' if key else '"x-api-key: $WEBCORTEX_API_KEY"'
+        print(json.dumps(cfg, indent=2))
+        print(f"\n# Claude Code:\nclaude mcp add --transport http {name} {url} --header {header}")
+        if not key:
+            print("# (set WEBCORTEX_API_KEY to fill the header in)", file=sys.stderr)
         return 0
 
     if args.command == "evolve":

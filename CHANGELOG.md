@@ -3,6 +3,28 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.1.0] — 2026-09-30
+
+### Added — for the author who is a model
+
+- **Every starter ships `AGENTS.md` and `CLAUDE.md`.** `webcortex new` writes the rules a
+  coding agent needs in this project — declare, don't compute; `tool=True` and scopes on
+  every route; `approval="required"` on anything destructive; agents cannot exceed their
+  caller; keep it to one file — with the commands to run before starting
+  (`webcortex context`) and after every change (`webcortex check`). `CLAUDE.md` imports it
+  with Claude Code's `@AGENTS.md` syntax; Codex, Cursor and most agents read `AGENTS.md`
+  directly.
+- **`webcortex mcp-config`** prints the MCP client configuration for the app — streamable
+  HTTP at `/_webcortex/mcp` with the API key as the `x-api-key` header, so the client gets
+  exactly that key's scopes — and the `claude mcp add --transport http …` line. Plugging an
+  app into Claude Code, Claude Desktop or Cursor is one command.
+
+### Changed
+
+- **Release builds use fat LTO** (`lto = "fat"`, was thin): the whole program is optimised as
+  one unit, so every wheel is a little faster and smaller at the cost of a slower CI build.
+- `client/`, where `webcortex typegen` writes by default, is ignored by git.
+
 ## [2.0.1] — 2026-09-29
 
 ### Fixed

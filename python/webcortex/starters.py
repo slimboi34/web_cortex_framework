@@ -34,6 +34,50 @@ WEBCORTEX_JWT_SECRET=replace-me-at-least-32-bytes-long-abcdefgh
 # OLLAMA_HOST=http://127.0.0.1:11434
 """
 
+AGENTS_MD = """\
+# {name} — notes for coding agents
+
+This is a [WebCortex](https://github.com/slimboi34/web_cortex_framework) app: a Python web
+framework with a Rust core where every declaration is a REST route, an OpenAPI operation and
+an MCP tool at once. Python declares; the Rust runtime executes what it can without waking
+Python (queries, static responses, proxies, agent runs); typed Python handlers run on a
+worker pool.
+
+## Commands
+
+| | |
+|---|---|
+| `webcortex context` | the whole app described for an AI coding tool: routes with their engine and scopes, tools with signatures, agents with budgets, security posture. **Run this before you start.** |
+| `webcortex check` | validate the manifest and print the route table, tool list and security report as JSON. **Run this after every change**; a boot error is a bug. |
+| `webcortex security` | what is reachable without a credential |
+| `webcortex tools` | the agent tool manifest |
+| `webcortex dev` | run it (`export WEBCORTEX_API_KEY=$(webcortex keygen)` first) |
+| `webcortex mcp-config` | the MCP client configuration for this app, and the `claude mcp add` line |
+| `pytest` | the tests; `WEBCORTEX_FAKE_PROVIDER=1` runs agents against an offline provider |
+
+## The rules that matter most
+
+- **Declare, don't compute.** A route whose work is data — a query, a static response, a
+  proxy, an agent run — belongs in `app.query`, `app.static`, `app.proxy`, `app.agent`, so
+  Rust serves it. Write a Python handler only when there is real logic; its type hints are the
+  tool schema, so annotate every parameter.
+- **`tool=True` makes a route an agent tool** with a schema derived from the route itself, so
+  the two cannot drift. Give every route `scopes=[...]`; everything is deny-by-default.
+- **Dangerous tools wait for a human.** `approval="required"` suspends an agent's run and is
+  refused outright over MCP. Use it on anything destructive.
+- **Agents cannot exceed their caller.** Scopes intersect, budgets (`max_steps`,
+  `token_budget`) are enforced by the runtime, and a flow shares one budget across its tree.
+  Do not try to widen authority from inside an agent.
+- **Keep it to one file** (`api.py`) unless it is genuinely large, and do not add a second web
+  framework, an ORM, or a dependency for something the runtime already does (auth, rate
+  limiting, CORS, security headers, OpenAPI, MCP, TypeScript generation, the ledger).
+
+Everything else — every route, tool, agent and budget of this app — is in the output of
+`webcortex context`.
+"""
+
+CLAUDE_MD = "@AGENTS.md\n"
+
 README = """\
 # {name}
 
@@ -324,6 +368,10 @@ def files_for(template: str, name: str, description: str) -> dict[str, str]:
         ".gitignore": BASE_GITIGNORE,
         ".env.example": ENV_EXAMPLE,
         "README.md": README.format(name=name),
+        # The rules travel with the project: AGENTS.md is what Codex, Cursor and most agents
+        # read; CLAUDE.md imports it with Claude Code's @file syntax.
+        "AGENTS.md": AGENTS_MD.format(name=name),
+        "CLAUDE.md": CLAUDE_MD,
     }
 
     if template == "api":

@@ -342,6 +342,11 @@ TypeScript client** for SPA frontends, generated from the same route table by
 
 ## AI-native development
 
+`webcortex new` writes an `AGENTS.md` (read by Codex, Cursor and most agents) and a
+`CLAUDE.md` that imports it, so the rules travel with the project; `webcortex context`
+describes the running app for the model extending it; `webcortex mcp-config` prints the
+one command that plugs the app into Claude Code, Claude Desktop or Cursor.
+
 ```
 $ webcortex context                     # the app, described for a coding model
 $ webcortex evolve "add reviews tied to books and a behaviour that summarises them" --model fast
@@ -399,7 +404,7 @@ tested, the known limits, and what v2 added to the surface.
 
 ## Status
 
-v2.0.1. Working and tested: the manifest IR, router, native ops (static /
+v2.1.0. Working and tested: the manifest IR, router, native ops (static /
 query / proxy / page / files / flow), the free-threaded Python bridge,
 authentication and scopes, rate limiting, CORS, security headers, graceful
 shutdown, Behaviours with concurrent leaves, the agent runtime with handoffs,
