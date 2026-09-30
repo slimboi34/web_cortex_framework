@@ -152,9 +152,15 @@ async fn call_tool(app: &App, params: &Value, caller: &Principal) -> Result<Valu
     match app.call_tool_as(name, &args, caller).await {
         Ok(value) => {
             let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+            // MCP requires `structuredContent` to be a JSON object. A tool whose result is a
+            // list or a scalar — every `list_*` resource route, for one — is wrapped as
+            // `{"result": …}`; an object passes through unchanged. Strict clients (Claude
+            // Code among them) reject the bare value as malformed, which turned a working
+            // list route into a tool the model could not use.
+            let structured = if value.is_object() { value.clone() } else { json!({"result": value}) };
             Ok(json!({
                 "content": [{"type": "text", "text": text}],
-                "structuredContent": value,
+                "structuredContent": structured,
                 "isError": false,
             }))
         }

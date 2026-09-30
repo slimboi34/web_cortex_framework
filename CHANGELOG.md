@@ -3,6 +3,23 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.1.1] — 2026-09-30
+
+### Fixed
+
+- **MCP results for tools that return a list or a scalar.** `tools/call` put the tool's raw
+  JSON in `structuredContent`, but the protocol requires an object there, and strict clients
+  (Claude Code among them) reject the bare value as malformed — which made every `list_*`
+  resource route unusable as a tool even though the call succeeded. A non-object result is
+  now wrapped as `{"result": …}`; objects pass through unchanged, and the text content is
+  still the raw JSON. Found by recording Claude Code driving a scaffolded app over MCP.
+
+### Corrected
+
+- 2.1.0's note said fat LTO made wheels "a little faster and smaller". Measured on the same
+  app and routes with ApacheBench, throughput did not change beyond run-to-run noise; the
+  wheels are about 3% smaller (5.43 → 5.26 MB on macOS arm64). The note below now says so.
+
 ## [2.1.0] — 2026-09-30
 
 ### Added — for the author who is a model
@@ -22,7 +39,7 @@ bumps could contain breaking changes.
 ### Changed
 
 - **Release builds use fat LTO** (`lto = "fat"`, was thin): the whole program is optimised as
-  one unit, so every wheel is a little faster and smaller at the cost of a slower CI build.
+  one unit. Measured: wheels about 3% smaller; throughput unchanged within noise (see 2.1.1).
 - `client/`, where `webcortex typegen` writes by default, is ignored by git.
 
 ## [2.0.1] — 2026-09-29

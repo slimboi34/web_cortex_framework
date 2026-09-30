@@ -249,8 +249,13 @@ def test_mcp_tools_list_matches_the_declared_routes(server):
 def test_mcp_tool_call_reaches_a_native_sql_route(server):
     server.request("/books", "POST", {"title": "Neuromancer", "author": "Gibson"})
     out = server.rpc("tools/call", {"name": "list_books", "arguments": {"limit": 50}})
+    # MCP requires structuredContent to be an object; a list result is wrapped as {"result": [...]}
+    assert isinstance(out["result"]["structuredContent"], dict)
+    assert isinstance(out["result"]["structuredContent"]["result"], list)
     assert out["result"]["isError"] is False
-    assert any(b["author"] == "Gibson" for b in out["result"]["structuredContent"])
+    assert any(b["author"] == "Gibson" for b in out["result"]["structuredContent"]["result"])
+    # the text content is still the raw JSON of the result, for models that read that instead
+    assert "Gibson" in out["result"]["content"][0]["text"]
 
 
 def test_mcp_tool_call_reaches_a_python_route(server):
