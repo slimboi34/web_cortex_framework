@@ -198,7 +198,7 @@ def test_context_policy_is_carried_in_the_manifest():
     app.agent("a", context_window=50_000, tool_result_limit=2048, compact_with="fast", keep_recent=3, cache=False)
     a = app.manifest()["agents"][0]
     assert a["policy"] == {"max_tool_result_bytes": 2048, "max_context_tokens": 50_000,
-                           "compact_with": "fast", "keep_recent": 3}
+                           "compact_with": "fast", "keep_recent": 3, "max_images": 4}
     assert a["cache"] is False
     with pytest.raises(ValueError, match="keep_recent"):
         app.agent("b", keep_recent=0)

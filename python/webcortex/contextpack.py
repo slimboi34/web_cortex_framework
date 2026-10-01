@@ -42,6 +42,14 @@ app.page("/", "index.html", sql="SELECT ...", bind="rows")
 @app.get("/things/{id}/summary", tool=True, scopes=["read"], approval="never|required")
 def summary(id: int, style: str = "short") -> dict: '''Docstring = tool description.'''
 
+# perception + hardware (no inference is embedded: pixels go to the model)
+from webcortex import Image   # Image.from_array(frame, bgr=True) | from_bytes | from_path | from_pil | from_url
+@app.get("/camera", tool=True)
+def camera() -> dict: return {"frame": Image.from_array(cam.read(), bgr=True)}   # the agent SEES the frame
+@app.post("/arm/move", tool=True, actuator=True, approval="required", scopes=["operate"])
+def move(joint: int, degrees: float) -> dict: ...   # refuses while halted (POST /_webcortex/halt)
+WebCortex(..., start_halted=True)   # boot with the e-stop engaged; `webcortex release` to arm
+
 # models: tiers and providers (prefix picks the wire format: ollama/, openai/, anthropic/, <provider>/)
 app.models(default="claude-opus-5", fast="claude-haiku-4-5-20251001", local="ollama/qwen3.5:9b")
 app.provider("groq", base_url="https://api.groq.com/openai/v1", api_key_env="GROQ_API_KEY")
@@ -58,7 +66,8 @@ notes = app.memory("notes", scopes=["read"])   # notes_remember/recall/search/fo
 # agents (every agent is a tool named after itself; endpoint takes {"input", "session_id"})
 app.agent("name", model="default", system="...", tools=[...], handoffs=[...], context=[...], memory="notes",
           scopes=[...], expose_scopes=[...], max_steps=12, token_budget=100_000,
-          context_window=None, tool_result_limit=16_384, compact_with="fast", cache=True)
+          context_window=None, tool_result_limit=16_384, compact_with="fast", cache=True, max_images=4)
+# agent endpoint also takes "images": [{"media_type": "image/png", "data": "<b64>"} | {"url": "..."}]
 
 # behaviours: deterministic Python control flow, probabilistic leaves
 @app.behaviour("name", tools=[...], context=[...], scopes=[...], max_steps=50, token_budget=None, model="default")
@@ -77,8 +86,9 @@ app.flow("desk", route={"billing": "billing_agent", "tech": "tech_agent"}, defau
 
 Rules the runtime enforces: agent/behaviour/flow scopes are intersected with the caller's;
 approval="required" tools suspend a run (resume via POST /_webcortex/approvals/{id});
-max_steps and token_budget are hard limits; nesting is capped at 8; every step is audited.
-CLI: webcortex check | security | tools | context | evolve "…" | typegen | openapi | sql | dev
+max_steps and token_budget are hard limits; nesting is capped at 8; every step is audited;
+actuator=True routes refuse with 423 while the emergency stop is engaged.
+CLI: webcortex check | security | tools | context | evolve "…" | typegen | openapi | sql | dev | halt | release
 """
 
 
@@ -118,6 +128,11 @@ def build(app: Any) -> str:
     add(f"- public routes ({len(sec['public_routes'])}): " + (", ".join(sec["public_routes"][:12]) + (" …" if len(sec["public_routes"]) > 12 else "")))
     if sec["gated_tools"]:
         add(f"- approval-gated tools: {', '.join(sec['gated_tools'])}")
+    if sec.get("actuators"):
+        add(f"- actuators (refuse while halted): {', '.join(a['name'] for a in sec['actuators'])}"
+            + ("; boots halted" if sec.get("start_halted") else ""))
+    for warning in sec.get("actuator_warnings", []):
+        add(f"- ⚠ {warning}")
     add("")
 
     # --- Routes ---------------------------------------------------------

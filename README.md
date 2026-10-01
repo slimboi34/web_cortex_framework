@@ -321,6 +321,49 @@ invoke.
 **A full audit trail**, including refused calls, handoffs, compactions and
 approval decisions, at `GET /_webcortex/audit`.
 
+## Agents that see, machines that move
+
+WebCortex embeds no vision model — it carries pixels to the model that has one,
+and puts the guard rails a physical system needs around the tools that move it.
+
+```python
+from webcortex import HTTPError, Image, WebCortex
+
+app = WebCortex("cell", start_halted=True)            # boots with the e-stop engaged
+
+@app.get("/camera", tool=True, tool_name="camera", scopes=["observe"])
+def camera() -> dict:
+    frame = cam.read()                                 # an OpenCV / NumPy frame
+    return {"frame": Image.from_array(frame, bgr=True), "exposure_ms": 8}
+
+@app.post("/arm/move", tool=True, tool_name="move_arm", scopes=["operate"],
+          actuator=True, approval="required")
+def move(joint: str, degrees: float) -> dict:
+    if not -90 <= degrees <= 90:
+        raise HTTPError(422, "out of range")           # limits live in code, not prompts
+    return arm.move(joint, degrees)
+
+app.agent("operator", tools=["camera", "move_arm"], scopes=["observe", "operate"], max_images=3)
+```
+
+- **The agent sees the frame.** A tool that returns a `webcortex.Image` —
+  anywhere in its result — hands the model the picture itself, over both wire
+  formats (Anthropic and OpenAI-compatible, so local vision models too) and over
+  MCP, where Claude Code and other clients receive it as image content. Agent
+  endpoints also take `"images": [...]` with the input.
+- **Frames do not become a token leak.** Images are lifted out before
+  tool-result bounding, step records keep their size rather than their base64,
+  and only the last `max_images` stay in context as pixels.
+- **An emergency stop that cannot be routed around.** `actuator=True` routes
+  refuse with `423` while halted — over HTTP, from an agent, a behaviour, a
+  flow, MCP, or an approval granted after the stop. `webcortex halt` /
+  `webcortex release`, or `POST /_webcortex/halt` and `/release`.
+- **`webcortex new cell -t robotics`** scaffolds a simulated arm and camera with
+  an inspector agent and an operator agent, gated, scoped and booting halted.
+  Swap the `Cell` class for your driver — serial, ROS 2, Modbus, a vendor SDK.
+
+See [Vision and robotics](docs/vision-and-robotics.md).
+
 ## Security defaults
 
 Deny-by-default throughout; relaxing something costs a line, tightening it costs
@@ -404,7 +447,7 @@ tested, the known limits, and what v2 added to the surface.
 
 ## Status
 
-v2.1.1. Working and tested: the manifest IR, router, native ops (static /
+v2.2.0. Working and tested: the manifest IR, router, native ops (static /
 query / proxy / page / files / flow), the free-threaded Python bridge,
 authentication and scopes, rate limiting, CORS, security headers, graceful
 shutdown, Behaviours with concurrent leaves, the agent runtime with handoffs,
@@ -412,8 +455,9 @@ sessions, resumable approval gates, composing budgets, tool-result bounding and
 compaction, context providers, memory, flows, two providers (Anthropic and
 OpenAI-compatible, which covers local models), prompt caching, the spend
 ledger, the audit trail, OpenAPI, the MCP server, TypeScript generation, the
-context pack and `evolve`. **355 tests** (106 Rust, 249 Python, including a
-54-test adversarial suite and an offline end-to-end suite that drives the whole
+context pack and `evolve`, images in and out of agent runs and MCP, actuators
+and the emergency stop. **403 tests** (124 Rust, 279 Python, including a
+54-test adversarial suite and offline end-to-end suites that drive the whole
 agent stack over HTTP), clippy clean.
 
 Not yet: Postgres, token-level SSE streaming, durable agent runs that survive a

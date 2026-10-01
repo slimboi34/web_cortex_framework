@@ -288,6 +288,17 @@ Ordered by what unblocks the most.
 10. A real load benchmark against Django and FastAPI (see §2).
 11. Ledger export (OpenTelemetry metrics) so spend leaves the process.
 
+**v2.2 — shipped: perception and physical tools**
+✅ Images in and out of agent runs: `webcortex.Image`, an `$image` marker
+   lifted out of tool results before bounding, both wire formats, MCP image
+   content, and `max_images` pruning, because frames are the most expensive
+   context there is. Still no embedded inference: pixels go to the model.
+✅ `actuator=True` and an emergency stop checked in `App::dispatch`, so no path
+   (HTTP, agent, behaviour, flow, MCP, a late approval) gets around it;
+   `start_halted` so a restart does not re-arm hardware; a robotics starter.
+   Streaming (item 5) moves behind this. A camera agent needed a frame more
+   than it needed token deltas.
+
 **Later, if warranted**
 12. Durable agent runs — only with a real design for exactly-once tool
     execution. Sessions and approvals stay in memory until then, and say so.

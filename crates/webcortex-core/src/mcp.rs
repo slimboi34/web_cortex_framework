@@ -120,6 +120,11 @@ fn tool_descriptors(app: &App, caller: &Principal) -> Vec<Value> {
                     // Surfaced so a client can warn a user before a call that
                     // will block on human approval.
                     "requiresApproval": r.approval == crate::manifest::Approval::Required,
+                    // A tool that moves hardware acts on the world outside the
+                    // app; clients use these hints to decide when to confirm.
+                    "destructiveHint": r.actuator,
+                    "openWorldHint": r.actuator,
+                    "actuator": r.actuator,
                 },
             })
         })
@@ -151,15 +156,22 @@ async fn call_tool(app: &App, params: &Value, caller: &Principal) -> Result<Valu
     // the same authority the caller would have over plain HTTP.
     match app.call_tool_as(name, &args, caller).await {
         Ok(value) => {
-            let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+            // An image a tool returned becomes an MCP image item beside the text, so
+            // the client's model sees the frame; the text and the structured copy
+            // keep a placeholder and the size, not megabytes of base64.
+            let (shown, images) = crate::agent::vision::extract(&value, crate::agent::vision::MAX_IMAGES);
+            let text = serde_json::to_string_pretty(&shown).unwrap_or_else(|_| shown.to_string());
+            let value = crate::agent::vision::redact(&value);
             // MCP requires `structuredContent` to be a JSON object. A tool whose result is a
             // list or a scalar — every `list_*` resource route, for one — is wrapped as
             // `{"result": …}`; an object passes through unchanged. Strict clients (Claude
             // Code among them) reject the bare value as malformed, which turned a working
             // list route into a tool the model could not use.
             let structured = if value.is_object() { value.clone() } else { json!({"result": value}) };
+            let mut content = vec![json!({"type": "text", "text": text})];
+            content.extend(images.iter().filter_map(mcp_image));
             Ok(json!({
-                "content": [{"type": "text", "text": text}],
+                "content": content,
                 "structuredContent": structured,
                 "isError": false,
             }))
@@ -171,6 +183,20 @@ async fn call_tool(app: &App, params: &Value, caller: &Principal) -> Result<Valu
             "isError": true,
         })),
     }
+}
+
+/// A canonical base64 image block as an MCP image content item. URL images
+/// have no MCP form; their placeholder text already carries the URL.
+fn mcp_image(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    if source.get("type")?.as_str()? != "base64" {
+        return None;
+    }
+    Some(json!({
+        "type": "image",
+        "data": source.get("data")?,
+        "mimeType": source.get("media_type")?,
+    }))
 }
 
 fn error_obj(id: Value, code: i64, message: String) -> Value {

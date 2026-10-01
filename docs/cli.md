@@ -17,7 +17,7 @@ $ webcortex new myapp --template fullstack
 
 | Option | Default | |
 |---|---|---|
-| `--template`, `-t` | `api` | `api` · `fullstack` · `agent` · `behaviour` · `orchestration` |
+| `--template`, `-t` | `api` | `api` · `fullstack` · `agent` · `behaviour` · `orchestration` · `robotics` |
 | `--directory`, `-d` | `<name>` | Target directory |
 | `--description` | — | Project description |
 
@@ -191,6 +191,29 @@ $ webcortex evolve "..." --json    # {summary, code, notes}
 
 It prints a proposal; it never edits `api.py`. Needs the relevant key in the
 environment, or an `ollama/…` model, which needs none.
+
+## `webcortex halt` / `webcortex release`
+
+The emergency stop for a running app. While halted, every `actuator=True`
+route refuses with 423, whether HTTP, agent, behaviour, flow or MCP calls it.
+
+```console
+$ webcortex halt --reason "person in the cell"
+HALTED: person in the cell. Actuators refuse to run until `webcortex release`.
+$ webcortex halt --status
+$ webcortex release
+released: actuators enabled
+```
+
+| Option | Default | |
+|---|---|---|
+| `--reason`, `-r` | `emergency stop` | Recorded in the audit log |
+| `--status` | off | Report the state without changing it |
+| `--key` | `$WEBCORTEX_API_KEY` | A key with `webcortex:admin` |
+
+Both commands call the control plane of the app at `WEBCORTEX_HOST` and
+`WEBCORTEX_PORT`, or at the app's own host and port. See
+[Vision and robotics](vision-and-robotics.md).
 
 
 ---

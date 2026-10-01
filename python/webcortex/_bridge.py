@@ -278,6 +278,10 @@ def _encode(value: Any) -> tuple[int, bytes, str, list]:
 
 def _fallback(obj: Any) -> Any:
     """Last-resort JSON encoding for types the stdlib encoder rejects."""
+    # `webcortex.Image`, and anything else that knows its own wire form.
+    hook = getattr(obj, "__webcortex_json__", None)
+    if callable(hook):
+        return hook()
     for attr in ("model_dump", "dict", "_asdict"):
         method = getattr(obj, attr, None)
         if callable(method):

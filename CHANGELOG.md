@@ -3,6 +3,61 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.2.0] — 2026-10-01
+
+Agents that see, and machines they may only move with permission.
+
+### Added — perception
+
+- **`webcortex.Image`.** Return one from any handler, alone or nested anywhere in the
+  result, and an agent calling that tool receives the picture itself. Constructors:
+  `from_array` (NumPy `uint8` arrays or nested lists, encoded as PNG with the standard
+  library; `bgr=True` for OpenCV frames), `from_bytes` (the type is sniffed), `from_path`,
+  `from_pil`, `from_url`. Neither NumPy nor Pillow is a dependency. A route annotated
+  `-> Image` advertises the shape in OpenAPI.
+- **Images in agent runs.** The runtime lifts each `{"$image": …}` marker out of a tool
+  result *before* bounding, leaves a placeholder in the text, and attaches the image to
+  the `tool_result`. It works in both wire formats: Anthropic image blocks, and for
+  OpenAI-compatible servers (local vision models), `image_url` parts in a user message
+  after the tool messages. Step records and the audit log keep each image's size, never
+  its base64.
+- **Images with the input.** Every agent endpoint takes `"images": [...]` (up to 16, each
+  5 MB at most, as `{"media_type", "data"}` or `{"url"}`). A bad item is a 400 that names it.
+- **`max_images` (default 4).** Only the newest images stay in context as pixels; older
+  ones become a line of text, counted in `usage.images_dropped`. A camera tool called in a
+  loop no longer resends every frame on every step.
+- **MCP image content.** `tools/call` returns tool images as `image` items, so Claude Code
+  and other MCP clients see the frame. `structuredContent` holds the redacted value.
+
+### Added — physical tools
+
+- **`actuator=True`** on any route marks it as moving hardware. MCP `tools/list` reports
+  it, with `destructiveHint` and `openWorldHint`.
+- **An emergency stop.** `POST /_webcortex/halt` (with an optional `reason`) and
+  `POST /_webcortex/release`, `GET /_webcortex/halt`, plus `webcortex halt` and
+  `webcortex release` on the command line. While halted, every actuator answers 423
+  before its handler runs. The check sits in `App::dispatch`, so HTTP, agent tool calls,
+  behaviours, flows, MCP and approvals granted after the halt are all refused. Reads keep
+  working. Halting and releasing are audited, `/health` reports `halted`, and both routes
+  need `webcortex:admin`.
+- **`WebCortex(..., start_halted=True)`** boots with the stop engaged, so a crash and
+  restart does not re-arm hardware.
+- **`security_report()["actuators"]`** and `actuator_warnings`. The boot banner and the
+  context pack flag actuators with no authentication, with no scope, or exposed to agents
+  without `approval="required"`.
+- **`webcortex new NAME -t robotics`.** A simulated two-joint arm, gripper and camera; an
+  inspector agent that only looks and an operator agent whose every move needs approval;
+  `observe` and `operate` scopes; joint limits enforced in code; boots halted. Replace the
+  `Cell` class with your driver.
+- Docs: [Vision and robotics](docs/vision-and-robotics.md).
+
+### Changed
+
+- `FakeProvider` reads the text of a message that carries images, and appends
+  ` [saw N image(s)]` when the last message held any, so offline tests can see pixels
+  arrive.
+- The DESIGN roadmap puts perception and physical tools ahead of SSE streaming.
+
 ## [2.1.1] — 2026-09-30
 
 ### Fixed

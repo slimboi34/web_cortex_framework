@@ -276,5 +276,10 @@ Rust, at ~22,000 requests/second. `{{ u.email }}` is HTML-escaped automatically.
 | To front an internal service | `app.upstream` + `app.proxy` |
 | A known procedure with judgment in it | `@app.behaviour(...)` |
 | Open-ended assistance | `app.agent(...)` |
+| An agent that looks at images | a tool returning `webcortex.Image`, or `"images"` in the request |
+| A tool that moves hardware | `actuator=True, approval="required"`, plus the emergency stop |
+
+For cameras, robot arms, lab instruments and PLCs, see
+[Vision and robotics](vision-and-robotics.md), or run `webcortex new cell -t robotics`.
 
 [Deployment :material-arrow-right:](deployment.md){ .md-button .md-button--primary }

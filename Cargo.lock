@@ -2616,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "webcortex-core"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2643,7 +2643,7 @@ dependencies = [
 
 [[package]]
 name = "webcortex-py"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "bytes",
  "futures",

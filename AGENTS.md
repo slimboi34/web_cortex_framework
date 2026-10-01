@@ -110,8 +110,16 @@ if it is missing — a boot error, not a runtime one.
 
 ```python
 @app.route(method, path, *, tool=False, tool_name=None, read_only=None,
-           idempotent=None, scopes=(), approval="never", summary="")
+           idempotent=None, scopes=(), approval="never", actuator=False, summary="")
 ```
+
+`actuator=True` marks a handler that moves hardware. While the emergency stop is
+engaged (`POST /_webcortex/halt`, `webcortex halt`, or
+`WebCortex(..., start_halted=True)` at boot) `App::dispatch` answers it with
+**423** before the op runs — so HTTP, agent tool calls, behaviours, flows, MCP
+and approvals resumed after the stop are all refused. `security_report()` lists
+actuators and warns about any that are unscoped, or agent tools without
+`approval="required"`. Section 8a covers images.
 
 Shorthands: `@app.get`, `@app.post`, `@app.put`, `@app.patch`, `@app.delete` —
 all take `(path, **kw)` with the same keywords.
@@ -447,7 +455,7 @@ app.agent(name, *, model="default", system="", tools=(), handoffs=(), context=()
           expose_at=None, scopes=(), expose_scopes=None, temperature=None,
           max_tokens=16_000, cache=True, context_window=None,
           tool_result_limit=16_384, compact_with=None, keep_recent=6,
-          tool=True) -> None
+          max_images=4, tool=True) -> None
 ```
 
 `tools` names routes that were declared with `tool=True` — including other
@@ -458,7 +466,7 @@ loopback HTTP request**, and it inherits the route's declared scopes.
 **Every agent is a route and a tool.** It is mounted at `expose_at` (default
 `/agents/<name-with-hyphens>`) with tool name `<name>`, guarded by
 `expose_scopes` (default `scopes`). The route takes
-`{"input": str, "session_id"?: str, "reset"?: bool}`. This is a change from
+`{"input": str, "session_id"?: str, "reset"?: bool, "images"?: [...]}`. This is a change from
 0.3, where an agent without `expose_at` had no route: an agent declared with
 `scopes=()` is now a public route, and `webcortex security` reports it.
 
@@ -550,6 +558,33 @@ Result: `{flow, run_id, status: completed|budget_exhausted, output, steps:
 
 ---
 
+## 8a. Images and vision
+
+No vision model is embedded (DESIGN §5); pixels are carried to the model.
+
+- **Marker.** An image inside any JSON value is the one-key object
+  `{"$image": {"media_type": "image/png|jpeg|gif|webp", "data": "<base64>"}}`
+  or `{"$image": {"url": "http(s)://…"}}`. `webcortex.Image`
+  (`python/webcortex/media.py`) serialises to it via `__webcortex_json__`, which
+  `_bridge._fallback` honours; `from_bytes | from_path | from_url | from_pil |
+  from_array(pixels, bgr=False)` — `from_array` is a stdlib PNG encoder that
+  takes NumPy `uint8` arrays by duck typing or nested lists.
+- **Runtime** (`crates/webcortex-core/src/agent/vision.rs`). `dispatch_call`
+  runs `vision::extract` on a tool result *before* `bounded`: each marker
+  becomes a placeholder string and a canonical Anthropic image block appended to
+  the `tool_result.content` array (`tool_result_with_images`). The step record
+  gets `vision::redact` (size, no base64). `vision::prune` runs before every
+  provider call and keeps the newest `policy.max_images` images as pixels.
+  Input images (`RunOptions.images`, from the request's `images`) precede the
+  text block of the first user message. Limits: 16 images, 5 MB each.
+- **OpenAI-compatible** (`to_openai_messages`): tool messages stay text; tool
+  images follow in one `user` message as `image_url` parts (data URLs).
+- **MCP** `tools/call`: images become `{"type": "image", "data", "mimeType"}`
+  items after the text item; `structuredContent` is the redacted value.
+  `tools/list` annotations carry `actuator`, and `destructiveHint` /
+  `openWorldHint` are true for actuators.
+- **FakeProvider** appends ` [saw N image(s)]` when the last message held images.
+
 ## 9. Introspection and output
 
 | call | returns |
@@ -588,7 +623,7 @@ precise tool schema. Do not "fix" this by making it raise.
 ## 10. The CLI
 
 ```
-webcortex new NAME [-t api|fullstack|agent|behaviour|orchestration] [-d DIR] [--description D]
+webcortex new NAME [-t api|fullstack|agent|behaviour|orchestration|robotics] [-d DIR] [--description D]
 webcortex keygen
 webcortex dev      [target] [--host H] [--port P] [--workers N]
 webcortex run      [target] [--host H] [--port P] [--workers N]
@@ -600,7 +635,13 @@ webcortex security [target]
 webcortex typegen  [target] [-o client/api.ts]
 webcortex context  [target] [--json]
 webcortex evolve   REQUEST [target] [-m MODEL] [-o FILE] [--json]
+webcortex halt     [target] [--reason R] [--status] [--key K]
+webcortex release  [target] [--key K]
 ```
+
+`halt` and `release` call the running app's control plane (`POST
+{control_prefix}/halt|release`, admin scope) using `--key` or
+`$WEBCORTEX_API_KEY`, at `WEBCORTEX_HOST`/`WEBCORTEX_PORT` or the app's own.
 
 `evolve` calls `_core.ask_model(manifest_json, model, system, prompt, schema,
 max_tokens)`, which builds a `ProviderRegistry` from the app's `models`

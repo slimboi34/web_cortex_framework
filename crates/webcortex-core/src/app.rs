@@ -53,6 +53,9 @@ pub struct App {
     /// application in order to call tools, and that reference is necessarily
     /// cyclic; a Weak keeps it from leaking.
     self_ref: std::sync::OnceLock<std::sync::Weak<App>>,
+    /// The emergency stop. While set, every route declared `actuator` refuses
+    /// to run, whoever asks and however they arrive.
+    halt: Mutex<Option<serde_json::Value>>,
 }
 
 impl App {
@@ -159,6 +162,7 @@ impl App {
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| format!("http client build failed: {e}"))?;
+        let manifest_start_halted = manifest.server.start_halted;
 
         Ok(Self {
             manifest,
@@ -184,6 +188,10 @@ impl App {
             sessions,
             approvals: Mutex::new(HashMap::new()),
             self_ref: std::sync::OnceLock::new(),
+            halt: Mutex::new(manifest_start_halted.then(|| {
+                serde_json::json!({"reason": "started halted; release to enable actuators",
+                                   "by": "boot", "since_unix": 0})
+            })),
         })
     }
 
@@ -283,6 +291,45 @@ impl App {
         Ok(runtime.resume_approval(self, run, approve, note).await)
     }
 
+    /// Engage the emergency stop. Idempotent; a second halt updates the reason.
+    pub fn halt(&self, reason: &str, by: &Principal) {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let state = serde_json::json!({"reason": reason, "by": by.id, "since_unix": since});
+        *self.halt.lock().unwrap_or_else(|p| p.into_inner()) = Some(state.clone());
+        tracing::warn!(reason = %reason, by = %by.id, "actuators halted");
+        self.audit.record(crate::audit::AuditEvent {
+            kind: "halted".into(),
+            run_id: String::new(),
+            actor: Some(by.id.clone()),
+            tool: None,
+            detail: state,
+        });
+    }
+
+    /// Release the emergency stop. Returns whether it was engaged.
+    pub fn release(&self, by: &Principal) -> bool {
+        let was = self.halt.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if was.is_some() {
+            tracing::warn!(by = %by.id, "actuators released");
+            self.audit.record(crate::audit::AuditEvent {
+                kind: "released".into(),
+                run_id: String::new(),
+                actor: Some(by.id.clone()),
+                tool: None,
+                detail: serde_json::json!({"was": was}),
+            });
+        }
+        was.is_some()
+    }
+
+    /// The halt state, when the emergency stop is engaged.
+    pub fn halted(&self) -> Option<serde_json::Value> {
+        self.halt.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     pub fn behaviour(&self, name: &str) -> Option<&crate::manifest::BehaviourDef> {
         self.behaviours.get(name)
     }
@@ -377,6 +424,23 @@ impl App {
                 return WebCortexResponse::error(
                     status,
                     format!("missing required scope(s): {}", missing.join(", ")),
+                );
+            }
+        }
+
+        // The emergency stop sits here, after authentication and before the
+        // op, so it covers HTTP, agent tool calls, behaviours, flows, MCP and
+        // approvals resumed after the halt — they all come through dispatch.
+        if route.actuator {
+            if let Some(state) = self.halted() {
+                let reason = state.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+                return WebCortexResponse::error(
+                    423,
+                    format!(
+                        "actuators are halted ({reason}); nothing that moves hardware will run \
+                         until an operator releases the stop at {}/release",
+                        self.manifest.server.control_prefix
+                    ),
                 );
             }
         }
@@ -654,11 +718,17 @@ impl App {
             ));
         }
 
+        let images = match crate::agent::vision::input_images(req.lookup("images").as_ref()) {
+            Ok(images) => images,
+            Err(e) => return Ok(WebCortexResponse::error(400, e)),
+        };
+
         let opts = RunOptions {
             depth: req.depth,
             budget: req.budget.clone(),
             session_id,
             reset_session,
+            images,
         };
         let result = runtime.run(self, def, &req.principal, &input, opts).await;
         Ok(run_result_response(&result))

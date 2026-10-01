@@ -404,33 +404,57 @@ impl ModelProvider for OpenAiCompatProvider {
 
 /// Translate one canonical (Anthropic-shaped) message into OpenAI messages.
 /// A user turn holding tool results becomes one `tool` message per result.
+///
+/// OpenAI `tool` messages carry text only, so images a tool returned travel in
+/// one `user` message after the tool messages, labelled with the call they
+/// came from. Images sent with the input become `image_url` parts.
 pub fn to_openai_messages(role: &str, content: &Value) -> Vec<Value> {
     match (role, content) {
         (_, Value::String(s)) => vec![json!({"role": role, "content": s})],
         ("user", Value::Array(blocks)) => {
             let mut out = Vec::new();
             let mut text = String::new();
+            let mut parts: Vec<Value> = Vec::new();
             for b in blocks {
                 match b.get("type").and_then(|t| t.as_str()) {
-                    Some("tool_result") => out.push(json!({
-                        "role": "tool",
-                        "tool_call_id": b.get("tool_use_id").cloned().unwrap_or(Value::Null),
-                        "content": match b.get("content") {
-                            Some(Value::String(s)) => s.clone(),
-                            Some(other) => other.to_string(),
-                            None => String::new(),
-                        },
-                    })),
+                    Some("tool_result") => {
+                        let id = b.get("tool_use_id").cloned().unwrap_or(Value::Null);
+                        let (body, images) = match b.get("content") {
+                            Some(Value::String(s)) => (s.clone(), Vec::new()),
+                            Some(Value::Array(inner)) => (
+                                crate::agent::message_text(&Value::Array(inner.clone())),
+                                inner.iter().filter_map(super::vision::openai_part).collect(),
+                            ),
+                            Some(other) => (other.to_string(), Vec::new()),
+                            None => (String::new(), Vec::new()),
+                        };
+                        if !images.is_empty() {
+                            parts.push(json!({"type": "text", "text": format!(
+                                "Images returned by tool call {}:",
+                                id.as_str().unwrap_or("?")
+                            )}));
+                            parts.extend(images);
+                        }
+                        out.push(json!({"role": "tool", "tool_call_id": id, "content": body}));
+                    }
                     Some("text") => {
                         if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                             text.push_str(t);
                         }
                     }
+                    Some("image") => parts.extend(super::vision::openai_part(b)),
                     _ => {}
                 }
             }
-            if !text.is_empty() {
-                out.push(json!({"role": "user", "content": text}));
+            if parts.is_empty() {
+                if !text.is_empty() {
+                    out.push(json!({"role": "user", "content": text}));
+                }
+            } else {
+                if !text.is_empty() {
+                    parts.push(json!({"type": "text", "text": text}));
+                }
+                out.push(json!({"role": "user", "content": parts}));
             }
             out
         }
@@ -878,10 +902,20 @@ impl ModelProvider for FakeProvider {
             };
 
             let last = req.conversation.messages.last();
+            let is_tool_results = |c: &Value| {
+                c.as_array().is_some_and(|bs| {
+                    bs.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                })
+            };
             let last_text = match last.map(|m| &m.content) {
                 Some(Value::String(s)) => Some(s.clone()),
+                // Input sent with images: the text block is the prompt.
+                Some(c @ Value::Array(_)) if !is_tool_results(c) => Some(crate::agent::message_text(c)),
                 _ => None,
             };
+            // So a test can see that pixels reached the model.
+            let seen = last.map(|m| super::vision::count(&m.content)).unwrap_or(0);
+            let images_note = if seen > 0 { format!(" [saw {seen} image(s)]") } else { String::new() };
 
             // A forced tool: structured output.
             if let Some(forced) = req.force_tool {
@@ -914,7 +948,8 @@ impl ModelProvider for FakeProvider {
                 let summary = match last.map(|m| &m.content) {
                     Some(Value::Array(blocks)) => blocks
                         .iter()
-                        .filter_map(|b| b.get("content").and_then(|c| c.as_str()))
+                        .filter_map(|b| b.get("content"))
+                        .map(|c| c.as_str().map(str::to_string).unwrap_or_else(|| crate::agent::message_text(c)))
                         .map(|s| {
                             let n = s.chars().count();
                             let tail: String = s.chars().skip(n.saturating_sub(160)).collect();
@@ -925,7 +960,7 @@ impl ModelProvider for FakeProvider {
                     _ => String::new(),
                 };
 
-                let reply = format!("{} says: {summary}", req.agent.name);
+                let reply = format!("{} says: {summary}{images_note}", req.agent.name);
                 return done(
                     reply.clone(),
                     Vec::new(),
@@ -964,7 +999,7 @@ impl ModelProvider for FakeProvider {
                 return done(String::new(), calls, Value::Array(raw), StopReason::ToolUse);
             }
 
-            let reply = format!("{} echoes: {text}", req.agent.name);
+            let reply = format!("{} echoes: {text}{images_note}", req.agent.name);
             done(
                 reply.clone(),
                 Vec::new(),
@@ -1103,6 +1138,27 @@ mod tests {
         assert_eq!(out[0]["role"], "tool");
         assert_eq!(out[0]["tool_call_id"], "c1");
         assert_eq!(out[1]["content"], "{\"n\":2}");
+    }
+
+    #[test]
+    fn images_reach_openai_as_image_url_parts_after_the_tool_messages() {
+        let img = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}});
+        let content = json!([
+            {"type": "tool_result", "tool_use_id": "c1", "is_error": false,
+             "content": [{"type": "text", "text": "{\"frame\":\"[image 1]\"}"}, img]},
+        ]);
+        let out = to_openai_messages("user", &content);
+        assert_eq!(out.len(), 2, "tool message, then the images");
+        assert_eq!(out[0]["role"], "tool");
+        assert_eq!(out[0]["content"], "{\"frame\":\"[image 1]\"}");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"][1]["image_url"]["url"], "data:image/png;base64,AAAA");
+
+        let input = json!([img, {"type": "text", "text": "what is this?"}]);
+        let out = to_openai_messages("user", &input);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["content"][0]["type"], "image_url");
+        assert_eq!(out[0]["content"][1]["text"], "what is this?");
     }
 
     #[test]

@@ -391,8 +391,31 @@ async fn control_plane(
                 "python_workers": app.bridge().workers(),
                 "sessions": app.sessions().len(),
                 "pending_approvals": app.pending_approvals().len(),
+                "halted": app.halted().is_some(),
             }),
         ),
+
+        // The emergency stop. Engaging it needs the same admin scope as every
+        // other control route, but nothing else: no body is required, because
+        // whoever reaches for an e-stop should not have to compose JSON.
+        ("GET", "/halt") => WebCortexResponse::json(
+            200,
+            &serde_json::json!({"halted": app.halted().is_some(), "state": app.halted()}),
+        ),
+        ("POST", "/halt") => {
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+            let reason = parsed
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .filter(|r| !r.is_empty())
+                .unwrap_or("emergency stop");
+            app.halt(reason, principal);
+            WebCortexResponse::json(200, &serde_json::json!({"halted": true, "state": app.halted()}))
+        }
+        ("POST", "/release") => {
+            let was = app.release(principal);
+            WebCortexResponse::json(200, &serde_json::json!({"halted": false, "was_halted": was}))
+        }
 
         // Spend, by model and by what spent it. Cost is reported only when
         // every model involved has a declared price.
@@ -467,6 +490,7 @@ async fn control_plane(
                     "read_only": r.tool.read_only,
                     "scopes": r.scopes,
                     "approval": r.approval,
+                    "actuator": r.actuator,
                 })).collect::<Vec<_>>()
             }),
         ),

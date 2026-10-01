@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub mod provider;
 pub mod registry;
 pub mod session;
+pub mod vision;
 
 pub use provider::{
     CompletionRequest, ModelProvider, ProviderResponse, StopReason, ToolCall, recover_json,
@@ -127,6 +128,9 @@ pub struct Usage {
     /// run that called nothing model-backed.
     #[serde(default)]
     pub tree_tokens: u64,
+    /// Older images replaced with text to keep context within `max_images`.
+    #[serde(default)]
+    pub images_dropped: u32,
 }
 
 impl Usage {
@@ -236,6 +240,8 @@ pub struct RunOptions {
     pub session_id: Option<String>,
     /// Discard any existing session history before this turn.
     pub reset_session: bool,
+    /// Canonical image blocks sent with the input (see [`vision`]).
+    pub images: Vec<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +369,14 @@ impl AgentRuntime {
             }
             _ => Conversation::default(),
         };
-        conversation.messages.push(Message { role: "user".into(), content: json!(input) });
+        let content = if opts.images.is_empty() {
+            json!(input)
+        } else {
+            let mut blocks = opts.images.clone();
+            blocks.push(json!({"type": "text", "text": input}));
+            Value::Array(blocks)
+        };
+        conversation.messages.push(Message { role: "user".into(), content });
 
         let budget = opts
             .budget
@@ -516,6 +529,11 @@ impl AgentRuntime {
                     }
                 }
             }
+
+            // Every step resends the conversation, so every image in it is paid
+            // for again. Only the most recent few stay as pixels.
+            let dropped = vision::prune(&mut st.conversation.messages, st.entry.policy.max_images);
+            st.usage.images_dropped = st.usage.images_dropped.saturating_add(dropped as u32);
 
             let tools = self.tool_specs(app, &st.def);
             let started = std::time::Instant::now();
@@ -675,10 +693,15 @@ impl AgentRuntime {
         self.audit.record(AuditEvent::tool_called(
             &st.run_id, &st.actor, &call.name, &call.arguments, outcome.is_ok(), duration_ms,
         ));
+        let mut images = Vec::new();
         let (result, error, shown, is_error) = match outcome {
             Ok(value) => {
-                let shown = bounded(&value, st.entry.policy.max_tool_result_bytes);
-                (Some(value), None, shown, false)
+                // Images are lifted out before bounding: a frame is not text to
+                // be truncated, and its base64 would otherwise eat the budget.
+                let (text, found) = vision::extract(&value, vision::MAX_IMAGES);
+                images = found;
+                let shown = bounded(&text, st.entry.policy.max_tool_result_bytes);
+                (Some(vision::redact(&value)), None, shown, false)
             }
             Err(e) => (None, Some(e.clone()), json!({"error": e}), true),
         };
@@ -691,7 +714,7 @@ impl AgentRuntime {
             error,
             duration_ms,
         });
-        tool_result(&call.id, &shown, is_error)
+        tool_result_with_images(&call.id, &shown, is_error, images)
     }
 
     async fn handoff(
@@ -723,9 +746,8 @@ impl AgentRuntime {
             .conversation
             .messages
             .first()
-            .and_then(|m| m.content.as_str())
-            .unwrap_or("")
-            .to_string();
+            .map(|m| message_text(&m.content))
+            .unwrap_or_default();
         st.system_suffix = self.system_suffix(app, &next, &actor, &last_input).await?;
         st.actor = actor;
         st.def = next;
@@ -1050,6 +1072,34 @@ pub fn tool_result(id: &str, content: &Value, is_error: bool) -> Value {
     })
 }
 
+/// A tool result that carries images beside its text. Anthropic accepts image
+/// blocks inside `tool_result.content`; the OpenAI translation moves them into
+/// a user message that follows the tool messages.
+pub fn tool_result_with_images(id: &str, content: &Value, is_error: bool, images: Vec<Value>) -> Value {
+    let mut result = tool_result(id, content, is_error);
+    if !images.is_empty() {
+        let text = result["content"].take();
+        let mut blocks = vec![json!({"type": "text", "text": text})];
+        blocks.extend(images);
+        result["content"] = Value::Array(blocks);
+    }
+    result
+}
+
+/// The text of a message, ignoring images and tool traffic.
+pub fn message_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 /// Cap what the model sees of a tool result. The full value is still in the
 /// step record and the audit log; only the model's copy is cut.
 pub fn bounded(value: &Value, max_bytes: usize) -> Value {
@@ -1083,8 +1133,9 @@ fn render_message(content: &Value) -> String {
                 ),
                 Some("tool_result") => format!(
                     "[result: {}]",
-                    b.get("content").and_then(|c| c.as_str()).unwrap_or("")
+                    b.get("content").map(render_message).unwrap_or_default()
                 ),
+                Some("image") => format!("[{}]", vision::describe(b)),
                 _ => String::new(),
             })
             .filter(|s| !s.is_empty())
@@ -1099,6 +1150,7 @@ mod tests {
     use super::*;
     use crate::audit::MemoryAudit;
     use crate::manifest::Manifest;
+    use crate::http::WebCortexRequest;
     use provider::ScriptedProvider;
 
     fn manifest() -> Manifest {
@@ -1519,5 +1571,153 @@ mod tests {
         assert!(budget.charge(u64::MAX).is_err());
         assert_eq!(budget.used(), u64::MAX);
         assert!(budget.exhausted());
+    }
+
+    // -----------------------------------------------------------------------
+    // Perception and physical tools
+    // -----------------------------------------------------------------------
+
+    // A 1x1 PNG.
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    fn robot_manifest(start_halted: bool) -> Manifest {
+        serde_json::from_value(json!({
+            "name": "robot",
+            "server": {"start_halted": start_halted},
+            "routes": [
+                {"id": 0, "method": "GET", "path": "/camera",
+                 "op": {"kind": "static", "body": {"frame": {"$image": {"media_type": "image/png", "data": PNG}}, "exposure_ms": 8}},
+                 "tool": {"expose": true, "name": "camera", "read_only": true}},
+                {"id": 1, "method": "POST", "path": "/arm/move",
+                 "op": {"kind": "static", "body": {"moved": true}},
+                 "tool": {"expose": true, "name": "move_arm"},
+                 "actuator": true},
+                {"id": 2, "method": "GET", "path": "/sensors",
+                 "op": {"kind": "static", "body": {"temp_c": 31.5}},
+                 "tool": {"expose": true, "name": "sensors", "read_only": true}}
+            ],
+            "agents": [
+                {"name": "eye", "model": "test", "tools": ["camera", "move_arm", "sensors"], "max_steps": 8,
+                 "policy": {"max_images": 1}}
+            ]
+        }))
+        .expect("robot manifest")
+    }
+
+    async fn robot_with(provider: ScriptedProvider, start_halted: bool) -> (Arc<App>, Arc<ScriptedProvider>) {
+        let app = App::build_without_python(robot_manifest(start_halted)).await.expect("app builds");
+        let provider = Arc::new(provider);
+        let rt = AgentRuntime::new(provider.clone(), Arc::new(MemoryAudit::default()));
+        (app.with_agent_runtime(rt).into_arc(), provider)
+    }
+
+    #[tokio::test]
+    async fn an_image_a_tool_returns_reaches_the_model_as_pixels_and_the_step_keeps_its_size() {
+        let (app, provider) = robot_with(ScriptedProvider::tool_then_text("camera", json!({}), "a bolt"), false).await;
+        let out = run(&app, "eye", &caller(&[]), "what do you see?").await;
+        assert_eq!(out.status, RunStatus::Completed);
+
+        let seen = provider.snapshots().last().unwrap().messages.last().unwrap().clone();
+        let result = &seen["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][1]["source"]["data"], PNG);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[image 1: image/png") && text.contains("exposure_ms"), "{text}");
+        assert!(!text.contains(PNG), "pixels are not repeated as text");
+
+        let step = out.steps.iter().find(|s| s.kind == StepKind::ToolCall).unwrap();
+        let recorded = step.result.as_ref().unwrap();
+        assert!(recorded["frame"]["$image"]["bytes"].as_u64().unwrap() > 0);
+        assert!(!recorded.to_string().contains(PNG), "the step record holds no base64");
+    }
+
+    #[tokio::test]
+    async fn images_sent_with_the_input_come_before_the_text() {
+        let (app, provider) = robot_with(ScriptedProvider::text("seen"), false).await;
+        let images = vision::input_images(Some(&json!([{"media_type": "image/png", "data": PNG}]))).unwrap();
+        let opts = RunOptions { images, ..Default::default() };
+        let out = app.invoke_agent("eye", "inspect this weld", &caller(&[]), opts).await.unwrap();
+        assert_eq!(out.status, RunStatus::Completed);
+        let first = provider.snapshots()[0].messages[0].clone();
+        assert_eq!(first["content"][0]["type"], "image");
+        assert_eq!(first["content"][1]["text"], "inspect this weld");
+    }
+
+    #[tokio::test]
+    async fn only_the_most_recent_images_stay_in_context() {
+        let (app, provider) = robot_with(
+            ScriptedProvider::sequence(vec![
+                ("tool", "camera", json!({})),
+                ("tool", "camera", json!({})),
+                ("tool", "camera", json!({})),
+                ("text", "done", json!(null)),
+            ]),
+            false,
+        )
+        .await;
+        let out = run(&app, "eye", &caller(&[]), "watch").await;
+        assert_eq!(out.status, RunStatus::Completed);
+        assert_eq!(out.usage.images_dropped, 2, "max_images is 1 and three frames were taken");
+        let last = provider.snapshots().last().unwrap().clone();
+        let images: usize = last.messages.iter().map(|m| vision::count(&m["content"])).sum();
+        assert_eq!(images, 1);
+    }
+
+    #[tokio::test]
+    async fn the_emergency_stop_refuses_actuators_and_nothing_else() {
+        let (app, _) = robot_with(
+            ScriptedProvider::tools_then_text(vec![("move_arm", json!({})), ("sensors", json!({}))], "ok"),
+            false,
+        )
+        .await;
+        app.halt("operator pressed the button", &caller(&["*"]));
+        let out = run(&app, "eye", &caller(&["*"]), "move").await;
+        let calls: Vec<_> = out.steps.iter().filter(|s| s.kind == StepKind::ToolCall).collect();
+        assert!(calls[0].error.as_ref().unwrap().contains("423"), "{:?}", calls[0].error);
+        assert!(calls[0].error.as_ref().unwrap().contains("operator pressed the button"));
+        assert_eq!(calls[1].result, Some(json!({"temp_c": 31.5})), "sensors still read");
+
+        // Straight over HTTP too.
+        let res = app.dispatch(WebCortexRequest::synthetic("POST", "/arm/move")).await;
+        assert_eq!(res.status, 423);
+
+        assert!(app.release(&caller(&["*"])));
+        assert!(!app.release(&caller(&["*"])), "a second release is a no-op");
+        let res = app.dispatch(WebCortexRequest::synthetic("POST", "/arm/move")).await;
+        assert_eq!(res.status, 200);
+    }
+
+    #[tokio::test]
+    async fn an_app_can_boot_halted() {
+        let (app, _) = robot_with(ScriptedProvider::text("x"), true).await;
+        assert!(app.halted().is_some());
+        let res = app.dispatch(WebCortexRequest::synthetic("POST", "/arm/move")).await;
+        assert_eq!(res.status, 423);
+    }
+
+    #[tokio::test]
+    async fn mcp_returns_tool_images_as_image_content_and_honours_the_stop() {
+        let (app, _) = robot_with(ScriptedProvider::text("x"), false).await;
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "camera", "arguments": {}}});
+        let res = crate::mcp::handle(&app, body.to_string().as_bytes(), &caller(&["*"])).await;
+        let v = res.json_value();
+        let content = v["result"]["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        assert_eq!(content[1]["data"], PNG);
+        assert!(!v["result"]["structuredContent"].to_string().contains(PNG));
+
+        let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        let v = crate::mcp::handle(&app, list.to_string().as_bytes(), &caller(&["*"])).await.json_value();
+        let arm = v["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "move_arm").unwrap().clone();
+        assert_eq!(arm["annotations"]["actuator"], true);
+
+        app.halt("", &caller(&["*"]));
+        let call = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                          "params": {"name": "move_arm", "arguments": {}}});
+        let v = crate::mcp::handle(&app, call.to_string().as_bytes(), &caller(&["*"])).await.json_value();
+        assert_eq!(v["result"]["isError"], true);
     }
 }

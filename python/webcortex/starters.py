@@ -1,6 +1,6 @@
 """Project starters for `webcortex new`.
 
-Three shapes, because they are genuinely different applications rather than the
+Six shapes, because they are genuinely different applications rather than the
 same one with features toggled:
 
 * **api**       — a JSON API plus an MCP tool surface
@@ -8,6 +8,9 @@ same one with features toggled:
 * **agent**     — the above, plus an agent with a gated tool and an approval flow
 * **behaviour** — the above, plus Behaviours: procedures whose control flow is
   real Python and whose leaves are model and tool calls
+* **orchestration** — handoffs, flows, memory, context and a local model
+* **robotics** — perception and actuation: a camera an agent can see through,
+  gated actuators, and an emergency stop
 
 Every starter boots with authentication, rate limiting, and security headers
 already on. A starter that generates an insecure app teaches an insecure habit.
@@ -65,6 +68,11 @@ worker pool.
   the two cannot drift. Give every route `scopes=[...]`; everything is deny-by-default.
 - **Dangerous tools wait for a human.** `approval="required"` suspends an agent's run and is
   refused outright over MCP. Use it on anything destructive.
+- **Hardware is `actuator=True`.** Anything that moves, switches or doses something is an
+  actuator: it refuses with 423 while the emergency stop is engaged (`webcortex halt`), from
+  every path. Pair it with `approval="required"`, and keep physical limits in code, not prompts.
+- **Agents can see.** Return a `webcortex.Image` (`Image.from_array(frame, bgr=True)` for
+  OpenCV) from a tool and the agent receives the picture; agent endpoints take `"images"`.
 - **Agents cannot exceed their caller.** Scopes intersect, budgets (`max_steps`,
   `token_budget`) are enforced by the runtime, and a flow shares one budget across its tree.
   Do not try to widen authority from inside an agent.
@@ -386,6 +394,9 @@ def files_for(template: str, name: str, description: str) -> dict[str, str]:
     if template == "orchestration":
         return {**common, "api.py": ORCHESTRATION_API.format(name=name, description=description)}
 
+    if template == "robotics":
+        return {**common, "api.py": ROBOTICS_API.format(name=name, description=description)}
+
     return {
         **common,
         "api.py": FULLSTACK_API.format(name=name, description=description),
@@ -705,5 +716,198 @@ def triage(ctx, input):
 '''
 
 
-TEMPLATES = ("api", "fullstack", "agent", "behaviour", "orchestration")
+
+ROBOTICS_API = '''\
+"""{name} — an agent that can see, and a machine it may only move with permission.
+
+A simulated work cell: a two-joint arm, a gripper and a camera. Swap the
+`Cell` class for your driver (serial, ROS 2, a PLC over Modbus, a vendor SDK)
+and every route, tool, gate and the emergency stop stay exactly as they are.
+
+What WebCortex adds around the hardware:
+
+* **The agent sees.** `camera_snapshot` returns a `webcortex.Image`; an agent
+  calling it receives the frame itself, not a description of one. Only the
+  last `max_images` frames stay in context, so watching is not a token leak.
+* **Moving is gated.** Every actuator is `approval="required"`: a run that
+  wants to move suspends until a human approves that exact call.
+* **There is an emergency stop.** `actuator=True` routes refuse with 423 while
+  halted — over HTTP, from an agent, a behaviour, a flow or MCP. The app
+  boots halted (`start_halted=True`); `webcortex release` arms it and
+  `webcortex halt` stops it.
+* **Authority is scoped.** Looking needs `observe`; moving needs `operate`.
+"""
+
+import math
+import threading
+import time
+
+from webcortex import HTTPError, Image, WebCortex
+
+app = WebCortex(
+    "{name}",
+    description="{description}",
+    database="sqlite://./{name}.db",
+    start_halted=True,
+)
+
+app.api_key("WEBCORTEX_API_KEY", id="operator", scopes=["observe", "operate", "webcortex:admin"])
+app.api_key("WEBCORTEX_VIEWER_KEY", id="viewer", scopes=["observe"])
+app.rate_limit(per_second=20, burst=40)
+
+
+# ---------------------------------------------------------------------------
+# The hardware. Replace this class with your driver.
+# ---------------------------------------------------------------------------
+
+LIMITS = {{"shoulder": (-90.0, 90.0), "elbow": (0.0, 135.0)}}
+
+
+class Cell:
+    """A simulated arm and camera. Thread-safe, as a real driver must be."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.joints = {{"shoulder": 0.0, "elbow": 45.0}}
+        self.gripper_closed = False
+
+    def move(self, joint: str, degrees: float) -> dict:
+        with self.lock:
+            self.joints[joint] = degrees
+            return dict(self.joints)
+
+    def grip(self, closed: bool) -> bool:
+        with self.lock:
+            self.gripper_closed = closed
+            return closed
+
+    def state(self) -> dict:
+        with self.lock:
+            return {{"joints": dict(self.joints), "gripper_closed": self.gripper_closed}}
+
+    def frame(self, width: int = 96, height: int = 72) -> list:
+        """Render the arm as rows of RGB pixels. A real camera returns a NumPy array."""
+        state = self.state()
+        shoulder, elbow = state["joints"]["shoulder"], state["joints"]["elbow"]
+        rows = [[(235, 235, 228)] * width for _ in range(height)]
+
+        def dot(x: float, y: float, colour: tuple, r: int = 1) -> None:
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    px, py = int(x) + dx, int(y) + dy
+                    if 0 <= px < width and 0 <= py < height:
+                        rows[py][px] = colour
+
+        bx, by = width / 2, height - 6
+        a1 = math.radians(90 - shoulder)
+        ex, ey = bx + 26 * math.cos(a1), by - 26 * math.sin(a1)
+        a2 = a1 - math.radians(elbow)
+        tx, ty = ex + 20 * math.cos(a2), ey - 20 * math.sin(a2)
+        for x0, y0, x1, y1, colour in ((bx, by, ex, ey, (40, 70, 160)), (ex, ey, tx, ty, (40, 140, 90))):
+            for i in range(41):
+                dot(x0 + (x1 - x0) * i / 40, y0 + (y1 - y0) * i / 40, colour)
+        dot(tx, ty, (200, 40, 40) if state["gripper_closed"] else (240, 170, 30), r=2)
+        return rows
+
+
+cell = Cell()
+
+
+# ---------------------------------------------------------------------------
+# Perception: read-only tools an agent may call freely.
+# ---------------------------------------------------------------------------
+
+@app.get("/camera/snapshot", tool=True, tool_name="camera_snapshot", scopes=["observe"])
+def camera_snapshot() -> dict:
+    """Take a picture of the work cell. You receive the picture itself."""
+    return {{"frame": Image.from_array(cell.frame()), "taken_at": time.time()}}
+
+
+@app.get("/robot/state", tool=True, tool_name="robot_state", scopes=["observe"])
+def robot_state() -> dict:
+    """Joint angles in degrees, their limits, and whether the gripper is closed."""
+    return {{**cell.state(), "limits": LIMITS}}
+
+
+# ---------------------------------------------------------------------------
+# Actuation: gated, scoped, and stopped by the emergency stop.
+# ---------------------------------------------------------------------------
+
+@app.post("/robot/joints/{{joint}}", tool=True, tool_name="move_joint", scopes=["operate"],
+          actuator=True, approval="required")
+def move_joint(joint: str, degrees: float) -> dict:
+    """Move one joint (shoulder or elbow) to an absolute angle in degrees."""
+    if joint not in LIMITS:
+        raise HTTPError(404, f"no joint {{joint!r}}; joints: {{', '.join(LIMITS)}}")
+    low, high = LIMITS[joint]
+    if not low <= degrees <= high:
+        # Limits are enforced here, in code, not trusted to a prompt.
+        raise HTTPError(422, f"{{joint}} must stay within [{{low}}, {{high}}] degrees")
+    return {{"joints": cell.move(joint, degrees)}}
+
+
+@app.post("/robot/gripper", tool=True, tool_name="set_gripper", scopes=["operate"],
+          actuator=True, approval="required")
+def set_gripper(closed: bool) -> dict:
+    """Open or close the gripper."""
+    return {{"gripper_closed": cell.grip(closed)}}
+
+
+# ---------------------------------------------------------------------------
+# What the agents record: an inspection log, served entirely in Rust.
+# ---------------------------------------------------------------------------
+
+app.resource(
+    "inspections",
+    fields={{"id": int, "verdict": str, "notes": str}},
+    tools=True,
+    read_scopes=["observe"],
+    write_scopes=["observe"],
+)
+
+app.context("cell_rules", data={{
+    "joint_limits_degrees": LIMITS,
+    "rules": [
+        "Look before you move: take a snapshot first.",
+        "Move one joint at a time and look again after each move.",
+        "If anything in the frame is unexpected, stop and report instead of moving.",
+    ],
+}})
+
+
+# ---------------------------------------------------------------------------
+# Agents
+# ---------------------------------------------------------------------------
+
+app.agent(
+    "inspector",
+    model="default",
+    description="Looks at the work cell and records what it sees. Never moves anything.",
+    system="You inspect a robot work cell from camera images. Describe only what is "
+           "visible, and record each inspection with create_inspections.",
+    tools=["camera_snapshot", "robot_state", "create_inspections", "list_inspections"],
+    context=["cell_rules"],
+    scopes=["observe"],
+    max_steps=8,
+    token_budget=60_000,
+    max_images=2,
+)
+
+app.agent(
+    "operator",
+    model="default",
+    description="Plans and performs arm moves. Every move waits for human approval.",
+    system="You operate a two-joint arm. Check the state and look at the cell before and "
+           "after each move. Respect the joint limits.",
+    tools=["robot_state", "camera_snapshot", "move_joint", "set_gripper"],
+    handoffs=["inspector"],
+    context=["cell_rules"],
+    scopes=["observe", "operate"],
+    max_steps=16,
+    token_budget=120_000,
+    max_images=3,
+)
+'''
+
+TEMPLATES = ("api", "fullstack", "agent", "behaviour", "orchestration", "robotics")
 

@@ -16,8 +16,9 @@ server exposing six tools — from nine lines.
 
 from ._bridge import HTTPError, Request, Response, free_threaded
 from .app import WebCortex, Resource
+from .media import Image
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 __all__ = [
     "WebCortex",
@@ -25,6 +26,7 @@ __all__ = [
     "Response",
     "HTTPError",
     "Resource",
+    "Image",
     "free_threaded",
     "__version__",
 ]

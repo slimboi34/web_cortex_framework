@@ -58,6 +58,7 @@ class WebCortex:
         request_timeout: int = 30,
         agent_timeout: int = 600,
         shutdown_timeout: int = 25,
+        start_halted: bool = False,
     ) -> None:
         self.name = name
         self.description = description
@@ -71,6 +72,9 @@ class WebCortex:
         self.request_timeout = request_timeout
         self.agent_timeout = agent_timeout
         self.shutdown_timeout = shutdown_timeout
+        # Boot with the emergency stop engaged: a machine that moves should
+        # wait for an operator after a restart, not resume on its own.
+        self.start_halted = bool(start_halted)
 
         # Security posture. Every one of these defaults to the safe setting;
         # relaxing it is what costs a line of code, not tightening it.
@@ -126,6 +130,7 @@ class WebCortex:
         idempotent: bool | None = None,
         scopes: Sequence[str] = (),
         approval: str = "never",
+        actuator: bool = False,
     ) -> int:
         method = method.upper()
         if method not in _HTTP_METHODS:
@@ -158,6 +163,7 @@ class WebCortex:
                 },
                 "scopes": list(scopes),
                 "approval": approval,
+                "actuator": bool(actuator),
             }
         )
         return rid
@@ -173,6 +179,7 @@ class WebCortex:
         idempotent: bool | None = None,
         scopes: Sequence[str] = (),
         approval: str = "never",
+        actuator: bool = False,
         summary: str = "",
     ) -> Callable:
         """Register a Python handler.
@@ -185,6 +192,12 @@ class WebCortex:
 
         The second form is preferred, because the signature then doubles as the
         tool schema an agent sees.
+
+        `actuator=True` marks a handler that acts on the physical world — a
+        motor, a valve, a relay. It refuses to run while the emergency stop is
+        engaged (`POST /_webcortex/halt`, or `webcortex halt`), whoever calls
+        it and however: HTTP, an agent, a behaviour, a flow or MCP. Pair it
+        with `approval="required"` when a human should see each move first.
         """
 
         def decorator(fn: Callable) -> Callable:
@@ -211,6 +224,7 @@ class WebCortex:
                 idempotent=idempotent,
                 scopes=scopes,
                 approval=approval,
+                actuator=actuator,
             )
             return fn
 
@@ -1154,6 +1168,7 @@ class WebCortex:
         tool_result_limit: int = 16_384,
         compact_with: str | None = None,
         keep_recent: int = 6,
+        max_images: int = 4,
         tool: bool = True,
     ) -> None:
         """Declare an agent that lives inside the application.
@@ -1186,6 +1201,14 @@ class WebCortex:
         `compact_with` (default: the `fast` alias), keeping the last
         `keep_recent` messages intact. `token_budget` caps the whole run,
         including every nested agent, behaviour and flow it calls.
+        `max_images` is how many images stay in the conversation as pixels;
+        older ones become a line of text, so a camera tool called in a loop
+        does not resend every frame on every step.
+
+        **Vision.** The endpoint also takes `"images": [...]` — each
+        `{"media_type": "image/png", "data": "<base64>"}` or `{"url": "..."}` —
+        and any tool that returns a `webcortex.Image` shows the model the
+        picture itself.
 
         `scopes` is what the agent may *use*; `expose_scopes` is who may *start*
         a run. They default to the same set, because an endpoint that spends
@@ -1196,6 +1219,8 @@ class WebCortex:
         A typo in `tools`, `handoffs` or `context` is a boot error, not a
         runtime surprise.
         """
+        if max_images < 1:
+            raise ValueError("agent(): max_images must be at least 1")
         if keep_recent < 1:
 
             raise ValueError("agent(): keep_recent must be at least 1")
@@ -1239,6 +1264,7 @@ class WebCortex:
                     "max_context_tokens": context_window,
                     "compact_with": compact_with,
                     "keep_recent": int(keep_recent),
+                    "max_images": int(max_images),
                 },
             }
         )
@@ -1261,6 +1287,20 @@ class WebCortex:
                     "reset": {
                         "type": "boolean",
                         "description": "Discard the session's history before this turn.",
+                    },
+                    "images": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "description": "Images for the agent to look at.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "media_type": {"type": "string",
+                                               "enum": ["image/png", "image/jpeg", "image/gif", "image/webp"]},
+                                "data": {"type": "string", "contentEncoding": "base64"},
+                                "url": {"type": "string", "format": "uri"},
+                            },
+                        },
                     },
                 },
                 "required": ["input"],
@@ -1300,6 +1340,7 @@ class WebCortex:
                      "idempotent": True, "scopes": []},
             "scopes": [],
             "approval": "never",
+            "actuator": False,
         }
         return [*self._routes, default]
 
@@ -1315,6 +1356,7 @@ class WebCortex:
                 "request_timeout_secs": self.request_timeout,
                 "agent_timeout_secs": self.agent_timeout,
                 "shutdown_timeout_secs": self.shutdown_timeout,
+                "start_halted": self.start_halted,
             },
             "auth": self._auth,
             "cors": self._cors or {"enabled": False},
@@ -1428,6 +1470,18 @@ class WebCortex:
                 for f in self._flows
             ],
             "memories": [m["name"] for m in self._memories],
+            "actuators": [
+                {
+                    "name": r["tool"]["name"] or _derive_tool_name(r["method"], r["path"]),
+                    "route": f"{r['method']} {r['path']}",
+                    "approval": r.get("approval", "never"),
+                    "scopes": [*r["scopes"], *r["tool"]["scopes"]],
+                }
+                for r in self._routes
+                if r.get("actuator")
+            ],
+            "actuator_warnings": self._actuator_warnings(auth_on),
+            "start_halted": self.start_halted,
             "behaviours": [
                 {
                     "name": b["name"],
@@ -1439,6 +1493,26 @@ class WebCortex:
                 for b in self._behaviours
             ],
         }
+
+    def _actuator_warnings(self, auth_on: bool) -> list[str]:
+        """Ways the physical surface is easier to reach than it should be."""
+        out = []
+        actuators = [r for r in self._routes if r.get("actuator")]
+        if actuators and not auth_on:
+            out.append(
+                "actuators exist but no authentication is configured: anyone who can reach "
+                "the port can move hardware, and can release the emergency stop"
+            )
+        for r in actuators:
+            label = f"{r['method']} {r['path']}"
+            if not r["scopes"] and not r["tool"]["scopes"]:
+                out.append(f"actuator {label} requires no scope")
+            if r["tool"]["expose"] and r.get("approval") != "required":
+                out.append(
+                    f"actuator {label} is an agent tool without approval='required': "
+                    "a model can move it unattended"
+                )
+        return out
 
     def run(self) -> None:
         """Boot the runtime and serve. Blocks."""

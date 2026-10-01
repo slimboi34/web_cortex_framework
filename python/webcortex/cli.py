@@ -114,6 +114,13 @@ def _banner(app: Any) -> None:
               f"(run `webcortex security` to list them)")
     if security["gated_tools"]:
         print(f"  approval-gated tools: {', '.join(security['gated_tools'])}")
+    if security.get("actuators"):
+        names = ", ".join(a["name"] for a in security["actuators"])
+        halted = "  (booting HALTED: `webcortex release` to enable)" if security.get("start_halted") else ""
+        print(f"  actuators: {names}{halted}")
+        print("  emergency stop: `webcortex halt`")
+        for warning in security.get("actuator_warnings", []):
+            print(f"  ⚠ {warning}")
 
     # The manifest applies WEBCORTEX_HOST and WEBCORTEX_PORT: print what binds.
     server = manifest["server"]
@@ -197,6 +204,30 @@ def mcp_config(app: Any, key: str | None = None) -> dict:
     return {"mcpServers": {name: {"type": "http", "url": url, "headers": {"x-api-key": key} if key else {}}}}
 
 
+def _control(app: Any, method: str, path: str, body: dict | None = None,
+             key: str | None = None) -> dict:
+    """Call the running app's control plane with the operator's API key."""
+    import urllib.error
+    import urllib.request
+
+    host = os.environ.get("WEBCORTEX_HOST", app.host)
+    port = int(os.environ.get("WEBCORTEX_PORT", app.port))
+    url = f"http://{host}:{port}{app.control_prefix}{path}"
+    data = json.dumps(body or {}).encode() if method == "POST" else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"content-type": "application/json"})
+    key = key or os.environ.get("WEBCORTEX_API_KEY")
+    if key:
+        req.add_header("x-api-key", key)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return json.loads(res.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"webcortex: {url} answered {e.code}: {e.read().decode(errors='replace')}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"webcortex: cannot reach {url}: {e.reason}. Is the app running?")
+
+
 def _cmd_new(args: argparse.Namespace) -> int:
     from . import starters
 
@@ -238,7 +269,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=TEMPLATES,
         help=("api: JSON+MCP · fullstack: adds pages · agent: adds an approval gate · "
               "behaviour: adds programmable procedures · orchestration: handoffs, flows, "
-              "memory, context and a local model"),
+              "memory, context and a local model · robotics: a camera agents can see "
+              "through, gated actuators and an emergency stop"),
     )
     new.add_argument("--directory", "-d", default=None)
     new.add_argument("--description", default=None)
@@ -257,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
         ("context", "print the context pack: the app described for an AI coding tool"),
         ("mcp-config", "print the MCP client configuration for this app (Claude Code, Claude Desktop, Cursor)"),
         ("evolve", "ask a model to propose an extension, anchored on the context pack"),
+        ("halt", "engage the emergency stop on the running app: every actuator refuses to run"),
+        ("release", "release the emergency stop on the running app"),
     ]:
         p = sub.add_parser(name, help=help_text)
         if name == "evolve":
@@ -271,6 +305,12 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--out", "-o", default="client/api.ts")
         if name == "context":
             p.add_argument("--json", action="store_true", help="emit the raw manifest instead")
+        if name in ("halt", "release"):
+            p.add_argument("--key", default=None,
+                           help="admin API key (default: $WEBCORTEX_API_KEY)")
+        if name == "halt":
+            p.add_argument("--reason", "-r", default="", help="recorded in the audit log")
+            p.add_argument("--status", action="store_true", help="only report whether it is halted")
         if name == "evolve":
             p.add_argument("--model", "-m", default="default",
                            help="model or alias, e.g. default, fast, ollama/qwen3.5:9b")
@@ -303,6 +343,20 @@ def main(argv: list[str] | None = None) -> int:
             os.environ.setdefault("WEBCORTEX_LOG", "info")
         _banner(app)
         app.run()
+        return 0
+
+    if args.command == "halt":
+        if args.status:
+            print(json.dumps(_control(app, "GET", "/halt", key=args.key), indent=2))
+            return 0
+        state = _control(app, "POST", "/halt", {"reason": args.reason}, key=args.key)
+        print(f"HALTED: {state.get('state', {}).get('reason', '')}. Actuators refuse to run "
+              f"until `webcortex release`.")
+        return 0
+
+    if args.command == "release":
+        state = _control(app, "POST", "/release", key=args.key)
+        print("released: actuators enabled" if state.get("was_halted") else "was not halted")
         return 0
 
     if args.command == "check":

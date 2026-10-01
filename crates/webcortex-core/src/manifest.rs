@@ -129,6 +129,11 @@ pub struct ContextPolicy {
     /// How many recent messages survive a compaction untouched.
     #[serde(default = "default_keep_recent")]
     pub keep_recent: usize,
+    /// How many images stay in the conversation as pixels. Older ones become
+    /// a line of text: a camera tool called in a loop would otherwise resend
+    /// every frame it ever took on every step.
+    #[serde(default = "default_max_images")]
+    pub max_images: usize,
 }
 
 fn default_tool_result_bytes() -> usize {
@@ -136,6 +141,9 @@ fn default_tool_result_bytes() -> usize {
 }
 fn default_keep_recent() -> usize {
     6
+}
+fn default_max_images() -> usize {
+    4
 }
 
 impl Default for ContextPolicy {
@@ -145,6 +153,7 @@ impl Default for ContextPolicy {
             max_context_tokens: None,
             compact_with: None,
             keep_recent: default_keep_recent(),
+            max_images: default_max_images(),
         }
     }
 }
@@ -547,6 +556,11 @@ pub struct ServerConfig {
     /// How long a suspended run waits for a human before it is discarded.
     #[serde(default = "default_approval_ttl")]
     pub approval_ttl_secs: u64,
+    /// Boot with the emergency stop engaged. The halt lives in memory, so a
+    /// crash-and-restart would otherwise come back with every actuator live;
+    /// a machine that moves should wait for an operator to release it.
+    #[serde(default)]
+    pub start_halted: bool,
 }
 
 fn default_max_depth() -> u32 {
@@ -595,6 +609,7 @@ impl Default for ServerConfig {
             session_capacity: default_session_capacity(),
             session_ttl_secs: default_session_ttl(),
             approval_ttl_secs: default_approval_ttl(),
+            start_halted: false,
         }
     }
 }
@@ -659,6 +674,10 @@ pub struct Route {
     /// Whether an agent may invoke this without a human in the loop.
     #[serde(default)]
     pub approval: Approval,
+    /// The route acts on the physical world — a motor, a valve, a relay. It
+    /// refuses to run while the emergency stop is engaged.
+    #[serde(default)]
+    pub actuator: bool,
 }
 
 /// Controls whether a route is visible to agents as a callable tool.
