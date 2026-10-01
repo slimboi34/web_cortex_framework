@@ -156,10 +156,8 @@ impl BehaviourContext {
 
     fn charge_tokens(&self, input: u64, output: u64, cache: u64) -> PyResult<()> {
         // Saturating, like the shared budget: the counts come from upstream.
-        let add = |counter: &AtomicU64, n: u64| match counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_add(n)))
-        {
-            Ok(c) | Err(c) => c.saturating_add(n),
+        let add = |counter: &AtomicU64, n: u64| {
+            webcortex_core::agent::saturating_fetch_add(counter, n).saturating_add(n)
         };
         let total = add(&self.input_tokens, input)
             .saturating_add(add(&self.output_tokens, output))

@@ -204,12 +204,7 @@ impl SharedBudget {
     /// token counts are whatever an upstream's `usage` field says, and a
     /// counter that wrapped would reopen a budget that was already exhausted.
     pub fn charge(&self, tokens: u64) -> Result<(), String> {
-        let previous = match self
-            .used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| Some(u.saturating_add(tokens)))
-        {
-            Ok(p) | Err(p) => p,
-        };
+        let previous = saturating_fetch_add(&self.used, tokens);
         let total = previous.saturating_add(tokens);
         match self.max_tokens {
             Some(max) if total > max => Err(format!(
@@ -227,6 +222,19 @@ impl SharedBudget {
 
     pub fn used(&self) -> u64 {
         self.used.load(Ordering::SeqCst)
+    }
+}
+
+/// Add to a counter without wrapping, returning the previous value. A plain
+/// compare-and-swap loop rather than `fetch_update`, which newer toolchains
+/// deprecate under another name: this compiles warning-free on all of them.
+pub fn saturating_fetch_add(counter: &AtomicU64, n: u64) -> u64 {
+    let mut current = counter.load(Ordering::SeqCst);
+    loop {
+        match counter.compare_exchange_weak(current, current.saturating_add(n), Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(previous) => return previous,
+            Err(actual) => current = actual,
+        }
     }
 }
 
