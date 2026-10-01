@@ -87,6 +87,7 @@ nav:
       - Context and memory: context.md
       - Models and token economy: models.md
       - Vision and robotics: vision-and-robotics.md
+      - The device hub: device-hub.md
   - Operating:
       - Security: security.md
       - Deployment: deployment.md

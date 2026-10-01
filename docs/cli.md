@@ -17,7 +17,7 @@ $ webcortex new myapp --template fullstack
 
 | Option | Default | |
 |---|---|---|
-| `--template`, `-t` | `api` | `api` · `fullstack` · `agent` · `behaviour` · `orchestration` · `robotics` |
+| `--template`, `-t` | `api` | `api` · `fullstack` · `agent` · `behaviour` · `orchestration` · `robotics` · `hub` |
 | `--directory`, `-d` | `<name>` | Target directory |
 | `--description` | — | Project description |
 

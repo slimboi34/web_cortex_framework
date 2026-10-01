@@ -1,6 +1,6 @@
 """Project starters for `webcortex new`.
 
-Six shapes, because they are genuinely different applications rather than the
+Seven shapes, because they are genuinely different applications rather than the
 same one with features toggled:
 
 * **api**       — a JSON API plus an MCP tool surface
@@ -11,6 +11,8 @@ same one with features toggled:
 * **orchestration** — handoffs, flows, memory, context and a local model
 * **robotics** — perception and actuation: a camera an agent can see through,
   gated actuators, and an emergency stop
+* **hub** — the device hub: cameras and sensors stream in, an agent watches,
+  insights stream out to subscribers and webhooks
 
 Every starter boots with authentication, rate limiting, and security headers
 already on. A starter that generates an insecure app teaches an insecure habit.
@@ -73,6 +75,9 @@ worker pool.
   every path. Pair it with `approval="required"`, and keep physical limits in code, not prompts.
 - **Agents can see.** Return a `webcortex.Image` (`Image.from_array(frame, bgr=True)` for
   OpenCV) from a tool and the agent receives the picture; agent endpoints take `"images"`.
+- **Cameras and sensors belong to the device hub.** `app.camera` / `app.sensor` / `app.watch`
+  keep frames in Rust and give agents `<name>_snapshot` tools; do not write a Python route that
+  stores frames. Device keys get only `devices:ingest`.
 - **Agents cannot exceed their caller.** Scopes intersect, budgets (`max_steps`,
   `token_budget`) are enforced by the runtime, and a flow shares one budget across its tree.
   Do not try to widen authority from inside an agent.
@@ -396,6 +401,9 @@ def files_for(template: str, name: str, description: str) -> dict[str, str]:
 
     if template == "robotics":
         return {**common, "api.py": ROBOTICS_API.format(name=name, description=description)}
+
+    if template == "hub":
+        return {**common, "api.py": HUB_API.format(name=name, description=description)}
 
     return {
         **common,
@@ -909,5 +917,86 @@ app.agent(
 )
 '''
 
-TEMPLATES = ("api", "fullstack", "agent", "behaviour", "orchestration", "robotics")
+
+HUB_API = '''\
+"""{name} — a hub between cameras, sensors and AI agents.
+
+Devices stream in; agents look; what they conclude streams out to whoever
+subscribes and to any other system you point a webhook at.
+
+    phone / Pi / IP camera ──frames──▶  hub (Rust)  ──tool──▶  agent sees the frame
+    sensor ─────────telemetry──────▶   │                        │
+                                       ◀────── insight ─────────┘
+    dashboards, services  ◀──WebSocket stream── frames, telemetry, insights
+    another system        ◀──webhook POST────── insights
+
+Try it:
+
+    export WEBCORTEX_API_KEY=$(webcortex keygen)
+    webcortex dev
+    open http://127.0.0.1:8000/devices/dock/connect   # this laptop's camera becomes "dock"
+    open http://127.0.0.1:8000/devices/dock/view      # watch it, and what the agent says
+
+No Python runs per frame: frames, telemetry, fan-out and the watcher loop all
+live in the Rust core. Python is only the declarations below.
+"""
+
+import os
+
+from webcortex import WebCortex
+
+app = WebCortex(
+    "{name}",
+    description="{description}",
+)
+
+# One key for you; give each device its own ingest-only key, and each consumer a
+# read-only one, so a stolen camera key cannot read anything back.
+app.api_key("WEBCORTEX_API_KEY", id="operator",
+            scopes=["devices:ingest", "devices:read", "ask", "webcortex:admin"])
+app.api_key("WEBCORTEX_DEVICE_KEY", id="device", scopes=["devices:ingest"])
+app.api_key("WEBCORTEX_READER_KEY", id="reader", scopes=["devices:read"])
+app.rate_limit(per_second=100, burst=200)
+
+# A camera something pushes to: a browser (/devices/dock/connect), a Raspberry Pi
+# (webcortex.client.DeviceConnection), or curl -X POST --data-binary @frame.jpg.
+app.camera("dock", description="the loading dock", max_fps=10)
+
+# An IP camera is pulled instead: give its snapshot URL.
+# app.camera("lobby", source="http://192.168.1.40/snapshot.jpg", bearer_env="LOBBY_CAM_TOKEN")
+
+# Telemetry only: a thermometer, an IMU, a PLC's registers.
+app.sensor("dock_env", description="temperature and humidity at the dock")
+
+app.agent(
+    "inspector",
+    model="default",
+    description="Looks at the dock and reports anything unsafe or unusual.",
+    system="You watch a loading dock through a camera. Report hazards (blocked exits, "
+           "people near moving vehicles, spills) in one or two sentences. If nothing is "
+           "wrong, say 'all clear'.",
+    tools=["dock_snapshot", "dock_env_telemetry", "dock_insights"],
+    scopes=["devices:read"],
+    expose_scopes=["ask"],
+    max_steps=6,
+    token_budget=40_000,
+    max_images=2,
+)
+
+# The middle of the hub: every 15 seconds, if the picture changed, the inspector
+# looks; its answer goes to /devices/dock/stream subscribers and to the webhook.
+# max_runs_per_hour is the spend ceiling: at most 120 x token_budget per hour.
+app.watch(
+    "dock_watch",
+    device="dock",
+    agent="inspector",
+    input="Anything unsafe or unusual at the dock right now?",
+    every=15,
+    scopes=["devices:read"],
+    max_runs_per_hour=120,
+    webhook=os.environ.get("DOCK_WEBHOOK_URL") or None,
+)
+'''
+
+TEMPLATES = ("api", "fullstack", "agent", "behaviour", "orchestration", "robotics", "hub")
 

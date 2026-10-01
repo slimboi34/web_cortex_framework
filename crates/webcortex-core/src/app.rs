@@ -56,6 +56,8 @@ pub struct App {
     /// The emergency stop. While set, every route declared `actuator` refuses
     /// to run, whoever asks and however they arrive.
     halt: Mutex<Option<serde_json::Value>>,
+    /// Cameras and sensors: frames, telemetry, insights and their subscribers.
+    devices: crate::devices::DeviceHub,
 }
 
 impl App {
@@ -163,6 +165,7 @@ impl App {
             .build()
             .map_err(|e| format!("http client build failed: {e}"))?;
         let manifest_start_halted = manifest.server.start_halted;
+        let devices = crate::devices::DeviceHub::new(&manifest.devices, client.clone());
 
         Ok(Self {
             manifest,
@@ -192,6 +195,7 @@ impl App {
                 serde_json::json!({"reason": "started halted; release to enable actuators",
                                    "by": "boot", "since_unix": 0})
             })),
+            devices,
         })
     }
 
@@ -289,6 +293,38 @@ impl App {
             }),
         });
         Ok(runtime.resume_approval(self, run, approve, note).await)
+    }
+
+    pub fn devices(&self) -> &crate::devices::DeviceHub {
+        &self.devices
+    }
+
+    /// The shared outbound HTTP client: upstreams, pulled cameras, webhooks.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    /// Match a request to its route and check the caller may reach it, without
+    /// running it. The WebSocket upgrade uses this, so a socket is held to the
+    /// same scopes as the route it is mounted on.
+    pub fn authorize(&self, method: &str, path: &str, principal: &Principal) -> Result<&Route, WebCortexResponse> {
+        let matched = self.router.find(method, path).map_err(|e| match e {
+            MatchError::NotFound => WebCortexResponse::error(404, format!("no route for {method} {path}")),
+            MatchError::MethodNotAllowed => WebCortexResponse::error(405, format!("{method} not allowed on {path}")),
+        })?;
+        let route = self
+            .routes_by_id
+            .get(&matched.route_id)
+            .ok_or_else(|| WebCortexResponse::error(500, "router matched an unknown route id"))?;
+        let missing = principal.missing_scopes(&Self::required_scopes(route));
+        if !missing.is_empty() {
+            let status = if principal.is_anonymous() { 401 } else { 403 };
+            return Err(WebCortexResponse::error(
+                status,
+                format!("missing required scope(s): {}", missing.join(", ")),
+            ));
+        }
+        Ok(route)
     }
 
     /// Engage the emergency stop. Idempotent; a second halt updates the reason.
@@ -521,7 +557,78 @@ impl App {
                 }
                 self.run_flow(flow, req).await
             }
+
+            Op::Device { device, action } => self.serve_device(device, *action, req).await,
         }
+    }
+
+    async fn serve_device(
+        &self,
+        name: &str,
+        action: crate::manifest::DeviceAction,
+        req: WebCortexRequest,
+    ) -> Result<WebCortexResponse, String> {
+        use crate::manifest::DeviceAction as A;
+        let device = self
+            .devices
+            .get(name)
+            .ok_or_else(|| format!("unknown device {name:?}"))?;
+        let html = |page: &str| WebCortexResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
+            body: bytes::Bytes::from(page.replace("__DEVICE__", &crate::devices::escape_html(name))),
+        };
+        Ok(match action {
+            A::Snapshot => match self.devices.snapshot(device).await {
+                Ok(v) => WebCortexResponse::json(200, &v),
+                Err(e) => WebCortexResponse::error(if device.def.source.is_some() { 502 } else { 404 }, e),
+            },
+            A::Image => match self.devices.current_frame(device).await {
+                Ok(Some(frame)) => WebCortexResponse {
+                    status: 200,
+                    headers: vec![
+                        ("content-type".into(), frame.media_type.into()),
+                        ("cache-control".into(), "no-store".into()),
+                        ("x-webcortex-seq".into(), frame.seq.to_string()),
+                    ],
+                    body: frame.data.clone(),
+                },
+                Ok(None) => WebCortexResponse::error(404, format!("device {name:?} has not sent a frame yet")),
+                Err(e) => WebCortexResponse::error(502, e),
+            },
+            A::Telemetry => {
+                let t = device.telemetry();
+                WebCortexResponse::json(200, &serde_json::json!({
+                    "device": name,
+                    "telemetry": t.as_ref().map(|(_, v)| (**v).clone()),
+                    "age_ms": t.map(|(at, _)| crate::devices::now_ms().saturating_sub(at)),
+                }))
+            }
+            A::Insights => WebCortexResponse::json(
+                200,
+                &serde_json::json!({"device": name, "insights": device.insights()}),
+            ),
+            A::IngestFrame => match device.push_frame(req.body.clone()) {
+                Ok(seq) => WebCortexResponse::json(200, &serde_json::json!({"device": name, "seq": seq})),
+                Err(e) => WebCortexResponse::error(e.status(), e.message()),
+            },
+            A::IngestTelemetry => {
+                let Ok(value) = req.json_body() else {
+                    return Ok(WebCortexResponse::error(400, "telemetry must be a JSON body"));
+                };
+                match device.push_telemetry(value) {
+                    Ok(()) => WebCortexResponse::json(200, &serde_json::json!({"device": name, "ok": true})),
+                    Err(e) => WebCortexResponse::error(e.status(), e.message()),
+                }
+            }
+            A::SocketIngest | A::SocketStream => {
+                let mut res = WebCortexResponse::error(426, "this route is a WebSocket; connect with Upgrade: websocket");
+                res.headers.push(("upgrade".into(), "websocket".into()));
+                res
+            }
+            A::ConnectPage => html(crate::devices::CONNECT_PAGE),
+            A::ViewPage => html(crate::devices::VIEW_PAGE),
+        })
     }
 
     async fn run_flow(&self, name: &str, req: WebCortexRequest) -> Result<WebCortexResponse, String> {
@@ -729,6 +836,7 @@ impl App {
             session_id,
             reset_session,
             images,
+            events: None,
         };
         let result = runtime.run(self, def, &req.principal, &input, opts).await;
         Ok(run_result_response(&result))

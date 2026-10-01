@@ -76,6 +76,12 @@ where
         "webcortex listening"
     );
 
+    // Watchers hand device frames to agents on a timer. They stop with the server.
+    let watchers = crate::devices::spawn_watchers(app.clone());
+    if !watchers.is_empty() || !app.devices().is_empty() {
+        tracing::info!(devices = app.devices().len(), watchers = watchers.len(), "device hub running");
+    }
+
     let tracker = Arc::new(tokio::sync::Semaphore::new(Semaphore::MAX_PERMITS));
     tokio::pin!(shutdown);
 
@@ -104,7 +110,7 @@ where
                         async move { Ok::<_, Infallible>(handle(app, req, client_ip).await) }
                     });
                     if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection(io, svc)
+                        .serve_connection_with_upgrades(io, svc)
                         .await
                     {
                         tracing::debug!(%peer, error = %e, "connection closed");
@@ -112,6 +118,10 @@ where
                 });
             }
         }
+    }
+
+    for w in &watchers {
+        w.abort();
     }
 
     // Draining: wait for every outstanding connection permit to come back.
@@ -213,7 +223,7 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
 
 async fn route_request(
     app: &Arc<App>,
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     client_ip: &str,
     request_id: &str,
 ) -> (WebCortexResponse, String) {
@@ -239,6 +249,20 @@ async fn route_request(
             );
         }
         return (WebCortexResponse::error(403, "origin not allowed"), "-".into());
+    }
+
+    // A browser cannot set headers on a WebSocket, so an upgrade may carry its
+    // key in the query string instead. Only for upgrades, and only when no
+    // header credential is present; the request log records the path, never
+    // the query.
+    let upgrade = crate::ws::is_upgrade(&headers);
+    if upgrade {
+        let key_header = app.authenticator.api_key_header().to_string();
+        if !headers.contains_key(&key_header) && !headers.contains_key("authorization") {
+            if let Some(token) = query.get("access_token") {
+                headers.insert(key_header, token.clone());
+            }
+        }
     }
 
     // 2. Authenticate. Done before rate limiting is *keyed*, but the limiter
@@ -274,6 +298,12 @@ async fn route_request(
             finish_cors(app, &mut res, origin.as_deref());
             return (res, principal_id);
         }
+    }
+
+    if upgrade {
+        let mut res = crate::ws::accept(app.clone(), &mut req, &headers, &path, &query, principal);
+        finish_cors(app, &mut res, origin.as_deref());
+        return (res, principal_id);
     }
 
     let body = match read_body(req).await {
@@ -392,8 +422,12 @@ async fn control_plane(
                 "sessions": app.sessions().len(),
                 "pending_approvals": app.pending_approvals().len(),
                 "halted": app.halted().is_some(),
+                "devices": app.devices().len(),
+                "watchers": app.manifest.watchers.len(),
             }),
         ),
+
+        ("GET", "/devices") => WebCortexResponse::json(200, &app.devices().describe()),
 
         // The emergency stop. Engaging it needs the same admin scope as every
         // other control route, but nothing else: no body is required, because

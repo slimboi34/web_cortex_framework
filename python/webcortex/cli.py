@@ -114,6 +114,14 @@ def _banner(app: Any) -> None:
               f"(run `webcortex security` to list them)")
     if security["gated_tools"]:
         print(f"  approval-gated tools: {', '.join(security['gated_tools'])}")
+    if security.get("devices"):
+        names = ", ".join(f"{d['name']} ({d['kind']}{', pulled' if d['pulled'] else ''})"
+                          for d in security["devices"])
+        print(f"  devices: {names}")
+    for w in security.get("watchers", []):
+        hook = f" → {w['webhook']}" if w["webhook"] else ""
+        print(f"  watcher {w['name']}: {w['device']} → {w['agent']} every {w['every_secs']:g}s, "
+              f"≤{w['max_runs_per_hour']} runs/h{hook}")
     if security.get("actuators"):
         names = ", ".join(a["name"] for a in security["actuators"])
         halted = "  (booting HALTED: `webcortex release` to enable)" if security.get("start_halted") else ""
@@ -270,7 +278,8 @@ def main(argv: list[str] | None = None) -> int:
         help=("api: JSON+MCP · fullstack: adds pages · agent: adds an approval gate · "
               "behaviour: adds programmable procedures · orchestration: handoffs, flows, "
               "memory, context and a local model · robotics: a camera agents can see "
-              "through, gated actuators and an emergency stop"),
+              "through, gated actuators and an emergency stop · hub: cameras and sensors "
+              "streaming to agents, insights to subscribers and webhooks"),
     )
     new.add_argument("--directory", "-d", default=None)
     new.add_argument("--description", default=None)

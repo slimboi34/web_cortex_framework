@@ -11,6 +11,7 @@ pub mod audit;
 pub mod auth;
 pub mod bridge;
 pub mod context;
+pub mod devices;
 pub mod files;
 pub mod flow;
 pub mod http;
@@ -23,6 +24,7 @@ pub mod router;
 pub mod server;
 pub mod templates;
 pub mod typegen;
+pub mod ws;
 
 #[cfg(feature = "sqlite")]
 pub mod db;

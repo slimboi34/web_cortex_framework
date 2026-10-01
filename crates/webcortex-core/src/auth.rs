@@ -188,6 +188,11 @@ impl Authenticator {
     /// A malformed or expired credential is an error, not a silent downgrade to
     /// anonymous: a client that sent a token deserves to be told it was
     /// rejected rather than mysteriously receiving 403s later.
+    /// The header an API key is read from (lower-case).
+    pub fn api_key_header(&self) -> &str {
+        &self.api_key_header
+    }
+
     pub fn authenticate(
         &self,
         headers: &BTreeMap<String, String>,

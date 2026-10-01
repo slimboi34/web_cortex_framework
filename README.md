@@ -364,6 +364,41 @@ app.agent("operator", tools=["camera", "move_arm"], scopes=["observe", "operate"
 
 See [Vision and robotics](docs/vision-and-robotics.md).
 
+## The device hub: cameras in, insights out
+
+WebCortex sits between devices and agents, and the Rust core does the work.
+Cameras and sensors stream in, agents see what they send, and what the agents
+conclude streams out to anyone subscribed.
+
+```python
+app.camera("dock", max_fps=10)                                   # pushed: browser, Pi, ESP32, curl
+app.camera("lobby", source="http://192.168.1.40/snapshot.jpg")   # pulled: any IP camera
+app.sensor("dock_env")                                           # telemetry only
+
+app.agent("inspector", tools=["dock_snapshot", "dock_env_telemetry"], max_images=2)
+app.watch("dock_watch", device="dock", agent="inspector", every=15,
+          input="Anything unsafe at the dock?", max_runs_per_hour=120,
+          webhook="https://ops.example.com/hooks/dock")
+```
+
+- **Connect anything.** WebSocket (`/devices/dock/ws`: binary messages are
+  frames, text is telemetry), HTTP POST, or an IP camera's snapshot URL. Open
+  `/devices/dock/connect` on a phone or laptop and its camera becomes the
+  device.
+- **No Python per frame.** Ring buffers, sniffing, per-device rate limits and
+  broadcast fan-out all live in Rust.
+- **Agents see it.** `dock_snapshot` is a tool that returns the live frame as
+  an image the model sees, over MCP too.
+- **Watchers are the middle of the hub.** When the picture changes, the agent
+  looks, and its insight goes to every `/devices/dock/stream` subscriber, to a
+  webhook, and to the audit log. Spend is capped per hour.
+- **Agents over WebSocket.** Any agent route accepts a socket: send a turn,
+  receive each step live, then the result.
+- **A stdlib Python client** (`webcortex.client`): `DeviceConnection` for
+  drivers, `subscribe()` for consumers, `AgentSocket` for services.
+
+`webcortex new site -t hub` scaffolds it. See [The device hub](docs/device-hub.md).
+
 ## Security defaults
 
 Deny-by-default throughout; relaxing something costs a line, tightening it costs
@@ -447,7 +482,7 @@ tested, the known limits, and what v2 added to the surface.
 
 ## Status
 
-v2.2.0. Working and tested: the manifest IR, router, native ops (static /
+v2.3.0. Working and tested: the manifest IR, router, native ops (static /
 query / proxy / page / files / flow), the free-threaded Python bridge,
 authentication and scopes, rate limiting, CORS, security headers, graceful
 shutdown, Behaviours with concurrent leaves, the agent runtime with handoffs,
@@ -456,7 +491,8 @@ compaction, context providers, memory, flows, two providers (Anthropic and
 OpenAI-compatible, which covers local models), prompt caching, the spend
 ledger, the audit trail, OpenAPI, the MCP server, TypeScript generation, the
 context pack and `evolve`, images in and out of agent runs and MCP, actuators
-and the emergency stop. **403 tests** (124 Rust, 279 Python, including a
+and the emergency stop, the device hub (cameras, sensors, watchers, WebSocket
+ingest and streams, agents over WebSocket). **427 tests** (132 Rust, 295 Python, including a
 54-test adversarial suite and offline end-to-end suites that drive the whole
 agent stack over HTTP), clippy clean.
 

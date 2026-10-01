@@ -250,6 +250,9 @@ pub struct RunOptions {
     pub reset_session: bool,
     /// Canonical image blocks sent with the input (see [`vision`]).
     pub images: Vec<Value>,
+    /// Receives `{"type": "step", …}` as each step happens, for a client that
+    /// wants to watch the run rather than wait for it (the agent WebSocket).
+    pub events: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +329,24 @@ struct RunState {
     /// Where the conversation is saved: the session id scoped by the entry
     /// agent and the caller, so another principal's id cannot reach it.
     session_key: Option<String>,
+    /// Where step events go, and how many steps have been sent.
+    events: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    emitted: usize,
+}
+
+impl RunState {
+    /// Send every step not yet sent. A closed receiver is not an error: the
+    /// client went away, and the run still finishes and is still recorded.
+    fn emit(&mut self) {
+        if let Some(tx) = &self.events {
+            for step in &self.steps[self.emitted.min(self.steps.len())..] {
+                let _ = tx.send(json!({
+                    "type": "step", "run_id": self.run_id, "agent": self.def.name, "step": step,
+                }));
+            }
+        }
+        self.emitted = self.steps.len();
+    }
 }
 
 enum CallsOutcome {
@@ -436,6 +457,8 @@ impl AgentRuntime {
             compaction_retry_at: 0,
             session_id: opts.session_id,
             session_key,
+            events: opts.events,
+            emitted: 0,
         };
 
         let tools = self.tool_specs(app, &state.def);
@@ -500,6 +523,7 @@ impl AgentRuntime {
         let max_steps = st.entry.max_steps.unwrap_or(12);
 
         loop {
+            st.emit();
             if st.usage.steps >= max_steps {
                 return self.finish(app, st, RunStatus::StepLimit, None);
             }
@@ -590,6 +614,7 @@ impl AgentRuntime {
                 duration_ms: started.elapsed().as_millis() as u64,
             });
 
+            st.emit();
             if !response.text.is_empty() {
                 st.output = response.text.clone();
             }
@@ -722,6 +747,7 @@ impl AgentRuntime {
             error,
             duration_ms,
         });
+        st.emit();
         tool_result_with_images(&call.id, &shown, is_error, images)
     }
 
@@ -1029,6 +1055,7 @@ impl AgentRuntime {
         pending: Option<PendingApproval>,
     ) -> RunResult {
         st.usage.tree_tokens = st.budget.used();
+        st.emit();
         self.audit
             .record(AuditEvent::agent_finished(&st.run_id, &st.def.name, status, &st.usage));
         app.ledger().count_run();

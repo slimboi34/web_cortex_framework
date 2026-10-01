@@ -50,6 +50,15 @@ def camera() -> dict: return {"frame": Image.from_array(cam.read(), bgr=True)}  
 def move(joint: int, degrees: float) -> dict: ...   # refuses while halted (POST /_webcortex/halt)
 WebCortex(..., start_halted=True)   # boot with the e-stop engaged; `webcortex release` to arm
 
+# device hub (Rust; no Python per frame). Tools: <name>_snapshot (agent SEES the frame), <name>_telemetry, <name>_insights
+app.camera("dock", description="...", source=None|"http://cam/snapshot.jpg", max_fps=30, ingest_scopes=[...], read_scopes=[...])
+app.sensor("line_temp", ingest_scopes=[...], read_scopes=[...])
+app.watch("dock_watch", device="dock", agent="inspector", input="Anything unsafe?", every=10, scopes=[...],
+          max_runs_per_hour=60, webhook="https://other.system/hook")   # insight -> subscribers + webhook
+# routes: POST /devices/<n>/frames|telemetry, WS /devices/<n>/ws (in) and /stream (out), GET /devices/<n>/connect|view (browser pages)
+# agents over WebSocket: connect to the agent route, send {"input", "images"?}, receive {"type":"step"}… then {"type":"result"}
+# python client (stdlib): from webcortex.client import DeviceConnection, subscribe, AgentSocket
+
 # models: tiers and providers (prefix picks the wire format: ollama/, openai/, anthropic/, <provider>/)
 app.models(default="claude-opus-5", fast="claude-haiku-4-5-20251001", local="ollama/qwen3.5:9b")
 app.provider("groq", base_url="https://api.groq.com/openai/v1", api_key_env="GROQ_API_KEY")
@@ -133,6 +142,11 @@ def build(app: Any) -> str:
             + ("; boots halted" if sec.get("start_halted") else ""))
     for warning in sec.get("actuator_warnings", []):
         add(f"- ⚠ {warning}")
+    if sec.get("devices"):
+        add(f"- devices: {', '.join(d['name'] + ' (' + d['kind'] + ')' for d in sec['devices'])}")
+    for w in sec.get("watchers", []):
+        add(f"- watcher {w['name']}: {w['device']} → agent {w['agent']} every {w['every_secs']:g}s, "
+            f"max {w['max_runs_per_hour']} runs/hour" + (f", webhook {w['webhook']}" if w["webhook"] else ""))
     add("")
 
     # --- Routes ---------------------------------------------------------

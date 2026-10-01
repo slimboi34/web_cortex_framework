@@ -96,6 +96,8 @@ class WebCortex:
         self._flows: list[dict] = []
         self._contexts: list[dict] = []
         self._memories: list[dict] = []
+        self._devices: list[dict] = []
+        self._watchers: list[dict] = []
         self._models: dict = {"aliases": {}, "providers": {}, "pricing": {}}
         self._resources: list[Resource] = []
         self._schema_sql: list[str] = []
@@ -1312,6 +1314,183 @@ class WebCortex:
         )
 
     # ------------------------------------------------------------------
+    # Devices: cameras, sensors, and the agents that watch them
+    # ------------------------------------------------------------------
+
+    def camera(
+        self,
+        name: str,
+        *,
+        description: str = "",
+        source: str | None = None,
+        headers: dict[str, str] | None = None,
+        bearer_env: str | None = None,
+        keep: int = 8,
+        max_fps: float = 30.0,
+        max_frame_bytes: int = 5 * 1024 * 1024,
+        ingest_scopes: Sequence[str] = ("devices:ingest",),
+        read_scopes: Sequence[str] = ("devices:read",),
+        tool: bool = True,
+        prefix: str = "/devices",
+    ) -> None:
+        """Declare a camera. Its frames live in the Rust device hub; no Python
+        runs per frame.
+
+        A camera is connected in one of three ways:
+
+        * **pushed** — the device sends frames: WebSocket binary messages to
+          `{prefix}/{name}/ws`, or an HTTP POST of the encoded image to
+          `{prefix}/{name}/frames`. A phone or laptop can push from its browser
+          by opening `{prefix}/{name}/connect`.
+        * **pulled** — `source="http://camera/snapshot.jpg"`: most IP cameras
+          expose a snapshot URL, fetched whenever a frame is asked for.
+        * **from Python** — a driver of your own POSTs to the frames route.
+
+        Agents get `{name}_snapshot` (the newest frame, as an image the model
+        sees, plus telemetry), `{name}_telemetry` and `{name}_insights` as
+        tools. Subscribers — dashboards, other services — connect to
+        `{prefix}/{name}/stream` and receive frames, telemetry and insights as
+        they happen; `{prefix}/{name}/view` is a ready-made monitor.
+
+        `ingest_scopes` guard the routes that send data in; `read_scopes`
+        guard everything that reads. Frames faster than `max_fps` are dropped.
+        """
+        self._device(name, "camera", description=description, source=source, headers=headers,
+                     bearer_env=bearer_env, keep=keep, max_fps=max_fps,
+                     max_frame_bytes=max_frame_bytes, ingest_scopes=ingest_scopes,
+                     read_scopes=read_scopes, tool=tool, prefix=prefix)
+
+    def sensor(
+        self,
+        name: str,
+        *,
+        description: str = "",
+        max_fps: float = 30.0,
+        ingest_scopes: Sequence[str] = ("devices:ingest",),
+        read_scopes: Sequence[str] = ("devices:read",),
+        tool: bool = True,
+        prefix: str = "/devices",
+    ) -> None:
+        """Declare a telemetry-only device: a thermometer, an IMU, a PLC's
+        registers. It sends JSON (WebSocket text messages to `{prefix}/{name}/ws`,
+        or a POST to `{prefix}/{name}/telemetry`); agents read the newest
+        reading with `{name}_telemetry`, and subscribers get every one."""
+        self._device(name, "sensor", description=description, source=None, headers=None,
+                     bearer_env=None, keep=1, max_fps=max_fps, max_frame_bytes=1,
+                     ingest_scopes=ingest_scopes, read_scopes=read_scopes, tool=tool, prefix=prefix)
+
+    def _device(self, name: str, kind: str, *, description: str, source: str | None,
+                headers: dict | None, bearer_env: str | None, keep: int, max_fps: float,
+                max_frame_bytes: int, ingest_scopes: Sequence[str], read_scopes: Sequence[str],
+                tool: bool, prefix: str) -> None:
+        if not name.isidentifier():
+            raise ValueError(f"device name {name!r} must be an identifier (it names tools)")
+        if any(d["name"] == name for d in self._devices):
+            raise ValueError(f"device {name!r} is declared twice")
+        if source is not None and not source.startswith(("http://", "https://")):
+            raise ValueError(f"camera {name!r}: source must be an http(s) snapshot URL")
+        if max_fps <= 0 or keep < 1 or max_frame_bytes < 1:
+            raise ValueError(f"device {name!r}: max_fps, keep and max_frame_bytes must be positive")
+        self._devices.append({
+            "name": name,
+            "description": description,
+            "kind": kind,
+            "source": None if source is None else {
+                "url": source, "headers": dict(headers or {}), "bearer_env": bearer_env,
+            },
+            "keep": int(keep),
+            "max_fps": float(max_fps),
+            "max_frame_bytes": int(max_frame_bytes),
+        })
+        base = f"{prefix.rstrip('/')}/{name}"
+        ingest, read = list(ingest_scopes), list(read_scopes)
+        what = description or f"the {name} {kind}"
+
+        def op(action: str) -> dict:
+            return {"kind": "device", "device": name, "action": action}
+
+        if kind == "camera":
+            self._add_route("POST", f"{base}/frames", op("ingest_frame"), scopes=ingest,
+                            summary=f"Push a frame from {name}",
+                            description="The body is one encoded PNG, JPEG, GIF or WebP image.")
+            self._add_route("GET", f"{base}/snapshot", op("snapshot"), scopes=read,
+                            summary=f"Look through {name}",
+                            description=f"The newest frame from {what}, returned to you as an image "
+                                        "you can see, with its age and the latest telemetry.",
+                            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                            tool=tool, tool_name=f"{name}_snapshot", read_only=True, idempotent=True)
+            self._add_route("GET", f"{base}/latest", op("image"), scopes=read,
+                            summary=f"The newest frame from {name}, as an image file")
+            self._add_route("GET", f"{base}/connect", op("connect_page"),
+                            summary=f"Turn this browser's camera into {name}")
+        self._add_route("POST", f"{base}/telemetry", op("ingest_telemetry"), scopes=ingest,
+                        summary=f"Push telemetry from {name}")
+        self._add_route("GET", f"{base}/telemetry", op("telemetry"), scopes=read,
+                        summary=f"Latest telemetry from {name}",
+                        description=f"The newest telemetry reading from {what}, and its age.",
+                        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                        tool=tool, tool_name=f"{name}_telemetry", read_only=True, idempotent=True)
+        self._add_route("GET", f"{base}/insights", op("insights"), scopes=read,
+                        summary=f"What agents watching {name} have said",
+                        description=f"Recent insights that watcher agents published about {what}, newest last.",
+                        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                        tool=tool, tool_name=f"{name}_insights", read_only=True, idempotent=True)
+        self._add_route("GET", f"{base}/ws", op("socket_ingest"), scopes=ingest,
+                        summary=f"WebSocket: {name} streams in (binary = frames, text = telemetry)")
+        self._add_route("GET", f"{base}/stream", op("socket_stream"), scopes=read,
+                        summary=f"WebSocket: frames, telemetry and insights from {name} as they happen")
+        self._add_route("GET", f"{base}/view", op("view_page"),
+                        summary=f"A live monitor for {name}")
+
+    def watch(
+        self,
+        name: str,
+        *,
+        device: str,
+        agent: str,
+        input: str,
+        every: float = 10.0,
+        only_on_change: bool = True,
+        scopes: Sequence[str] = (),
+        max_runs_per_hour: int = 60,
+        webhook: str | None = None,
+        webhook_bearer_env: str | None = None,
+    ) -> None:
+        """Hand a device's newest frame (and telemetry) to an agent every
+        `every` seconds, and publish what it says.
+
+        The answer — an *insight* — goes to everyone subscribed to the device's
+        stream, is readable as `{device}_insights`, and is POSTed as JSON to
+        `webhook` if one is given. That is the hub's point: a camera's output
+        reaches other systems already interpreted.
+
+        A tick with nothing new is skipped (`only_on_change`), and
+        `max_runs_per_hour` is a hard ceiling — a timer is a loop nobody is
+        watching, and every run spends tokens. The agent runs with exactly
+        `scopes`, intersected with its own, since a watcher has no caller.
+        """
+        if not any(d["name"] == device for d in self._devices):
+            raise ValueError(f"watcher {name!r} watches {device!r}, which is not declared; "
+                             f"call app.camera({device!r}) or app.sensor({device!r}) first")
+        if every < 1:
+            raise ValueError("watch(): every must be at least 1 second")
+        if max_runs_per_hour < 1:
+            raise ValueError("watch(): max_runs_per_hour must be at least 1")
+        if webhook is not None and not webhook.startswith(("http://", "https://")):
+            raise ValueError("watch(): webhook must be an http(s) URL")
+        self._watchers.append({
+            "name": name,
+            "device": device,
+            "agent": agent,
+            "input": input,
+            "every_secs": float(every),
+            "only_on_change": bool(only_on_change),
+            "scopes": list(scopes),
+            "max_runs_per_hour": int(max_runs_per_hour),
+            "webhook": None if webhook is None else {"url": webhook, "bearer_env": webhook_bearer_env},
+        })
+
+    # ------------------------------------------------------------------
     # Manifest + run
     # ------------------------------------------------------------------
 
@@ -1384,6 +1563,8 @@ class WebCortex:
             "behaviours": self._behaviours,
             "flows": self._flows,
             "contexts": self._contexts,
+            "devices": self._devices,
+            "watchers": self._watchers,
             "models": self._models,
         }
 
@@ -1481,6 +1662,17 @@ class WebCortex:
                 if r.get("actuator")
             ],
             "actuator_warnings": self._actuator_warnings(auth_on),
+            "devices": [
+                {"name": d["name"], "kind": d["kind"], "pulled": d["source"] is not None,
+                 "max_fps": d["max_fps"]}
+                for d in self._devices
+            ],
+            "watchers": [
+                {"name": w["name"], "device": w["device"], "agent": w["agent"],
+                 "every_secs": w["every_secs"], "max_runs_per_hour": w["max_runs_per_hour"],
+                 "webhook": (w["webhook"] or {}).get("url")}
+                for w in self._watchers
+            ],
             "start_halted": self.start_halted,
             "behaviours": [
                 {

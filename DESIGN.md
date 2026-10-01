@@ -299,6 +299,18 @@ Ordered by what unblocks the most.
    Streaming (item 5) moves behind this. A camera agent needed a frame more
    than it needed token deltas.
 
+**v2.3 — shipped: the device hub**
+✅ Cameras and sensors as declared devices: ring buffers, sniffing, per-device
+   ingest limits and broadcast fan-out in Rust, so no Python runs per frame.
+   Push over WebSocket or HTTP, or pull an IP camera's snapshot URL.
+✅ WebSockets, for device ingest, subscriber streams, and agent runs that
+   stream their steps. That delivers half of item 5 (step events); token
+   deltas are still to come.
+✅ Watchers: newest frame → agent → insight → subscribers and webhooks, skipped
+   when nothing changed and capped per hour. Still no embedded inference:
+   detection that has to run on every frame belongs in a sidecar that pushes
+   its results as telemetry.
+
 **Later, if warranted**
 12. Durable agent runs — only with a real design for exactly-once tool
     execution. Sessions and approvals stay in memory until then, and say so.

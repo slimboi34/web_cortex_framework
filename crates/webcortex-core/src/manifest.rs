@@ -47,6 +47,141 @@ pub struct Manifest {
     /// Declarative orchestrations executed entirely in Rust.
     #[serde(default)]
     pub flows: Vec<FlowDef>,
+    /// Cameras and sensors whose frames and telemetry live in the Rust device hub.
+    #[serde(default)]
+    pub devices: Vec<DeviceDef>,
+    /// Loops that hand a device's newest frame to an agent and publish what it says.
+    #[serde(default)]
+    pub watchers: Vec<WatcherDef>,
+}
+
+// ---------------------------------------------------------------------------
+// Devices: cameras and sensors, and the agents that watch them
+// ---------------------------------------------------------------------------
+
+/// A camera or sensor. Frames and telemetry are held in Rust; no Python runs
+/// per frame. See [`crate::devices`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub kind: DeviceKind,
+    /// Where frames come from when nobody pushes them: an HTTP snapshot URL,
+    /// fetched when a frame is asked for. Most IP cameras expose one.
+    #[serde(default)]
+    pub source: Option<PullSource>,
+    /// Frames kept in the ring buffer.
+    #[serde(default = "default_keep_frames")]
+    pub keep: usize,
+    /// Ingest ceiling. Frames arriving faster are dropped (WebSocket) or
+    /// refused with 429 (HTTP), so a misbehaving device cannot flood the hub.
+    #[serde(default = "default_max_fps")]
+    pub max_fps: f64,
+    #[serde(default = "default_max_frame_bytes")]
+    pub max_frame_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    #[default]
+    Camera,
+    /// Telemetry only.
+    Sensor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullSource {
+    pub url: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Environment variable holding a bearer token for the camera.
+    #[serde(default)]
+    pub bearer_env: Option<String>,
+    #[serde(default = "default_pull_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn default_keep_frames() -> usize {
+    8
+}
+fn default_max_fps() -> f64 {
+    30.0
+}
+fn default_max_frame_bytes() -> usize {
+    5 * 1024 * 1024
+}
+fn default_pull_timeout() -> u64 {
+    5000
+}
+
+/// What a device route does.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceAction {
+    /// JSON with the newest frame as an image marker, plus telemetry. The tool.
+    Snapshot,
+    /// The newest frame's raw bytes, for an `<img>` tag.
+    Image,
+    Telemetry,
+    Insights,
+    /// POST a frame: the body is the encoded image.
+    IngestFrame,
+    /// POST telemetry: the body is JSON.
+    IngestTelemetry,
+    /// WebSocket: binary messages are frames, text messages are telemetry.
+    SocketIngest,
+    /// WebSocket: frames, telemetry and insights as they happen.
+    SocketStream,
+    /// An HTML page that turns a browser's camera into this device.
+    ConnectPage,
+    /// An HTML page that shows the live stream and insights.
+    ViewPage,
+}
+
+/// Hand a device's newest frame to an agent on a timer, and publish the answer
+/// to the device's subscribers and, optionally, a webhook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatcherDef {
+    pub name: String,
+    pub device: String,
+    pub agent: String,
+    pub input: String,
+    #[serde(default = "default_watch_secs")]
+    pub every_secs: f64,
+    /// Skip a tick when no new frame or telemetry has arrived since the last run.
+    #[serde(default = "default_true")]
+    pub only_on_change: bool,
+    /// The authority the agent runs with. A watcher has no caller to inherit from.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Hard ceiling on runs, and therefore on spend: a timer is a loop that
+    /// nobody is watching.
+    #[serde(default = "default_runs_per_hour")]
+    pub max_runs_per_hour: u32,
+    #[serde(default)]
+    pub webhook: Option<WebhookDef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookDef {
+    pub url: String,
+    #[serde(default)]
+    pub bearer_env: Option<String>,
+    #[serde(default = "default_pull_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn default_watch_secs() -> f64 {
+    10.0
+}
+fn default_true() -> bool {
+    true
+}
+fn default_runs_per_hour() -> u32 {
+    60
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +898,8 @@ pub enum Op {
     },
     /// Run a declared flow: a pipeline, a parallel fan-out, or a router.
     Flow { flow: String },
+    /// A camera or sensor in the device hub. Never enters Python.
+    Device { device: String, action: DeviceAction },
 }
 
 impl Op {
@@ -778,6 +915,7 @@ impl Op {
             Op::Files { .. } => "files",
             Op::Behaviour { .. } => "behaviour",
             Op::Flow { .. } => "flow",
+            Op::Device { .. } => "device",
         }
     }
 }
@@ -914,6 +1052,39 @@ impl Manifest {
             }
         }
 
+        let mut device_seen = std::collections::HashSet::new();
+        for d in &self.devices {
+            if !device_seen.insert(d.name.as_str()) {
+                return Err(format!("duplicate device name {:?}", d.name));
+            }
+            if !d.max_fps.is_finite() || d.max_fps <= 0.0 || d.keep == 0 || d.max_frame_bytes == 0 {
+                return Err(format!("device {:?}: max_fps, keep and max_frame_bytes must be positive", d.name));
+            }
+            if let Some(src) = &d.source {
+                if !(src.url.starts_with("http://") || src.url.starts_with("https://")) {
+                    return Err(format!("device {:?}: source must be an http(s) URL", d.name));
+                }
+            }
+        }
+        let mut watcher_seen = std::collections::HashSet::new();
+        for w in &self.watchers {
+            if !watcher_seen.insert(w.name.as_str()) {
+                return Err(format!("duplicate watcher name {:?}", w.name));
+            }
+            if !self.devices.iter().any(|d| d.name == w.device) {
+                return Err(format!("watcher {:?} watches undeclared device {:?}", w.name, w.device));
+            }
+            if !self.agents.iter().any(|a| a.name == w.agent) {
+                return Err(format!("watcher {:?} runs undeclared agent {:?}", w.name, w.agent));
+            }
+            if !w.every_secs.is_finite() || w.every_secs < 1.0 {
+                return Err(format!("watcher {:?}: every_secs must be at least 1", w.name));
+            }
+            if w.max_runs_per_hour == 0 {
+                return Err(format!("watcher {:?}: max_runs_per_hour must be at least 1", w.name));
+            }
+        }
+
         let mut seen = std::collections::HashSet::new();
         for r in &self.routes {
             if !seen.insert((r.method.as_str(), r.path.as_str())) {
@@ -930,6 +1101,12 @@ impl Manifest {
                     return Err(format!(
                         "route {} {} invokes undeclared agent {:?}",
                         r.method, r.path, agent
+                    ));
+                }
+                Op::Device { device, .. } if !self.devices.iter().any(|d| &d.name == device) => {
+                    return Err(format!(
+                        "route {} {} serves undeclared device {:?}",
+                        r.method, r.path, device
                     ));
                 }
                 Op::Flow { flow } if !self.flows.iter().any(|f| &f.name == flow) => {

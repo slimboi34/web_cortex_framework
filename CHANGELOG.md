@@ -3,6 +3,55 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.3.0] — 2026-10-01
+
+The device hub: WebCortex sits between cameras and sensors on one side and agents
+on the other. Devices stream in, agents look, and insights stream out to subscribers and
+other systems. The Rust core does the work, and no Python runs per frame.
+
+### Added
+
+- **`app.camera(name, …)` and `app.sensor(name, …)`.** Frames and telemetry live in
+  per-device ring buffers in the Rust core. A camera is **pushed** (WebSocket binary
+  messages to `/devices/<name>/ws`, or an HTTP POST of the encoded image) or **pulled**
+  (`source=` an IP camera's snapshot URL, fetched when a frame is asked for). Media types
+  are sniffed from the bytes; `max_fps` and `max_frame_bytes` are enforced per device
+  (429 over HTTP, a silent drop over WebSocket). Ingest and read are separately scoped
+  (`devices:ingest`, `devices:read` by default).
+- **Device tools.** `<name>_snapshot` (the newest frame as an image the agent sees, its
+  age, and the latest telemetry), `<name>_telemetry` and `<name>_insights`, served in
+  Rust and available over MCP.
+- **WebSocket streams.** `/devices/<name>/stream` sends every frame (a JSON header, then
+  the image as a binary message; `?frames=meta` for headers only), telemetry reading and
+  insight as it happens. Slow subscribers are told how many events they missed instead
+  of slowing the device down.
+- **Watchers.** `app.watch(name, device=, agent=, input=, every=, max_runs_per_hour=,
+  webhook=)` hands the newest frame and telemetry to an agent on a timer, skipping ticks
+  where nothing changed (compared by content), and publishes the answer as an insight to
+  subscribers, `<device>_insights`, the audit log and an optional webhook. A watcher's
+  agent runs with exactly the watcher's `scopes`.
+- **Agents over WebSocket.** Every agent route accepts a socket: send `{"input",
+  "images"?, "session_id"?}`, receive `{"type": "step"}` as each step happens, then
+  `{"type": "result"}`, and keep the socket for the next turn. `RunOptions.events`
+  exposes the same step stream to Rust callers.
+- **Browser pages.** `/devices/<name>/connect` turns a phone's or laptop's camera into
+  the device; `/devices/<name>/view` is a live monitor of frames, telemetry and insights.
+  Browsers may authenticate a WebSocket upgrade with `?access_token=`.
+- **`webcortex.client`**, standard library only: `DeviceConnection` (a driver pushing
+  frames and telemetry), `subscribe()` (a consumer of events), `AgentSocket` (a service
+  driving an agent turn by turn), and a small RFC 6455 `WebSocket`.
+- `GET /_webcortex/devices`; `devices` and `watchers` in `/health`, the security report,
+  the boot banner and the context pack.
+- **`webcortex new NAME -t hub`**: a pushed camera, a sensor, an inspector agent and a
+  watcher with a webhook, and separate keys for operator, device and reader.
+- Docs: [The device hub](docs/device-hub.md).
+
+### Changed
+
+- Connections are served with HTTP upgrades enabled.
+- `App::authorize(method, path, principal)` matches a route and checks its scopes
+  without running it; WebSocket upgrades use it.
+
 ## [2.2.0] — 2026-10-01
 
 Agents that see, and machines they may only move with permission.

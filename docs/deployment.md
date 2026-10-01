@@ -28,7 +28,7 @@ An honest answer, because the useful version is qualified.
 1.79M requests soaked with zero errors and stable memory, wheels building on
 five platform targets across four interpreter versions.
 
-**What is young:** v2.2.0, one author, a few thousand installs and no known
+**What is young:** v2.3.0, one author, a few thousand installs and no known
 production users yet.
 
 ---
@@ -106,7 +106,7 @@ CMD ["webcortex", "run", "api.py"]
 ```
 
 !!! tip "Pin the version"
-    `pip install web-cortex-framework==2.2.0` in an image you intend to
+    `pip install web-cortex-framework==2.3.0` in an image you intend to
     redeploy. The wheel is prebuilt for Linux x86_64 and aarch64, so the install
     is a download, not a compile.
 

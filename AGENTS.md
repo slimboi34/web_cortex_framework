@@ -585,6 +585,46 @@ No vision model is embedded (DESIGN §5); pixels are carried to the model.
   `openWorldHint` are true for actuators.
 - **FakeProvider** appends ` [saw N image(s)]` when the last message held images.
 
+## 8b. The device hub (2.3)
+
+`crates/webcortex-core/src/devices.rs` and `ws.rs`; Python declarations in
+`app.camera / app.sensor / app.watch` (`python/webcortex/app.py`), client in
+`python/webcortex/client.py`.
+
+- **Manifest:** `devices: [DeviceDef]` (`kind` camera|sensor, `source`
+  PullSource for IP cameras, `keep`, `max_fps`, `max_frame_bytes`) and
+  `watchers: [WatcherDef]` (`device`, `agent`, `input`, `every_secs` ≥ 1,
+  `only_on_change`, `scopes`, `max_runs_per_hour`, `webhook`). Routes use
+  `Op::Device { device, action }` with `DeviceAction` snapshot | image |
+  telemetry | insights | ingest_frame | ingest_telemetry | socket_ingest |
+  socket_stream | connect_page | view_page. `app.camera` registers all of them
+  under `/devices/<name>/…`; the snapshot, telemetry and insights routes are the
+  tools `<name>_snapshot|_telemetry|_insights`.
+- **Hub:** `DeviceHub` on `App` (`app.devices()`). Per device: a `VecDeque`
+  ring of `Arc<Frame>`, latest telemetry, last 32 insights, and a
+  `tokio::sync::broadcast` channel (capacity 64; slow subscribers get
+  `lagged`). `push_frame` sniffs the media type from magic bytes, enforces
+  `max_frame_bytes` and `max_fps` (`IngestError::TooFast` → 429 over HTTP,
+  silent drop over WS). Pulled cameras are fetched in `current_frame`.
+- **WebSockets:** `server.rs` detects an upgrade after authentication and rate
+  limiting, then calls `ws::accept`, which runs `App::authorize` (route match
+  and scope check, the same check as `dispatch`) and spawns the socket task.
+  Connections are served with `serve_connection_with_upgrades`. A browser may
+  authenticate an upgrade with `?access_token=` (it is injected as the API-key
+  header only on upgrades with no header credential). Agent routes accept
+  sockets too: `RunOptions.events` (an mpsc sender) receives
+  `{"type":"step"}` from `RunState::emit`, called after each model step, each
+  tool call, at the top of the loop and in `finish`.
+- **Watchers:** `devices::spawn_watchers` (called in `serve_with_shutdown`,
+  aborted on shutdown) → `run_watcher_once`: current frame and telemetry →
+  SHA-256 of their bytes (skip if unchanged and `only_on_change`) → hourly
+  ceiling → `invoke_agent` as principal `watcher:<name>` with the frame in
+  `RunOptions.images` → an insight (with `error` when the run failed) →
+  `publish_insight` (subscribers), an audit `watcher_run` event, and a webhook
+  POST on a spawned task.
+- **FakeProvider** works unchanged: watcher inputs are echoed with
+  ` [saw N image(s)]`.
+
 ## 9. Introspection and output
 
 | call | returns |
@@ -623,7 +663,7 @@ precise tool schema. Do not "fix" this by making it raise.
 ## 10. The CLI
 
 ```
-webcortex new NAME [-t api|fullstack|agent|behaviour|orchestration|robotics] [-d DIR] [--description D]
+webcortex new NAME [-t api|fullstack|agent|behaviour|orchestration|robotics|hub] [-d DIR] [--description D]
 webcortex keygen
 webcortex dev      [target] [--host H] [--port P] [--workers N]
 webcortex run      [target] [--host H] [--port P] [--workers N]
