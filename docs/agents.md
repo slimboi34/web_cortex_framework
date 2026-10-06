@@ -236,6 +236,7 @@ a gate that can never fire is dead configuration giving false confidence.
 | `compact_with` | `"fast"` | Model used for compaction |
 | `keep_recent` | `6` | Messages kept verbatim by a compaction |
 | `temperature` | `None` | Sent only when set; Claude Opus 5, Opus 4.7/4.8 and Sonnet 5 reject it |
+| `reasoning` | `None` | `none`, `low`, `medium` or `high`; sent as `reasoning_effort` to OpenAI-compatible providers. `none` makes a local thinking model answer at once |
 | `max_tokens` | `16000` | Per response, thinking included |
 | `expose_at` | `/agents/<name-with-hyphens>` | The POST route |
 | `tool` | `True` | Expose under the agent's own name |

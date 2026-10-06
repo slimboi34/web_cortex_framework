@@ -626,6 +626,12 @@ pub struct BehaviourDef {
     /// Sent only when set: recent Anthropic models reject sampling parameters.
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// How hard the model may think before answering: `none`, `low`, `medium`
+    /// or `high`. Sent as `reasoning_effort` on the OpenAI wire format, where
+    /// `none` is what makes a local thinking model answer in a second rather
+    /// than a minute. Not sent to Anthropic.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     #[serde(default)]
     pub input_schema: Option<serde_json::Value>,
     /// Context providers resolved on demand via `ctx.context(name)`.
@@ -1011,6 +1017,12 @@ pub struct AgentDef {
     /// Sent only when set: recent Anthropic models reject sampling parameters.
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// How hard the model may think before answering: `none`, `low`, `medium`
+    /// or `high`. Sent as `reasoning_effort` on the OpenAI wire format (Ollama,
+    /// vLLM, OpenAI); `none` is what makes a local thinking model answer in a
+    /// second rather than a minute. Not sent to Anthropic.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     /// Agents this one may hand the conversation to. Each becomes a

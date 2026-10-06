@@ -331,43 +331,7 @@ impl ModelProvider for OpenAiCompatProvider {
     ) -> BoxFuture<'a, Result<ProviderResponse, String>> {
         Box::pin(async move {
             let agent = req.agent;
-            let mut messages: Vec<Value> = Vec::new();
-            let system = full_system(req);
-            if !system.is_empty() {
-                messages.push(json!({"role": "system", "content": system}));
-            }
-            for m in &req.conversation.messages {
-                messages.extend(to_openai_messages(&m.role, &m.content));
-            }
-
-            let mut body = json!({
-                "model": agent.model,
-                "max_tokens": agent.max_tokens,
-                "messages": messages,
-            });
-            if let Some(t) = agent.temperature {
-                body["temperature"] = json!(t);
-            }
-            if !req.tools.is_empty() {
-                body["tools"] = Value::Array(
-                    req.tools
-                        .iter()
-                        .map(|t| {
-                            json!({
-                                "type": "function",
-                                "function": {
-                                    "name": t.name,
-                                    "description": t.description,
-                                    "parameters": t.input_schema,
-                                }
-                            })
-                        })
-                        .collect(),
-                );
-                if let Some(name) = req.force_tool {
-                    body["tool_choice"] = json!({"type": "function", "function": {"name": name}});
-                }
-            }
+            let body = openai_body(req);
 
             let mut builder = self
                 .client
@@ -400,6 +364,54 @@ impl ModelProvider for OpenAiCompatProvider {
             parse_openai(&payload, &agent.model)
         })
     }
+}
+
+/// The Chat Completions request for one step.
+pub fn openai_body(req: &CompletionRequest) -> Value {
+    let agent = req.agent;
+    let mut messages: Vec<Value> = Vec::new();
+    let system = full_system(req);
+    if !system.is_empty() {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+    for m in &req.conversation.messages {
+        messages.extend(to_openai_messages(&m.role, &m.content));
+    }
+
+    let mut body = json!({
+        "model": agent.model,
+        "max_tokens": agent.max_tokens,
+        "messages": messages,
+    });
+    if let Some(t) = agent.temperature {
+        body["temperature"] = json!(t);
+    }
+    // Only when the app set it. `none` is how a local thinking model (Qwen,
+    // Gemma 4, MiniCPM through Ollama) is told to answer instead of deliberate.
+    if let Some(r) = &agent.reasoning {
+        body["reasoning_effort"] = json!(r);
+    }
+    if !req.tools.is_empty() {
+        body["tools"] = Value::Array(
+            req.tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    })
+                })
+                .collect(),
+        );
+        if let Some(name) = req.force_tool {
+            body["tool_choice"] = json!({"type": "function", "function": {"name": name}});
+        }
+    }
+    body
 }
 
 /// Translate one canonical (Anthropic-shaped) message into OpenAI messages.
@@ -1031,6 +1043,23 @@ mod tests {
         assert!(body(&agent).get("temperature").is_none(), "Opus 5 rejects any sampling parameter");
         agent.temperature = Some(0.2);
         assert_eq!(body(&agent)["temperature"], json!(0.2f32));
+    }
+
+    #[test]
+    fn reasoning_is_sent_as_reasoning_effort_only_on_the_openai_format() {
+        let mut agent: AgentDef =
+            serde_json::from_value(json!({"name": "a", "model": "ollama/qwen3.5:4b"})).unwrap();
+        let conversation = Conversation::default();
+        fn request<'a>(agent: &'a AgentDef, conversation: &'a Conversation) -> CompletionRequest<'a> {
+            CompletionRequest { agent, conversation, tools: &[], force_tool: None, system_suffix: "" }
+        }
+        assert!(openai_body(&request(&agent, &conversation)).get("reasoning_effort").is_none());
+        agent.reasoning = Some("none".into());
+        assert_eq!(openai_body(&request(&agent, &conversation))["reasoning_effort"], json!("none"));
+        assert!(
+            anthropic_body(&request(&agent, &conversation)).get("reasoning_effort").is_none(),
+            "the Anthropic format has no such field"
+        );
     }
 
     #[test]

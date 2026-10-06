@@ -854,6 +854,7 @@ impl AgentRuntime {
             token_budget: None,
             scopes: Vec::new(),
             temperature: None,
+            reasoning: None,
             max_tokens: 4096,
             handoffs: Vec::new(),
             context: Vec::new(),

@@ -84,6 +84,19 @@ recovers JSON from prose and code fences before reporting a failure. In
 practice a 9B model is a dependable classifier, and running fifty
 classification leaves on it costs nothing.
 
+Most current local models think before they answer, and through Ollama they
+do so by default: a 4B model takes 20 to 50 seconds per call and sometimes
+spends its whole `max_tokens` deliberating. Tell it not to:
+
+```python
+app.agent("monitor", model="ollama/qwen3.5:4b", reasoning="none", max_tokens=200, ...)
+```
+
+`reasoning` takes `none`, `low`, `medium` or `high` and is sent as
+`reasoning_effort` on the OpenAI wire format (Ollama, vLLM, LM Studio, OpenAI
+itself). With `none`, the same 4B model answers a yes-or-no question about a
+camera frame in about a second. The Anthropic provider ignores the setting.
+
 An app that declares agents but sets no hosted key still boots; a run that
 needs a missing key fails with a message naming the variable, and everything
 else keeps serving.

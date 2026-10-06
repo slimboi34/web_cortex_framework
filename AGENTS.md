@@ -325,6 +325,10 @@ whatever it pointed at.
 Opus 4.7/4.8 and Sonnet 5 reject sampling parameters with a 400. Nothing in the
 runtime sets one for you — compaction, flow routing and `evolve` included.
 `max_tokens` (default 16,000) caps thinking and answer together.
+`reasoning` (`none` | `low` | `medium` | `high`, default unset) is sent as
+`reasoning_effort` on the OpenAI wire format only; `none` is what stops a
+local thinking model (Qwen 3.5, Gemma 4, MiniCPM through Ollama) from
+deliberating for a minute per call. Validated at declaration.
 
 Prices are never built in. `GET /_webcortex/usage` reports
 `estimated_cost_usd: null` when any model that spent tokens is unpriced.
@@ -376,7 +380,7 @@ it would pool their data.
 ```python
 @app.behaviour(name=None, *, description="", tools=(), context=(), scopes=(),
                max_steps=50, token_budget=None, model="default", max_tokens=16_000,
-               temperature=None, expose_at=None, expose_scopes=None, tool=True)
+               temperature=None, reasoning=None, expose_at=None, expose_scopes=None, tool=True)
 def handler(ctx, input): ...
 ```
 
@@ -452,7 +456,7 @@ event loop.
 ```python
 app.agent(name, *, model="default", system="", tools=(), handoffs=(), context=(),
           memory=None, description="", max_steps=12, token_budget=None,
-          expose_at=None, scopes=(), expose_scopes=None, temperature=None,
+          expose_at=None, scopes=(), expose_scopes=None, temperature=None, reasoning=None,
           max_tokens=16_000, cache=True, context_window=None,
           tool_result_limit=16_384, compact_with=None, keep_recent=6,
           max_images=4, tool=True) -> None

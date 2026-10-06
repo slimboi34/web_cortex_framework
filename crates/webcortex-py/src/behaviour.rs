@@ -78,6 +78,7 @@ pub struct BehaviourContext {
     model: String,
     max_tokens: u32,
     temperature: Option<f32>,
+    reasoning: Option<String>,
 
     /// How deep this run already sits in the invocation chain. Tools called from
     /// here run one level deeper, which is what bounds a recursive behaviour.
@@ -114,6 +115,7 @@ impl BehaviourContext {
         model: String,
         max_tokens: u32,
         temperature: Option<f32>,
+        reasoning: Option<String>,
         depth: u32,
         budget: Arc<SharedBudget>,
         input: serde_json::Value,
@@ -136,6 +138,7 @@ impl BehaviourContext {
             model,
             max_tokens,
             temperature,
+            reasoning,
             depth,
             budget,
             input,
@@ -243,6 +246,7 @@ impl BehaviourContext {
             token_budget: None,
             scopes: Vec::new(),
             temperature: temperature.or(self.temperature),
+            reasoning: self.reasoning.clone(),
             max_tokens: max_tokens.unwrap_or(self.max_tokens),
             handoffs: Vec::new(),
             context: Vec::new(),

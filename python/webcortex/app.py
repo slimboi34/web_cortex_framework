@@ -42,6 +42,23 @@ class Resource:
     route_ids: list[int] = field(default_factory=list)
 
 
+REASONING_LEVELS = ("none", "low", "medium", "high")
+
+
+def _reasoning(value: str | None, who: str) -> str | None:
+    """`reasoning=` on an agent or behaviour: how hard the model may think before it answers.
+
+    Sent as `reasoning_effort` to OpenAI-compatible providers (Ollama, vLLM, LM Studio,
+    OpenAI); the Anthropic provider ignores it. `"none"` is the setting that makes a local
+    thinking model (Qwen 3.5, Gemma 4, MiniCPM) answer in a second instead of a minute.
+    """
+    if value is None:
+        return None
+    if value not in REASONING_LEVELS:
+        raise ValueError(f"{who}: reasoning must be one of {', '.join(REASONING_LEVELS)}, not {value!r}")
+    return value
+
+
 class WebCortex:
     def __init__(
         self,
@@ -1036,6 +1053,7 @@ class WebCortex:
         model: str = "default",
         max_tokens: int = 16_000,
         temperature: float | None = None,
+        reasoning: str | None = None,
         expose_at: str | None = None,
         expose_scopes: Sequence[str] | None = None,
         tool: bool = True,
@@ -1113,6 +1131,7 @@ class WebCortex:
                     "model": model,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
+                    "reasoning": _reasoning(reasoning, f"behaviour {behaviour_name!r}"),
                     "input_schema": input_schema,
                     "context": list(context),
                 }
@@ -1164,6 +1183,7 @@ class WebCortex:
         scopes: Sequence[str] = (),
         expose_scopes: Sequence[str] | None = None,
         temperature: float | None = None,
+        reasoning: str | None = None,
         max_tokens: int = 16_000,
         cache: bool = True,
         context_window: int | None = None,
@@ -1259,6 +1279,7 @@ class WebCortex:
                 "token_budget": token_budget,
                 "scopes": list(scopes),
                 "temperature": temperature,
+                "reasoning": _reasoning(reasoning, f"agent {name!r}"),
                 "max_tokens": max_tokens,
                 "cache": bool(cache),
                 "policy": {

@@ -306,6 +306,7 @@ async fn classify(
         token_budget: None,
         scopes: Vec::new(),
         temperature: None,
+        reasoning: None,
         max_tokens: 256,
         handoffs: Vec::new(),
         context: Vec::new(),

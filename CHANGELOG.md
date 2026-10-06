@@ -3,6 +3,17 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.4.0] — 2026-10-06
+
+### Added
+
+- `reasoning=` on `app.agent(...)` and `@app.behaviour(...)`: `none`, `low`, `medium` or
+  `high`, sent as `reasoning_effort` on the OpenAI wire format (Ollama, vLLM, LM Studio,
+  OpenAI) and ignored by the Anthropic provider. Current local models think before they
+  answer by default, which through Ollama meant 20 to 50 seconds per call from a 4B model
+  and, often, a reply that was all deliberation; `reasoning="none"` has the same model answer
+  a watcher's question about a camera frame in about a second. Validated at declaration.
+
 ## [2.3.0] — 2026-10-01
 
 The device hub: WebCortex sits between cameras and sensors on one side and agents
