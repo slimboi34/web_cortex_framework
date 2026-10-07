@@ -265,6 +265,51 @@ def test_a_browser_can_authenticate_a_socket_with_access_token(hub):
         WebSocket(hub.replace("http", "ws") + f"/devices/dock/ws?access_token={READ_KEY}")
 
 
+def test_a_hostile_page_cannot_open_a_socket_with_the_operators_key(hub):
+    """Cross-site WebSocket hijacking: WebSockets ignore CORS, so the Origin is checked."""
+    url = hub.replace("http", "ws") + f"/devices/dock/stream?frames=meta&access_token={READ_KEY}"
+    with pytest.raises(WebSocketError, match="403"):
+        WebSocket(url, headers={"origin": "https://evil.test"})
+    with pytest.raises(WebSocketError, match="403"):
+        WebSocket(url, headers={"origin": "https://evil.test", "sec-fetch-site": "cross-site"})
+    # The hub's own /view page is same-origin, and a device sends no Origin.
+    port = hub.rsplit(":", 1)[1]
+    for headers in ({"origin": f"http://127.0.0.1:{port}"}, {}):
+        with WebSocket(url, headers=headers) as ws:
+            assert ws.recv_json()["type"] == "hello"
+
+
+def test_the_client_refuses_header_injection_and_oversized_messages():
+    with pytest.raises(ValueError, match="line break"):
+        WebSocket("ws://127.0.0.1:9/x", headers={"x-api-key": "k\r\nx-evil: 1"})
+
+    # A server that completes the handshake and then announces a 2**62-byte frame.
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        head = b""
+        while b"\r\n\r\n" not in head:
+            head += conn.recv(4096)
+        key = [l.split(b":", 1)[1].strip() for l in head.split(b"\r\n")
+               if l.lower().startswith(b"sec-websocket-key")][0]
+        import hashlib
+        accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                     b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+        conn.sendall(bytes([0x82, 127]) + (1 << 62).to_bytes(8, "big"))
+        time.sleep(1)
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    ws = WebSocket(f"ws://127.0.0.1:{srv.getsockname()[1]}/x", timeout=5)
+    with pytest.raises(WebSocketError, match="max_message"):
+        ws.recv()
+    srv.close()
+
+
 def test_sockets_only_where_declared(hub):
     with pytest.raises(WebSocketError, match="400"):
         WebSocket(hub.replace("http", "ws") + "/devices/dock/snapshot", headers={"x-api-key": READ_KEY})

@@ -442,6 +442,18 @@ impl App {
             }
         };
 
+        // A tool call arrives already naming its route, and its path was built
+        // from the caller's (or a model's) arguments. If those arguments steer
+        // the path onto a different route — `id = "purge"` landing on a static
+        // `/notes/purge`, say — refuse rather than run it: approval gates are
+        // checked against the tool that was named, so this would be a way round them.
+        if req.route_id.is_some_and(|expected| expected != matched.route_id) {
+            return WebCortexResponse::error(
+                400,
+                "the arguments do not address this tool's route; a path argument may not \
+                 select a different route",
+            );
+        }
         req.path_params = matched.path_params;
         req.route_id = Some(matched.route_id);
 
@@ -929,7 +941,11 @@ impl App {
         let res = builder
             .send()
             .await
-            .map_err(|e| format!("upstream {upstream_name} failed: {e}"))?;
+            .map_err(|e| {
+                // The error names the upstream URL; that stays in the log.
+                tracing::warn!(upstream = %upstream_name, error = %e, "upstream request failed");
+                format!("upstream {upstream_name} failed: {}", e.without_url())
+            })?;
 
         let status = res.status().as_u16();
         let content_type = res
@@ -941,7 +957,7 @@ impl App {
         let body = res
             .bytes()
             .await
-            .map_err(|e| format!("upstream {upstream_name} body read failed: {e}"))?;
+            .map_err(|e| format!("upstream {upstream_name} body read failed: {}", e.without_url()))?;
 
         Ok(WebCortexResponse {
             status,
@@ -1143,6 +1159,31 @@ fn json_to_path_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// Characters percent-encoded when a value is spliced into one path segment:
+/// everything outside RFC 3986 `pchar`, plus `;` (a path-parameter delimiter
+/// to some servers). `?`, `#` and `/` above all — a decoded `%3F` substituted
+/// raw would start a query on the upstream, and a `/` would add a segment.
+const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b';')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// Fill a route template's `{name}` segments with values, each encoded so it
+/// stays exactly one path segment.
 fn substitute_path(
     template: &str,
     params: &std::collections::BTreeMap<String, String>,
@@ -1158,7 +1199,10 @@ fn substitute_path(
             .and_then(|s| s.strip_suffix('}'))
             .map(|n| n.trim_start_matches('*'))
         {
-            Some(name) => out.push_str(params.get(name).map(|s| s.as_str()).unwrap_or("")),
+            Some(name) => {
+                let value = params.get(name).map(|s| s.as_str()).unwrap_or("");
+                out.extend(percent_encoding::utf8_percent_encode(value, PATH_SEGMENT));
+            }
             None => out.push_str(seg),
         }
     }
@@ -1166,4 +1210,57 @@ fn substitute_path(
         out.push('/');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_substituted_value_stays_one_path_segment() {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("slug".to_string(), "x?admin=1#frag".to_string());
+        assert_eq!(substitute_path("/echo/{slug}", &params), "/echo/x%3Fadmin=1%23frag");
+        params.insert("slug".to_string(), "a/b c;d%".to_string());
+        assert_eq!(substitute_path("/echo/{slug}", &params), "/echo/a%2Fb%20c%3Bd%25");
+        params.insert("slug".to_string(), "Frank-Herbert_1.0~:@".to_string());
+        assert_eq!(substitute_path("/echo/{slug}", &params), "/echo/Frank-Herbert_1.0~:@");
+    }
+
+    async fn notes_app() -> App {
+        let manifest: Manifest = serde_json::from_value(json!({
+            "name": "t",
+            "routes": [
+                {"id": 0, "method": "POST", "path": "/notes/{id}",
+                 "op": {"kind": "static", "body": {"touched": true}},
+                 "tool": {"expose": true, "name": "touch_note"}},
+                {"id": 1, "method": "POST", "path": "/notes/purge",
+                 "op": {"kind": "static", "body": {"purged": true}},
+                 "tool": {"expose": true, "name": "purge"},
+                 "approval": "required"},
+                {"id": 2, "method": "POST", "path": "/notes/{id}/archive",
+                 "op": {"kind": "static", "body": {"archived": true}},
+                 "tool": {"expose": true, "name": "archive"},
+                 "approval": "required"}
+            ]
+        }))
+        .expect("manifest");
+        App::build_without_python(manifest).await.expect("app builds")
+    }
+
+    #[tokio::test]
+    async fn a_tool_argument_cannot_steer_the_call_onto_a_gated_route() {
+        let app = notes_app().await;
+        let who = Principal::anonymous();
+        // `purge` is gated; reaching it through the ungated tool's argument
+        // would skip the human the gate exists for.
+        let err = app.call_tool_as("touch_note", &json!({"id": "purge"}), &who).await.unwrap_err();
+        assert!(err.contains("do not address this tool's route"), "{err}");
+        // A slash cannot add a segment and land on `/notes/{id}/archive` either.
+        let out = app.call_tool_as("touch_note", &json!({"id": "1/archive"}), &who).await.unwrap();
+        assert_eq!(out["touched"], true);
+        let out = app.call_tool_as("touch_note", &json!({"id": "a b?c#d"}), &who).await.unwrap();
+        assert_eq!(out["touched"], true);
+    }
 }

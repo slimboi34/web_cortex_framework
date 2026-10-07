@@ -42,7 +42,7 @@ Nothing was written twice, so nothing can drift.
 
 The MCP endpoint speaks Streamable HTTP JSON-RPC at
 `/_webcortex/mcp` and implements `initialize`, `tools/list`, `tools/call`,
-`ping`, batching, and notifications.
+`ping`, batching (at most 32 messages per batch), and notifications.
 
 === "Claude Desktop / Claude Code"
 

@@ -169,10 +169,12 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
     let uri = req.uri().clone();
     let path = uri.path().to_string();
 
+    // A caller's id is echoed and logged, so only a short, plain one is kept.
     let request_id = req
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
+        .filter(|v| is_plain_request_id(v))
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -251,11 +253,34 @@ async fn route_request(
         return (WebCortexResponse::error(403, "origin not allowed"), "-".into());
     }
 
+    // 1b. Cross-origin protection. A browser sends a "simple" cross-site POST
+    //     without a preflight, and opens a WebSocket to any origin, so CORS
+    //     alone does not stop a hostile page acting on an app it can reach.
+    let upgrade = crate::ws::is_upgrade(&headers);
+    let state_changing = !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
+    if state_changing || upgrade {
+        let host = headers
+            .get("host")
+            .cloned()
+            .or_else(|| uri.authority().map(|a| a.as_str().to_string()));
+        if !middleware::cross_origin_allowed(&headers, host.as_deref(), &app.manifest.cors) {
+            tracing::warn!(
+                request_id = %request_id,
+                method = %method,
+                path = %path,
+                origin = origin.as_deref().unwrap_or("-"),
+                "refused a cross-origin browser request; list the origin in cors() to allow it"
+            );
+            let mut res = WebCortexResponse::error(403, "cross-origin request refused");
+            finish_cors(app, &mut res, origin.as_deref());
+            return (res, "-".into());
+        }
+    }
+
     // A browser cannot set headers on a WebSocket, so an upgrade may carry its
     // key in the query string instead. Only for upgrades, and only when no
     // header credential is present; the request log records the path, never
     // the query.
-    let upgrade = crate::ws::is_upgrade(&headers);
     if upgrade {
         let key_header = app.authenticator.api_key_header().to_string();
         if !headers.contains_key(&key_header) && !headers.contains_key("authorization") {
@@ -270,6 +295,16 @@ async fn route_request(
     let principal = match app.authenticator.authenticate(&headers) {
         Ok(p) => p,
         Err(e) => {
+            // Failed credentials are charged to the client's address, so
+            // guessing keys or tokens is held to the same rate as anything else.
+            if let Some(limiter) = &app.rate_limiter {
+                let decision = limiter.check(&format!("ip:{client_ip}"));
+                if !decision.allowed {
+                    let mut res = rate_limited(&decision);
+                    finish_cors(app, &mut res, origin.as_deref());
+                    return (res, "invalid".into());
+                }
+            }
             let mut res = WebCortexResponse::error(e.status(), e.message());
             res.headers.push((
                 "www-authenticate".into(),
@@ -291,10 +326,7 @@ async fn route_request(
         };
         let decision = limiter.check(&key);
         if !decision.allowed {
-            let mut res = WebCortexResponse::error(429, "rate limit exceeded");
-            res.headers.push(("retry-after".into(), decision.retry_after_secs.to_string()));
-            res.headers.push(("x-ratelimit-limit".into(), decision.limit.to_string()));
-            res.headers.push(("x-ratelimit-remaining".into(), "0".into()));
+            let mut res = rate_limited(&decision);
             finish_cors(app, &mut res, origin.as_deref());
             return (res, principal_id);
         }
@@ -348,6 +380,22 @@ async fn route_request(
 
     finish_cors(app, &mut res, origin.as_deref());
     (res, principal_id)
+}
+
+fn rate_limited(decision: &middleware::RateDecision) -> WebCortexResponse {
+    let mut res = WebCortexResponse::error(429, "rate limit exceeded");
+    res.headers.push(("retry-after".into(), decision.retry_after_secs.to_string()));
+    res.headers.push(("x-ratelimit-limit".into(), decision.limit.to_string()));
+    res.headers.push(("x-ratelimit-remaining".into(), "0".into()));
+    res
+}
+
+/// A client-supplied `x-request-id` worth keeping: short, and only characters
+/// that cannot confuse a log line or a header.
+fn is_plain_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
 fn finish_cors(app: &Arc<App>, res: &mut WebCortexResponse, origin: Option<&str>) {
@@ -645,4 +693,19 @@ fn to_hyper(res: WebCortexResponse) -> Response<Full<Bytes>> {
             .body(Full::new(Bytes::from(format!("response build failed: {e}"))))
             .expect("500 response is always constructible")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_plain_request_id;
+
+    #[test]
+    fn only_a_short_plain_request_id_is_echoed() {
+        assert!(is_plain_request_id("3f1c9a2e-7b1d-4c8e-9f00-1a2b3c4d5e6f"));
+        assert!(is_plain_request_id("trace:abc_1.2"));
+        assert!(!is_plain_request_id(""));
+        assert!(!is_plain_request_id("a b"));
+        assert!(!is_plain_request_id("<script>"));
+        assert!(!is_plain_request_id(&"a".repeat(129)));
+    }
 }

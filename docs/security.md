@@ -114,6 +114,26 @@ response to another.
 forbidden by the CORS spec and browsers fail it in ways that are maddening to
 debug.
 
+### Cross-origin requests (CSRF and WebSocket hijacking)
+
+CORS stops a hostile page *reading* a response, not *sending* the request: a
+form or a `text/plain` `fetch` POST goes out without a preflight, and a
+WebSocket is not subject to CORS at all. So every state-changing request
+(anything but `GET`, `HEAD` and `OPTIONS`) and every WebSocket upgrade that a
+browser marks as cross-origin is refused with `403`, unless its origin is one
+`app.cors(...)` allows. Since 2.4.1.
+
+The browser's own word decides: `Sec-Fetch-Site: same-origin` (or `none`) is
+allowed, any other value is not; without that header, the `Origin` must match
+`Host`. A request with neither header did not come from a web page — API
+clients, devices, `curl`, `webcortex.client` — and is unaffected. To accept a
+cross-origin browser app, list its origin in `app.cors(...)`.
+
+This matters most for an app on `localhost` or a LAN with anonymous scopes,
+which any page the operator visits could otherwise drive. It does not defend
+against DNS rebinding, where the attacker's page *is* same-origin: an app with
+actuators or sensitive tools should require a key even on `localhost`.
+
 ### Rate limiting
 
 ```python

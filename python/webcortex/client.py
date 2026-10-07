@@ -51,7 +51,18 @@ class WebSocketError(ConnectionError):
 class WebSocket:
     """A minimal blocking WebSocket client: text, binary, ping/pong, close."""
 
-    def __init__(self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 30.0) -> None:
+    #: Largest message accepted from the server, in bytes. A frame header can
+    #: announce up to 2**63 bytes; without a ceiling a hostile or broken server
+    #: could make the client buffer without bound.
+    MAX_MESSAGE = 64 * 1024 * 1024
+
+    def __init__(self, url: str, *, headers: dict[str, str] | None = None, timeout: float = 30.0,
+                 max_message: int | None = None) -> None:
+        self.max_message = max_message or self.MAX_MESSAGE
+        for k, v in (headers or {}).items():
+            # A CR or LF in a header would let a value write extra headers.
+            if any(c in str(k) + str(v) for c in "\r\n\0"):
+                raise ValueError(f"header {k!r} contains a line break or NUL")
         parts = urllib.parse.urlsplit(url)
         if parts.scheme not in ("ws", "wss", "http", "https"):
             raise ValueError(f"not a WebSocket URL: {url!r}")
@@ -86,7 +97,8 @@ class WebSocket:
             self._sock.close()
             raise WebSocketError(f"{url}: upgrade refused with {status}: {body[:300]}")
         received = {k.strip().lower(): v.strip() for k, _, v in (h.partition(":") for h in header_lines)}
-        expected = base64.b64encode(hashlib.sha1(key.encode() + _GUID).digest()).decode()
+        # SHA-1 is what RFC 6455 specifies for the handshake; it is not a security control.
+        expected = base64.b64encode(hashlib.sha1(key.encode() + _GUID, usedforsecurity=False).digest()).decode()
         if received.get("sec-websocket-accept") != expected:
             self._sock.close()
             raise WebSocketError("bad Sec-WebSocket-Accept from server")
@@ -150,6 +162,9 @@ class WebSocket:
                 n = struct.unpack(">H", self._read_exact(2))[0]
             elif n == 127:
                 n = struct.unpack(">Q", self._read_exact(8))[0]
+            if len(message) + n > self.max_message:
+                self._sock.close()
+                raise WebSocketError(f"message larger than max_message ({self.max_message} bytes)")
             payload = self._read_exact(n)
             if op == OP_PING:
                 self._send_frame(OP_PONG, payload)

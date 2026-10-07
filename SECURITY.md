@@ -254,7 +254,51 @@ a restart forgets them, which is stated but is still a loss. The `evolve`
 command sends the context pack — route paths, tool descriptions, security
 posture, but never credentials — to whichever model is named.
 
+## Review — 2.4.1
+
+A second adversarial pass, over the 2.x surface (device hub, WebSockets,
+vision, MCP, proxy) and the release workflows. Same author, so the same
+caveat as above applies. Each fix has a regression test.
+
+| # | Finding | Severity | Fix | Proven by |
+|---|---|---|---|---|
+| 1 | **A tool argument could steer a call onto a different, approval-gated route.** The path of an in-process tool call was rebuilt from its arguments and routed again, while the approval gate had been checked against the tool *name*: `touch_note(id="purge")` ran a gated `/notes/purge`, and a `/` in a value could add segments. A prompt-injected agent could skip the human. Scopes and the e-stop were still enforced. | High | Values are percent-encoded as one segment; `dispatch` refuses a call whose path routes anywhere but the named tool's route | `app.rs::a_tool_argument_cannot_steer_the_call_onto_a_gated_route` |
+| 2 | **Cross-site request forgery and WebSocket hijacking.** A hostile page could send a "simple" POST (no preflight) or open a WebSocket to an app it could reach — e.g. on `localhost` with anonymous scopes or no auth: call tools over `/_webcortex/mcp`, `release` the e-stop, or watch a camera stream. | High (for local/LAN apps without auth) | Unsafe methods and upgrades that a browser marks cross-origin are refused unless CORS allows the origin | `middleware.rs::a_cross_site_browser_request_is_refused_unless_cors_trusts_it`, `test_a_cross_site_post_is_refused_even_without_a_preflight`, `test_a_hostile_page_cannot_open_a_socket_with_the_operators_key` |
+| 3 | **Proxy parameter injection.** Since 2.0.1 path parameters are decoded, and the decoded value was spliced into the upstream URL raw: `/proxy/x%3Fadmin%3D1` reached the upstream as `/echo/x?admin=1`. | Medium | Substituted values are percent-encoded | `test_proxy_path_parameter_cannot_inject_an_upstream_query`, `app.rs::a_substituted_value_stays_one_path_segment` |
+| 4 | **Caller-supplied image URLs reached internal addresses.** An agent request's `images: [{"url": …}]` is passed to the provider, and OpenAI-compatible servers fetch it from their own network (`169.254.169.254`, `localhost`, …). | Medium | Loopback, private, link-local, shared and metadata hosts are refused for caller input (literal addresses in any notation; DNS is not resolved) | `vision.rs::a_caller_cannot_aim_an_image_url_at_an_internal_address` |
+| 5 | **MCP batches multiplied one admitted request.** The rate limiter counts a batch once; it could hold any number of `tools/call`s. | Medium | At most 32 messages per batch | `test_an_mcp_batch_cannot_multiply_one_admitted_request` |
+| 6 | **Pulled cameras were read without a bound**, and only then checked against `max_frame_bytes`. | Low | The body is read in chunks and refused past the cap | `devices.rs::a_pulled_camera_is_read_no_further_than_max_frame_bytes` |
+| 7 | **Camera and upstream URLs in error bodies.** A failed pull or proxy call returned reqwest's message, which names the URL — and a camera URL can carry `user:pass@`. | Low | The URL is logged, not returned | `devices.rs::a_camera_error_does_not_echo_its_url_or_credentials` |
+| 8 | **Failed credentials were not rate-limited**: authentication failed before the limiter ran. | Low | A failed credential is charged to the client address | `test_failed_credentials_are_rate_limited` |
+| 9 | **`x-request-id` was echoed and logged as sent**, at any length. | Low | Kept only when ≤128 plain characters, otherwise replaced | `test_a_request_id_that_could_pollute_logs_is_replaced` |
+| 10 | **`webcortex.client` trusted the server's frame length** (up to 2⁶³) and let header values carry CR/LF. | Low | `max_message` (64 MB default); header values with line breaks are refused | `test_the_client_refuses_header_injection_and_oversized_messages` |
+
+**Checked and held:** constant-time API-key comparison over SHA-256 digests;
+JWT `alg` pinning and required `exp`; admin scope on every control route but
+`/health`, including `halt`/`release` and MCP; the WebSocket upgrade is
+authenticated and scoped like its route, and `?access_token=` is honoured only
+on upgrades and never logged; static-file traversal (decoded twice, then
+canonicalised); `/connect` and `/view` escape the device name and write
+untrusted text with `textContent`; no `unsafe` in either crate; panics on the
+request path become a 500; default bind `127.0.0.1`. `cargo audit` and
+`pip-audit` report nothing beyond RUSTSEC-2023-0071 (below).
+
+**Not fixed, by design or for now:**
+
+- **DNS rebinding.** An attacker page served from a name that resolves to
+  `127.0.0.1` is same-origin, so finding 2's check does not stop it. A `Host`
+  allow-list would, but would break proxies that pass `Host` through; an app
+  with actuators or sensitive tools should require a key even on `localhost`.
+- **No auth configured means an open control plane**, including `halt` and
+  `release`, to anyone who can reach the port. Deliberate for development;
+  `webcortex security` warns about unscoped actuators.
+- **Image URLs returned by tools** are not checked (finding 4 covers caller
+  input), and a public name resolving to a private address is not caught.
+- **Proxy responses** are buffered whole. The upstream is the operator's.
+
 ## Reporting
 
-
-This is a personal project without a disclosure process. Open an issue.
+Report a vulnerability privately through
+[GitHub's private vulnerability reporting](https://github.com/slimboi34/web_cortex_framework/security/advisories/new)
+rather than a public issue. This is a personal project: there is no bounty and
+no fixed response time, but reports are read.

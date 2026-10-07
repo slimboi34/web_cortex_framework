@@ -163,7 +163,7 @@ app.agent("assistant", context=["policy"], memory="notes",
 ## Status
 
 !!! warning "Young"
-    v2.4.0, on PyPI as `web-cortex-framework`. Working and tested, but young.
+    v2.4.1, on PyPI as `web-cortex-framework`. Working and tested, but young.
     Read [Deployment](deployment.md#is-it-production-ready) for an honest
     assessment of what it is and is not ready for.
 

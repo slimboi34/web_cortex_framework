@@ -193,5 +193,10 @@ header credential is present. The request log records the path, never the
 query, but a proxy in front of the hub may log full URLs: give browsers keys
 with the narrowest scope that works.
 
+A browser opening a socket from another origin is refused (`403`) unless that
+origin is listed in `app.cors(...)`, so a page elsewhere cannot open the
+stream with a key the operator's browser has saved. Devices and
+`webcortex.client` send no `Origin` and are unaffected.
+
 The `/connect` and `/view` pages are public. They are static HTML containing no
 data, and everything they show needs a key.

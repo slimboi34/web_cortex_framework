@@ -212,11 +212,11 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def secure_server():
+def _serve(app_src: str, prefix: str):
+    """Boot an app source (formatted with its port) and yield its base URL."""
     port = _free_port()
-    workdir = Path(tempfile.mkdtemp(prefix="webcortex-sec-"))
-    (workdir / "api.py").write_text(APP.format(port=port))
+    workdir = Path(tempfile.mkdtemp(prefix=prefix))
+    (workdir / "api.py").write_text(app_src.format(port=port))
     log_path = workdir / "server.log"
 
     env = {
@@ -251,6 +251,26 @@ def secure_server():
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+
+@pytest.fixture(scope="module")
+def secure_server():
+    yield from _serve(APP, "webcortex-sec-")
+
+
+LIMITED_APP = '''
+from webcortex import WebCortex
+
+app = WebCortex("limited", port={port})
+app.api_key("ADMIN_KEY", id="admin", scopes=["webcortex:admin"])
+app.rate_limit(per_second=0.01, burst=5)
+app.static("GET", "/open", {{"public": True}})
+'''
+
+
+@pytest.fixture(scope="module")
+def limited_server():
+    yield from _serve(LIMITED_APP, "webcortex-limited-")
 
 
 def call(base, path, method="GET", key=None, body=None, headers=None):
@@ -315,6 +335,21 @@ def test_request_id_is_echoed_when_supplied(secure_server):
         secure_server, "/open", headers={"x-request-id": "trace-me-123"}
     )
     assert headers.get("x-request-id") == "trace-me-123"
+
+
+def test_a_request_id_that_could_pollute_logs_is_replaced(secure_server):
+    for bad in ("x" * 200, "has space", "<script>"):
+        _, _, headers = call(secure_server, "/open", headers={"x-request-id": bad})
+        assert headers.get("x-request-id") not in (None, bad)
+
+
+def test_failed_credentials_are_rate_limited(limited_server):
+    """Guessing keys costs the same budget as any other request."""
+    statuses = [call(limited_server, "/open", key=f"guess-{i}")[0] for i in range(8)]
+    # Burst of 5, and the readiness probe already spent one of them.
+    assert statuses[0] == 401
+    assert statuses[-3:] == [429] * 3
+    assert set(statuses) == {401, 429}
 
 
 def test_cors_allows_the_declared_origin_only(secure_server):

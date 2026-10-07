@@ -18,7 +18,7 @@ from ._bridge import HTTPError, Request, Response, free_threaded
 from .app import WebCortex, Resource
 from .media import Image
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 __all__ = [
     "WebCortex",

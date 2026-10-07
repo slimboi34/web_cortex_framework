@@ -14,6 +14,12 @@ use serde_json::{Value, json};
 /// The MCP revision this server implements.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Most messages one JSON-RPC batch may carry. Each one can be a tool call, and
+/// the rate limiter sees a batch as a single request, so an unbounded batch
+/// turned one admitted request into any number of tool runs. (MCP 2025-06-18
+/// dropped batching; it is still accepted for older clients, within this cap.)
+pub const MAX_BATCH: usize = 32;
+
 pub async fn handle(app: &App, body: &[u8], caller: &Principal) -> WebCortexResponse {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -25,6 +31,13 @@ pub async fn handle(app: &App, body: &[u8], caller: &Principal) -> WebCortexResp
     match parsed {
         // JSON-RPC batch.
         Value::Array(items) => {
+            if items.len() > MAX_BATCH {
+                return jsonrpc_response(error_obj(
+                    Value::Null,
+                    -32600,
+                    format!("a batch may hold at most {MAX_BATCH} messages ({} sent)", items.len()),
+                ));
+            }
             let mut out = Vec::new();
             for item in items {
                 if let Some(res) = handle_one(app, item, caller).await {

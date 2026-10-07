@@ -121,6 +121,11 @@ and approvals resumed after the stop are all refused. `security_report()` lists
 actuators and warns about any that are unscoped, or agent tools without
 `approval="required"`. Section 8a covers images.
 
+A tool call names its route (`WebCortexRequest.route_id`); its path is built
+from the arguments with each value percent-encoded as one segment, and
+`App::dispatch` refuses (400) if that path routes anywhere else. Approval gates
+are checked by tool name, so an argument must never select a different route.
+
 Shorthands: `@app.get`, `@app.post`, `@app.put`, `@app.patch`, `@app.delete` —
 all take `(path, **kw)` with the same keywords.
 
@@ -256,6 +261,11 @@ app.cors(*origins, credentials=False, methods=None, headers=None, expose=(), max
 ```
 Explicit origins only. `credentials=True` together with a `"*"` origin is
 **rejected at boot** — the combination is forbidden by the CORS spec.
+The listed origins are also the only *other* origins a browser may send a
+state-changing request or a WebSocket upgrade from: since 2.4.1 a cross-origin
+browser request (by `Sec-Fetch-Site`, or `Origin` ≠ `Host`) is refused with 403
+on anything but `GET`/`HEAD`/`OPTIONS`. Non-browser clients send neither header
+and are unaffected.
 
 ```python
 app.rate_limit(per_second=50.0, *, burst=100)
@@ -580,7 +590,9 @@ No vision model is embedded (DESIGN §5); pixels are carried to the model.
   gets `vision::redact` (size, no base64). `vision::prune` runs before every
   provider call and keeps the newest `policy.max_images` images as pixels.
   Input images (`RunOptions.images`, from the request's `images`) precede the
-  text block of the first user message. Limits: 16 images, 5 MB each.
+  text block of the first user message. Limits: 16 images, 5 MB each. A
+  caller's image `url` naming a loopback/private/link-local/metadata host is
+  refused (`vision::names_an_internal_host`); tool-returned URLs are not.
 - **OpenAI-compatible** (`to_openai_messages`): tool messages stay text; tool
   images follow in one `user` message as `image_url` parts (data URLs).
 - **MCP** `tools/call`: images become `{"type": "image", "data", "mimeType"}`

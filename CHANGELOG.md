@@ -3,6 +3,64 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.4.1] — 2026-10-07
+
+A security release: a second adversarial pass over the 2.x surface. Details, and what
+was checked and held, are in [SECURITY.md](SECURITY.md). No public API was
+removed; one behaviour is new and can refuse requests that used to succeed (the first
+item under *Changed*).
+
+### Security
+
+- **A tool argument could steer an in-process tool call onto a different route,
+  skipping its approval gate** (high). The call's path was rebuilt from the arguments
+  and routed again, while approval had been checked against the tool's name:
+  `touch_note(id="purge")` ran a gated `POST /notes/purge`, and a `/` in a value could
+  add segments. Scopes and the e-stop still applied. Path values are now percent-encoded
+  as one segment, and `dispatch` refuses (400) a tool call whose path routes anywhere
+  but the named tool's route.
+- **Proxy parameter injection** (medium). Since 2.0.1 path parameters are decoded, and
+  the decoded value was spliced into the upstream URL raw, so `/proxy/x%3Fadmin%3D1`
+  reached the upstream as `/echo/x?admin=1`. Substituted values are now encoded.
+- **Caller-supplied image URLs could aim an OpenAI-compatible server at internal
+  addresses** (medium). Those servers fetch `image_url` themselves. An image `url` in a
+  request may no longer name a loopback, private, link-local, shared or metadata host
+  (`localhost`, `10.x`, `169.254.169.254`, `[::1]`, `0x7f.1`, …). URLs a tool returns are
+  unchanged.
+- **MCP batches** are capped at 32 messages: the rate limiter admits a batch as one
+  request, and it could carry any number of tool calls (medium).
+- A **pulled camera** is read only up to `max_frame_bytes`, instead of buffering the whole
+  body and checking afterwards (low).
+- **Camera and upstream errors no longer echo their URL** to the client — a camera URL
+  can carry `user:pass@`. The full error is logged (low).
+- **Failed credentials count against the rate limit** for the client's address;
+  authentication used to fail before the limiter ran (low).
+- **`x-request-id`** is echoed and logged only when it is at most 128 plain characters;
+  anything else is replaced with a generated id (low).
+- **`webcortex.client.WebSocket`** refuses messages larger than `max_message` (new keyword,
+  64 MB by default) instead of trusting a server's 2⁶³-byte frame header, and refuses header
+  values containing a line break (low).
+
+### Changed
+
+- **Cross-origin browser requests that change state are refused.** A `POST`, `PUT`,
+  `PATCH` or `DELETE`, or a WebSocket upgrade, that a browser marks as cross-origin
+  (`Sec-Fetch-Site`, or an `Origin` that is not the `Host`) now gets `403` unless the
+  origin is listed in `app.cors(...)`. CORS only stopped a hostile page *reading*
+  responses; it could still send a simple POST or open a socket, so any page the operator
+  visited could call tools, release the e-stop or watch a camera on an app reachable
+  from their browser. API clients, devices, `curl` and `webcortex.client` send neither
+  header and are unaffected. To accept a cross-origin browser app, list its origin in
+  `app.cors(...)`.
+
+### CI
+
+- Every action is pinned to a full commit SHA (the tag is in a comment); checkouts do
+  not persist credentials; Pages permissions are granted to the deploy job only; the
+  published wheels are built without sccache; the publish job runs only for a tag;
+  `release.yml` has a concurrency group and timeouts. `zizmor` reports no findings.
+- The dependency audit job also runs `pip-audit` over the docs toolchain.
+
 ## [2.4.0] — 2026-10-06
 
 ### Added

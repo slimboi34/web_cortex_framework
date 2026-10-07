@@ -22,6 +22,10 @@ env:
   # Incremental artifacts are useless on ephemeral runners and cost disk.
   CARGO_INCREMENTAL: 0
 
+# Every action is pinned to a full commit SHA, with the tag it was resolved from
+# in the comment; Dependabot (.github/dependabot.yml) proposes the bumps. A tag
+# can be moved to point at different code; a SHA cannot.
+
 jobs:
   rust:
     name: Rust (${{ matrix.os }})
@@ -33,11 +37,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test -p webcortex-core --all-features
       # Warnings are errors here: this is where a real defect gets caught for
       # free, and a warning nobody fails on is a warning nobody reads.
@@ -57,9 +64,13 @@ jobs:
           - os: ubuntu-latest
             python: "3.13"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Key on the manifests, not just Cargo.lock.
           #
@@ -87,11 +98,13 @@ jobs:
           # failed at 10:17" mystery below.
           key: py${{ matrix.python }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
       - name: Build and test
         shell: bash
+        env:
+          PYTHON: ${{ matrix.python }}
         run: |
-          uv venv --python ${{ matrix.python }}
+          uv venv --python "$PYTHON"
           uv pip install maturin pytest
           source .venv/bin/activate
           # The exact patch release matters. `3.14` is a moving target — uv
@@ -132,15 +145,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo install cargo-audit --locked
       # Run the binary directly rather than via an action wrapper, so the
       # documented exceptions in .cargo/audit.toml are honoured. The critical
       # JWT finding in v0.3 was a dependency feature-flag issue — exactly the
       # class this catches automatically.
       - run: cargo audit
+      # The package itself has no Python dependencies; the docs toolchain does.
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+      - name: pip-audit (docs toolchain)
+        run: |
+          uv pip compile -q docs-requirements.txt -o "$RUNNER_TEMP/docs-lock.txt"
+          uvx pip-audit --strict --disable-pip --no-deps -r "$RUNNER_TEMP/docs-lock.txt"
 
   # Proves the wheel matrix builds on every push, so a release is never the
   # first time a platform is attempted.
@@ -170,12 +193,14 @@ jobs:
           - os: windows-latest
             target: x64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           # PyO3 without abi3 needs one wheel per interpreter version.
@@ -184,8 +209,10 @@ jobs:
             --out dist
             --interpreter 3.12 3.13 3.14 3.14t
           manylinux: auto
-          sccache: "true"
-      - uses: actions/upload-artifact@v4
+          # No build cache: these are the files release.yml publishes, so they
+          # are built from source alone, never from a cache another run wrote.
+          sccache: "false"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist
@@ -195,12 +222,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-sdist
           path: dist

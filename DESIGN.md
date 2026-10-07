@@ -337,6 +337,14 @@ failures to diagnose. The request path now catches unwinds. This is why
 `panic = "abort"` was rejected in v0.1: an aborting process would have made the
 same bug a crash loop instead of a contained 500.
 
+**A tool name is not a route (2.4.1).** An in-process tool call was dispatched
+by rebuilding a path from its arguments and routing it again, while approval had
+been decided on the tool's name. The two could disagree — an argument equal to a
+sibling's static segment landed on the sibling — so a gate held only as long as
+nothing sent an awkward value. The call now carries its route id and dispatch
+refuses a path that routes elsewhere: a decision made about one identity must be
+enforced against the same identity, not a re-derivation of it.
+
 ## 8. The honest summary
 
 The novel, defensible idea here is **"declared once, executed by Rust, callable

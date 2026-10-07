@@ -180,6 +180,47 @@ impl Cors {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-origin request protection
+// ---------------------------------------------------------------------------
+
+/// Whether a state-changing request (or a WebSocket upgrade) may proceed,
+/// judged by where a browser says it came from.
+///
+/// CORS only stops a hostile page *reading* a response. A "simple" POST — a
+/// form, or `fetch` with a `text/plain` body — is still sent, and a WebSocket
+/// is not subject to CORS at all. Against an app on localhost or a LAN with
+/// anonymous scopes, that let any web page the operator visited call tools,
+/// release the e-stop or watch a camera stream. So a request a browser marks
+/// as cross-origin is refused unless its origin is one CORS already trusts.
+///
+/// The same rules as Go's `CrossOriginProtection`: `Sec-Fetch-Site` decides
+/// when present; otherwise an `Origin` must match `Host`; a request carrying
+/// neither header did not come from a browser page and is allowed, so API
+/// clients, devices and `curl` are unaffected.
+pub fn cross_origin_allowed(
+    headers: &BTreeMap<String, String>,
+    host: Option<&str>,
+    cors: &CorsConfig,
+) -> bool {
+    let origin = headers.get("origin").map(String::as_str);
+    let trusted = |o: &str| cors.enabled && cors.allow_origins.iter().any(|a| a == "*" || a == o);
+    match headers.get("sec-fetch-site").map(|s| s.trim().to_ascii_lowercase()) {
+        Some(site) if site == "same-origin" || site == "none" => return true,
+        Some(_) => return origin.is_some_and(trusted),
+        None => {}
+    }
+    let Some(origin) = origin else { return true };
+    if trusted(origin) {
+        return true;
+    }
+    // Same origin: the Origin's authority is exactly the Host the browser used.
+    match (origin.split_once("://"), host) {
+        (Some((_, authority)), Some(host)) => authority.eq_ignore_ascii_case(host.trim()),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Security headers
 // ---------------------------------------------------------------------------
 
@@ -282,6 +323,42 @@ mod tests {
         let h = c.headers_for(Some("https://any.test"));
         let origin = h.iter().find(|(k, _)| k == "access-control-allow-origin").unwrap();
         assert_eq!(origin.1, "https://any.test", "must echo, never '*', with credentials");
+    }
+
+    fn hdrs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn a_cross_site_browser_request_is_refused_unless_cors_trusts_it() {
+        let off = CorsConfig::default();
+        let on = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["https://good.test".into()],
+            ..CorsConfig::default()
+        };
+        let host = Some("127.0.0.1:8000");
+        // Not from a browser page: no Origin, no Sec-Fetch-Site.
+        assert!(cross_origin_allowed(&hdrs(&[]), host, &off));
+        // A hostile page posting to a local app.
+        let evil = hdrs(&[("origin", "https://evil.test")]);
+        assert!(!cross_origin_allowed(&evil, host, &off));
+        assert!(!cross_origin_allowed(&evil, host, &on));
+        assert!(!cross_origin_allowed(&hdrs(&[("origin", "null")]), host, &off));
+        let fetch_meta = hdrs(&[("origin", "https://evil.test"), ("sec-fetch-site", "cross-site")]);
+        assert!(!cross_origin_allowed(&fetch_meta, host, &off));
+        let same_site = hdrs(&[("origin", "https://a.good.test"), ("sec-fetch-site", "same-site")]);
+        assert!(!cross_origin_allowed(&same_site, host, &on));
+        assert!(!cross_origin_allowed(&hdrs(&[("sec-fetch-site", "cross-site")]), host, &off));
+        // Same origin, by Origin == Host or by Sec-Fetch-Site.
+        assert!(cross_origin_allowed(&hdrs(&[("origin", "http://127.0.0.1:8000")]), host, &off));
+        assert!(!cross_origin_allowed(&hdrs(&[("origin", "http://127.0.0.1:9999")]), host, &off));
+        let proxied = hdrs(&[("origin", "https://app.test"), ("sec-fetch-site", "same-origin")]);
+        assert!(cross_origin_allowed(&proxied, host, &off), "Host rewritten by a proxy");
+        // An origin CORS already trusts.
+        let good = hdrs(&[("origin", "https://good.test"), ("sec-fetch-site", "cross-site")]);
+        assert!(cross_origin_allowed(&good, host, &on));
+        assert!(!cross_origin_allowed(&good, host, &off), "trusted only while CORS is on");
     }
 
     #[test]

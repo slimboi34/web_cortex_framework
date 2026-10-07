@@ -2,6 +2,9 @@ name: Release
 
 # Publishing is deliberately gated on a tag, not on a push to main: a release
 # should be an explicit act with a name attached to it.
+#
+# Do not rename this file or the `pypi` environment below: the PyPI trusted
+# publisher is bound to both.
 on:
   push:
     tags: ["v*"]
@@ -9,6 +12,11 @@ on:
 
 permissions:
   contents: read
+
+# Never two publishes of one ref at once, and never cancel one mid-upload.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # CI already builds every wheel and the sdist on each push, and uploads them
@@ -19,13 +27,22 @@ jobs:
   # the thing published were different builds, produced by duplicated config
   # that could drift apart silently. Now there is one build, and the release is
   # the act of uploading what CI already proved.
+  #
+  # A job-level reusable workflow is resolved from this commit when the run is
+  # planned, before any step runs, so the runtime-checkout risk zizmor's
+  # self-repository audit describes does not apply; `./` is kept over the
+  # newer `$/` form so the release gate does not depend on a July 2026 feature.
   verify:
-    uses: ./.github/workflows/ci.yml
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
 
   publish:
     name: Publish to PyPI
     needs: verify
+    # Only a tag publishes. A manual run started from a branch still runs the
+    # whole of CI, then stops here.
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Trusted publishing: no API token stored anywhere. The publisher is
     # configured at
     # https://pypi.org/manage/project/web-cortex-framework/settings/publishing/
@@ -34,7 +51,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -46,7 +63,7 @@ jobs:
       # skip-existing makes a re-run a no-op rather than a failure: PyPI files
       # are immutable, so a second attempt at an already-published version would
       # otherwise fail on the first file it recognises.
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist
           skip-existing: true

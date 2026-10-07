@@ -88,8 +88,67 @@ pub fn input_images(value: Option<&Value>) -> Result<Vec<Value>, String> {
     items
         .iter()
         .enumerate()
-        .map(|(i, v)| image_block(v).map_err(|e| format!("images[{i}]: {e}")))
+        .map(|(i, v)| {
+            let block = image_block(v).map_err(|e| format!("images[{i}]: {e}"))?;
+            if let Some(url) = block["source"]["url"].as_str() {
+                if names_an_internal_host(url) {
+                    return Err(format!(
+                        "images[{i}]: an image url may not point at a loopback, private, \
+                         link-local or metadata address; send the bytes instead"
+                    ));
+                }
+            }
+            Ok(block)
+        })
         .collect()
+}
+
+/// True when a URL's host is a loopback, private, link-local, shared or
+/// unspecified address, or a name for one such as `localhost`.
+///
+/// An image URL sent by a caller is handed to the model provider, and an
+/// OpenAI-compatible server (vLLM, LM Studio, …) fetches `image_url` itself,
+/// from wherever it runs — so a caller could aim it at the inference host's
+/// own network or a cloud metadata endpoint. Literal addresses are checked
+/// after the URL parser normalises them (`0x7f.1`, `2130706433`, `[::ffff:…]`
+/// are all caught); a public name that *resolves* to a private address is not,
+/// which needs DNS and is the provider's to refuse.
+pub fn names_an_internal_host(url: &str) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    fn v4(ip: Ipv4Addr) -> bool {
+        let [a, b, ..] = ip.octets();
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || a == 0
+            || (a == 100 && (64..128).contains(&b)) // shared / CGNAT
+    }
+    fn v6(ip: Ipv6Addr) -> bool {
+        let first = ip.segments()[0];
+        ip.is_loopback()
+            || ip.is_unspecified()
+            || (first & 0xfe00) == 0xfc00 // unique local
+            || (first & 0xffc0) == 0xfe80 // link-local
+            || ip.to_ipv4_mapped().is_some_and(v4)
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else { return true };
+    // The parser has already normalised the host: IPv4 in any notation comes
+    // back dotted-decimal, and IPv6 comes back bracketed.
+    let Some(host) = parsed.host_str() else { return true };
+    let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
+    let host = host.to_ascii_lowercase();
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => v4(ip),
+        Ok(IpAddr::V6(ip)) => v6(ip),
+        Err(_) => {
+            host == "localhost"
+                || host.ends_with(".localhost")
+                || host.ends_with(".internal")
+                || host.ends_with(".local")
+        }
+    }
 }
 
 /// True for a `{"$image": …}` marker object.
@@ -344,5 +403,33 @@ mod tests {
         let many = Value::Array(vec![marker(); MAX_IMAGES + 1]);
         assert!(input_images(Some(&many)).is_err());
         assert!(input_images(Some(&json!([{"url": "ftp://x"}]))).unwrap_err().starts_with("images[0]"));
+    }
+
+    #[test]
+    fn a_caller_cannot_aim_an_image_url_at_an_internal_address() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8000/x.png",
+            "http://0x7f.1/x.png",
+            "http://2130706433/x.png",
+            "http://10.0.0.5/x.png",
+            "http://192.168.1.10/cam.jpg",
+            "http://100.64.0.1/x.png",
+            "http://0.0.0.0/x.png",
+            "http://[::1]/x.png",
+            "http://[::ffff:127.0.0.1]/x.png",
+            "http://[fd00::1]/x.png",
+            "http://[fe80::1]/x.png",
+            "http://localhost/x.png",
+            "http://LOCALHOST./x.png",
+            "http://metadata.google.internal/x.png",
+            "http://printer.local/x.png",
+        ] {
+            let err = input_images(Some(&json!([{"url": url}]))).unwrap_err();
+            assert!(err.contains("may not point at"), "{url}: {err}");
+        }
+        for url in ["https://x.test/a.png", "https://8.8.8.8/a.png", "https://[2001:db8::1]/a.png"] {
+            assert!(input_images(Some(&json!([{"url": url}]))).is_ok(), "{url}");
+        }
     }
 }

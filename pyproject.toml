@@ -7,7 +7,7 @@ build-backend = "maturin"
 # The split is for ergonomics, the same way djangorestframework imports as
 # `rest_framework`.
 name = "web-cortex-framework"
-version = "2.4.0"
+version = "2.4.1"
 description = "A Rust-cored Python web framework where every route is also an agent tool."
 readme = "README.md"
 requires-python = ">=3.12"

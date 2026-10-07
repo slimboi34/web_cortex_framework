@@ -295,20 +295,36 @@ impl DeviceHub {
         if let Some(token) = src.bearer_env.as_ref().and_then(|e| std::env::var(e).ok()) {
             req = req.bearer_auth(token);
         }
-        let res = req
-            .send()
-            .await
-            .map_err(|e| format!("camera {:?} did not answer: {e}", device.def.name))?;
+        // A reqwest error names the URL, and a camera URL can carry credentials
+        // (`http://user:pass@cam/…`). The full error goes to the log; the
+        // message that can reach a client does not name the URL.
+        let name = &device.def.name;
+        let mut res = req.send().await.map_err(|e| {
+            tracing::warn!(device = %name, error = %e, "camera did not answer");
+            format!("camera {name:?} did not answer: {}", e.without_url())
+        })?;
         if !res.status().is_success() {
-            return Err(format!("camera {:?} answered {}", device.def.name, res.status()));
+            return Err(format!("camera {name:?} answered {}", res.status()));
         }
-        let data = res
-            .bytes()
+        // Read at most max_frame_bytes: a camera that streams forever, or a
+        // URL that is not a snapshot at all, must not grow memory without bound.
+        let max = device.def.max_frame_bytes;
+        let over = || format!("camera {name:?} sent more than max_frame_bytes ({max})");
+        if res.content_length().is_some_and(|n| n > max as u64) {
+            return Err(over());
+        }
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = res
+            .chunk()
             .await
-            .map_err(|e| format!("camera {:?} sent an unreadable body: {e}", device.def.name))?;
-        if data.len() > device.def.max_frame_bytes {
-            return Err(format!("camera {:?} sent {} bytes, over max_frame_bytes", device.def.name, data.len()));
+            .map_err(|e| format!("camera {name:?} sent an unreadable body: {}", e.without_url()))?
+        {
+            if buf.len() + chunk.len() > max {
+                return Err(over());
+            }
+            buf.extend_from_slice(&chunk);
         }
+        let data = buf.freeze();
         let media_type = sniff(&data)
             .ok_or_else(|| format!("camera {:?} did not send a PNG, JPEG, GIF or WebP image", device.def.name))?;
         // A pull is not rate-limited like a push: it happens because someone asked.
@@ -705,6 +721,54 @@ mod tests {
         cam.push_frame(Bytes::from_static(b"\x89PNG\r\n\x1a\n-third")).unwrap();
         assert!(run_watcher_once(&app, &w, &mut state).await.is_none(), "two runs an hour, and both are spent");
         assert_eq!(provider.calls(), 2);
+    }
+
+    /// One-shot HTTP server answering every connection with `body`.
+    async fn serve_once(body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                // No content-length: the size is only known by reading it.
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n").await;
+                let _ = sock.write_all(&body).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn pulled(url: &str, max_frame_bytes: usize) -> DeviceHub {
+        let def: DeviceDef = serde_json::from_value(json!({
+            "name": "cam", "max_frame_bytes": max_frame_bytes,
+            "source": {"url": url},
+        }))
+        .unwrap();
+        DeviceHub::new(&[def], reqwest::Client::new())
+    }
+
+    #[tokio::test]
+    async fn a_pulled_camera_is_read_no_further_than_max_frame_bytes() {
+        let mut big = PNG.to_vec();
+        big.resize(64 * 1024, 0);
+        let hub = pulled(&serve_once(big).await, 1024);
+        let err = hub.current_frame(hub.get("cam").unwrap()).await.unwrap_err();
+        assert!(err.contains("max_frame_bytes"), "{err}");
+
+        let hub = pulled(&serve_once(PNG.to_vec()).await, 1024);
+        let frame = hub.current_frame(hub.get("cam").unwrap()).await.unwrap().unwrap();
+        assert_eq!(frame.media_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn a_camera_error_does_not_echo_its_url_or_credentials() {
+        // Port 9 (discard) on loopback: nothing listens, the connect fails.
+        let hub = pulled("http://admin:hunter2@127.0.0.1:9/snapshot.jpg", 1024);
+        let err = hub.current_frame(hub.get("cam").unwrap()).await.unwrap_err();
+        assert!(err.contains("did not answer"), "{err}");
+        assert!(!err.contains("hunter2") && !err.contains("snapshot.jpg"), "{err}");
     }
 
     #[test]

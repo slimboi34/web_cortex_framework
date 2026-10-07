@@ -69,7 +69,9 @@ Measured throughput on an M-series machine, 24 concurrent clients:
 
 Order is fixed deliberately:
 
-1. **CORS preflight** — answered before anything can reject it
+1. **CORS preflight** — answered before anything can reject it; then a
+   cross-origin browser request that changes state, or opens a WebSocket, is
+   refused unless CORS trusts its origin
 2. **Request ID** — assigned, so every later log line correlates
 3. **Rate limit** — the cheapest rejection, before authentication work
 4. **Authenticate** — the principal is established exactly once
