@@ -18,7 +18,14 @@ from ._bridge import HTTPError, Request, Response, free_threaded
 from .app import WebCortex, Resource
 from .media import Image
 
-__version__ = "2.4.1"
+
+def doctor(app: "WebCortex", *, online: bool = False, url: str | None = None,
+           key: str | None = None) -> dict:
+    """`webcortex doctor` as a function: see :meth:`WebCortex.doctor`."""
+    return app.doctor(online=online, url=url, key=key)
+
+
+__version__ = "2.5.0"
 
 __all__ = [
     "WebCortex",
@@ -28,5 +35,6 @@ __all__ = [
     "Resource",
     "Image",
     "free_threaded",
+    "doctor",
     "__version__",
 ]

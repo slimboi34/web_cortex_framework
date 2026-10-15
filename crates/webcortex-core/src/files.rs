@@ -27,13 +27,13 @@ impl FileServer {
         let Some(safe) = self.resolve(relative) else {
             // Deliberately 404, not 403: a traversal attempt should learn
             // nothing about what does or does not exist outside the root.
-            return WebCortexResponse::error(404, "not found");
+            return WebCortexResponse::coded(404, "WC207", "not found");
         };
 
         let target = if safe.is_dir() {
             match &self.index {
                 Some(name) => safe.join(name),
-                None => return WebCortexResponse::error(404, "not found"),
+                None => return WebCortexResponse::coded(404, "WC207", "not found"),
             }
         } else {
             safe
@@ -41,7 +41,7 @@ impl FileServer {
 
         let bytes = match std::fs::read(&target) {
             Ok(b) => b,
-            Err(_) => return WebCortexResponse::error(404, "not found"),
+            Err(_) => return WebCortexResponse::coded(404, "WC207", "not found"),
         };
 
         let etag = weak_etag(&bytes);

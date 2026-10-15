@@ -92,6 +92,12 @@ impl IngestError {
             IngestError::Invalid(_) => 422,
         }
     }
+    pub fn code(&self) -> &'static str {
+        match self {
+            IngestError::TooFast => "WC504",
+            IngestError::Invalid(_) => "WC505",
+        }
+    }
     pub fn message(&self) -> String {
         match self {
             IngestError::TooFast => "frame dropped: faster than this device's max_fps".into(),
@@ -234,6 +240,18 @@ impl Device {
         self.tx.subscribe()
     }
 
+    /// Frames per second over the frames still held in the ring, or 0 when
+    /// fewer than two are held or the newest is over ten seconds old.
+    pub fn recent_fps(&self) -> f64 {
+        let frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
+        let (Some(first), Some(last)) = (frames.front(), frames.back()) else { return 0.0 };
+        if frames.len() < 2 || now_ms().saturating_sub(last.at_ms) > 10_000 || last.at_ms <= first.at_ms {
+            return 0.0;
+        }
+        let fps = (frames.len() - 1) as f64 * 1000.0 / (last.at_ms - first.at_ms) as f64;
+        (fps * 100.0).round() / 100.0
+    }
+
     pub fn describe(&self) -> Value {
         json!({
             "name": self.def.name,
@@ -274,6 +292,37 @@ impl DeviceHub {
 
     pub fn is_empty(&self) -> bool {
         self.devices.is_empty()
+    }
+
+    /// Live numbers per device for the status view: frames in and dropped, a
+    /// recent frame rate, how old the newest frame and telemetry are, and who
+    /// is subscribed.
+    pub fn stats(&self) -> Vec<Value> {
+        let now = now_ms();
+        let mut all: Vec<Value> = self
+            .devices
+            .values()
+            .map(|d| {
+                let latest = d.latest();
+                json!({
+                    "name": d.def.name,
+                    "kind": d.def.kind,
+                    "pulled": d.def.source.is_some(),
+                    "connected": latest.as_ref().is_some_and(|f| now.saturating_sub(f.at_ms) < 10_000)
+                        || d.telemetry().is_some_and(|(at, _)| now.saturating_sub(at) < 10_000),
+                    "fps": d.recent_fps(),
+                    "max_fps": d.def.max_fps,
+                    "frames_in": d.frames_in.load(Ordering::Relaxed),
+                    "frames_dropped": d.frames_dropped.load(Ordering::Relaxed),
+                    "last_frame_age_ms": latest.map(|f| now.saturating_sub(f.at_ms)),
+                    "last_telemetry_age_ms": d.telemetry().map(|(at, _)| now.saturating_sub(at)),
+                    "subscribers": d.tx.receiver_count(),
+                    "insights": d.insights.lock().unwrap_or_else(|p| p.into_inner()).len(),
+                })
+            })
+            .collect();
+        all.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        all
     }
 
     pub fn describe(&self) -> Value {
@@ -403,6 +452,7 @@ pub async fn run_watcher_once(app: &App, w: &WatcherDef, state: &mut WatchState)
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(watcher = %w.name, error = %e, "watcher could not get a frame");
+                app.recorder().watcher_error(&w.name, "WC506");
                 return None;
             }
         },
@@ -461,6 +511,7 @@ pub async fn run_watcher_once(app: &App, w: &WatcherDef, state: &mut WatchState)
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(watcher = %w.name, error = %e, "watcher could not run its agent");
+            app.recorder().watcher_error(&w.name, "WC316");
             return None;
         }
     };
@@ -475,10 +526,17 @@ pub async fn run_watcher_once(app: &App, w: &WatcherDef, state: &mut WatchState)
         "output": result.output,
         // Why a run that failed failed: without it a monitor shows "failed" and nothing else.
         "error": result.steps.iter().rev().find_map(|s| s.error.clone()),
+        "code": result.code,
         "run_id": result.run_id,
         "tokens": result.usage.total_tokens(),
         "at_ms": now_ms(),
     });
+    let status = serde_json::to_value(result.status).ok();
+    app.recorder().watcher_run(
+        &w.name,
+        status.as_ref().and_then(|s| s.as_str()).unwrap_or("unknown"),
+        result.code.as_deref(),
+    );
     device.publish_insight(insight.clone());
     app.audit.record(crate::audit::AuditEvent {
         kind: "watcher_run".into(),

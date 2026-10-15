@@ -170,6 +170,13 @@ impl QueryError {
         }
     }
 
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::BadInput(_) => "WC211",
+            Self::Internal(_) => "WC001",
+        }
+    }
+
     pub fn message(&self) -> &str {
         match self {
             Self::BadInput(m) | Self::Internal(m) => m,

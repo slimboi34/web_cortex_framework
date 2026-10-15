@@ -60,6 +60,13 @@ pub struct RunResult {
     /// Echoed when the run belongs to a session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Set when the run did not complete: a catalogued code (`WC3xx` for a
+    /// failure, `WC402` budget, `WC404` step limit, `WC312` cut off) and what
+    /// to do about it. Absent for `completed` and `awaiting_approval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +97,13 @@ pub struct Step {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The catalogued code for a failed step (see `crate::errors`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// What to do about it: the catalogue's hint for `code`, filled in when
+    /// the run finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     pub duration_ms: u64,
 }
 
@@ -332,6 +346,9 @@ struct RunState {
     /// Where step events go, and how many steps have been sent.
     events: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     emitted: usize,
+    /// What this run's own model calls cost at the declared prices; `None`
+    /// once any of them used an unpriced model (never reported as free).
+    cost_usd: Option<f64>,
 }
 
 impl RunState {
@@ -416,7 +433,8 @@ impl AgentRuntime {
             Err(e) => {
                 let ev = AuditEvent::agent_failed(&run_id, &def.name, &e);
                 self.audit.record(ev);
-                return RunResult {
+                let code = crate::errors::code_in(&e).unwrap_or("WC311");
+                let result = RunResult {
                     run_id,
                     agent: def.name.clone(),
                     path: vec![def.name.clone()],
@@ -429,12 +447,19 @@ impl AgentRuntime {
                         arguments: None,
                         result: None,
                         error: Some(e),
+                        code: Some(code.into()),
+                        hint: Some(crate::errors::hint(code).into()),
                         duration_ms: 0,
                     }],
                     usage: Usage::default(),
                     pending_approval: None,
                     session_id: opts.session_id,
+                    code: Some(code.into()),
+                    hint: Some(crate::errors::hint(code).into()),
                 };
+                app.recorder().run_started(&result.run_id, &def.name, &caller.id, opts.depth);
+                record_finished(app, &result, None);
+                return result;
             }
         };
 
@@ -459,8 +484,10 @@ impl AgentRuntime {
             session_key,
             events: opts.events,
             emitted: 0,
+            cost_usd: Some(0.0),
         };
 
+        app.recorder().run_started(&state.run_id, &state.def.name, &caller.id, state.depth);
         let tools = self.tool_specs(app, &state.def);
         self.audit.record(AuditEvent::agent_started(
             &state.run_id, &state.def.name, &state.actor, &tools,
@@ -482,6 +509,7 @@ impl AgentRuntime {
     ) -> RunResult {
         let SuspendedRun { state: mut st, calls, gated, mut results, approval_id, .. } = suspended;
         let call = &calls[gated];
+        app.recorder().run_started(&st.run_id, &st.def.name, &st.caller.id, st.depth);
 
         if approve {
             self.audit.record(AuditEvent::approval_decided(
@@ -504,6 +532,8 @@ impl AgentRuntime {
                 arguments: Some(call.arguments.clone()),
                 result: None,
                 error: Some(msg.clone()),
+                code: None,
+                hint: None,
                 duration_ms: 0,
             });
             results.push(tool_result(&call.id, &json!({"error": msg}), true));
@@ -555,6 +585,8 @@ impl AgentRuntime {
                             tool: None,
                             arguments: None,
                             result: None,
+                            code: Some(crate::errors::classify_run_error(&e).into()),
+                            hint: None,
                             error: Some(e),
                             duration_ms: 0,
                         });
@@ -589,6 +621,8 @@ impl AgentRuntime {
                         arguments: None,
                         result: None,
                         error: Some(e.clone()),
+                        code: Some(crate::errors::classify_run_error(&e).into()),
+                        hint: None,
                         duration_ms: started.elapsed().as_millis() as u64,
                     });
                     self.audit.record(AuditEvent::agent_failed(&st.run_id, &st.def.name, &e));
@@ -611,6 +645,8 @@ impl AgentRuntime {
                 result: Some(json!({"model": response.model, "input_tokens": st.last_input_tokens,
                                     "output_tokens": response.output_tokens})),
                 error: None,
+                code: None,
+                hint: None,
                 duration_ms: started.elapsed().as_millis() as u64,
             });
 
@@ -668,6 +704,8 @@ impl AgentRuntime {
                                 arguments: Some(call.arguments.clone()),
                                 result: Some(json!({"agent": target})),
                                 error: None,
+                                code: None,
+                                hint: None,
                                 duration_ms: started.elapsed().as_millis() as u64,
                             });
                             results.push(tool_result(&call.id, &json!({"handed_off_to": target, "note": msg}), false));
@@ -689,6 +727,7 @@ impl AgentRuntime {
                     st.def.tools.join(", ")
                 );
                 st.steps.push(refused(st.usage.steps, call, &msg, started));
+                app.recorder().record_failure("tool", &format!("tool {} (agent {})", call.name, st.def.name), "WC307", &st.run_id);
                 self.audit
                     .record(AuditEvent::tool_refused(&st.run_id, &st.actor, &call.name, &msg));
                 results.push(tool_result(&call.id, &json!({"error": msg}), true));
@@ -743,10 +782,17 @@ impl AgentRuntime {
             kind: StepKind::ToolCall,
             tool: Some(call.name.clone()),
             arguments: Some(call.arguments.clone()),
+            code: error.as_deref().map(|e| crate::errors::code_in(e).unwrap_or("WC308").to_string()),
+            hint: None,
             result,
             error,
             duration_ms,
         });
+        // A failed tool call is a failure worth seeing in the live view even
+        // though the run carries on: the model may retry, the operator should know.
+        if let Some(code) = st.steps.last().and_then(|s| s.code.clone()) {
+            app.recorder().record_failure("tool", &format!("tool {} (agent {})", call.name, st.def.name), &code, &st.run_id);
+        }
         st.emit();
         tool_result_with_images(&call.id, &shown, is_error, images)
     }
@@ -907,6 +953,8 @@ impl AgentRuntime {
                 "summary_chars": summary.len(),
             })),
             error: None,
+            code: None,
+            hint: None,
             duration_ms: started.elapsed().as_millis() as u64,
         });
         self.audit.record(AuditEvent {
@@ -953,6 +1001,17 @@ impl AgentRuntime {
         // Over-budget is detected at the top of the loop; charging never fails
         // a step that already happened.
         let _ = st.budget.charge(response.total_tokens());
+        st.cost_usd = match (st.cost_usd, app.registry().price_for(&response.model)) {
+            (Some(c), Some(p)) => Some(
+                c + (response.input_tokens as f64 * p.input_per_mtok
+                    + response.output_tokens as f64 * p.output_per_mtok
+                    + response.cache_read_tokens as f64 * p.cache_read_per_mtok
+                    + response.cache_write_tokens as f64 * p.cache_write_per_mtok)
+                    / 1_000_000.0,
+            ),
+            _ => None,
+        };
+        app.recorder().run_progress(&st.run_id, &st.def.name, st.usage.steps + 1, st.usage.total_tokens());
         app.ledger().charge(
             kind,
             &st.def.name,
@@ -1026,6 +1085,8 @@ impl AgentRuntime {
             arguments: Some(call.arguments.clone()),
             result: Some(json!({"approval_id": approval_id})),
             error: None,
+            code: None,
+            hint: None,
             duration_ms: 0,
         });
         self.audit.record(AuditEvent::approval_requested(
@@ -1065,7 +1126,13 @@ impl AgentRuntime {
                 app.sessions().save(key.clone(), st.conversation.clone());
             }
         }
-        RunResult {
+        for step in &mut st.steps {
+            if let (Some(code), None) = (&step.code, &step.hint) {
+                step.hint = Some(crate::errors::hint(code).to_string());
+            }
+        }
+        let code = outcome_code(status, &st.steps);
+        let result = RunResult {
             run_id: st.run_id,
             agent: st.def.name,
             path: st.path,
@@ -1075,13 +1142,52 @@ impl AgentRuntime {
             usage: st.usage,
             pending_approval: pending,
             session_id: st.session_id,
-        }
+            code: code.map(str::to_string),
+            hint: code.map(|c| crate::errors::hint(c).to_string()),
+        };
+        record_finished(app, &result, st.cost_usd);
+        result
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The catalogued code a run's outcome carries: none for a run that completed
+/// or is waiting on a human; the failing step's code for a failure.
+fn outcome_code(status: RunStatus, steps: &[Step]) -> Option<&'static str> {
+    match status {
+        RunStatus::Completed | RunStatus::AwaitingApproval => None,
+        RunStatus::BudgetExhausted => Some("WC402"),
+        RunStatus::StepLimit => Some("WC404"),
+        RunStatus::MaxTokens => Some("WC312"),
+        RunStatus::Failed => Some(
+            steps
+                .iter()
+                .rev()
+                .find_map(|s| s.code.as_deref().and_then(crate::errors::lookup).map(|e| e.code))
+                .unwrap_or("WC300"),
+        ),
+    }
+}
+
+/// Hand a finished run to the live status view.
+fn record_finished(app: &App, r: &RunResult, cost_usd: Option<f64>) {
+    let status = serde_json::to_value(r.status).ok();
+    app.recorder().run_finished(crate::status::RunSummary {
+        run_id: &r.run_id,
+        agent: &r.agent,
+        path: &r.path,
+        status: status.as_ref().and_then(|s| s.as_str()).unwrap_or("unknown"),
+        steps: r.usage.steps,
+        tool_calls: r.usage.tool_calls,
+        tokens: r.usage.total_tokens(),
+        tree_tokens: r.usage.tree_tokens,
+        cost_usd,
+        code: r.code.as_deref(),
+    });
+}
 
 fn refused(index: u32, call: &ToolCall, msg: &str, started: std::time::Instant) -> Step {
     Step {
@@ -1091,6 +1197,8 @@ fn refused(index: u32, call: &ToolCall, msg: &str, started: std::time::Instant) 
         arguments: Some(call.arguments.clone()),
         result: None,
         error: Some(msg.to_string()),
+        code: Some(crate::errors::code_in(msg).unwrap_or("WC307").into()),
+        hint: None,
         duration_ms: started.elapsed().as_millis() as u64,
     }
 }

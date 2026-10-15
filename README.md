@@ -429,7 +429,18 @@ one command that plugs the app into Claude Code, Claude Desktop or Cursor.
 $ webcortex context                     # the app, described for a coding model
 $ webcortex evolve "add reviews tied to books and a behaviour that summarises them" --model fast
 $ webcortex check                       # boot-time validation, with hints
+$ webcortex doctor                      # keys present? models resolve? port free? e-stop?
+$ webcortex status                      # what the running app is doing, and what just failed
+$ webcortex explain WC402               # what an error code means and what to do
 ```
+
+Every failure carries a stable code and a hint — in HTTP error bodies, agent runs, MCP
+tool errors and the CLI — and the live view at `/_webcortex/status` (also the
+`webcortex_status` MCP tool) shows recent failures by code and request id, runs in
+flight, spend and devices. On eighteen scripted broken scenarios, 2.5.0 gives a code and
+a hint for 18/18 where 2.4.0 gave none; see
+[benchmarks/diagnostics/RESULTS.md](benchmarks/diagnostics/RESULTS.md) and
+[docs/diagnostics.md](docs/diagnostics.md).
 
 The **context pack** is the app's shape — routes, tools and schemas, agents,
 behaviours, flows, context, memory, models, security posture — derived from the
@@ -457,6 +468,10 @@ webcortex typegen         generate a typed TypeScript client
 webcortex openapi         the OpenAPI 3.1 document
 webcortex sql             DDL for declared resources and memories
 webcortex keygen          mint an API key
+webcortex doctor          check the app is ready to run (exit 1 on a failure)
+webcortex status          the running app's live view: requests, errors, runs, spend, devices
+webcortex explain CODE    what an error code means; --list for all of them
+webcortex halt | release  the emergency stop for actuators
 ```
 
 ## Security
@@ -482,7 +497,7 @@ tested, the known limits, and what v2 added to the surface.
 
 ## Status
 
-v2.4.1. Working and tested: the manifest IR, router, native ops (static /
+v2.5.0. Working and tested: the manifest IR, router, native ops (static /
 query / proxy / page / files / flow), the free-threaded Python bridge,
 authentication and scopes, rate limiting, CORS, security headers, graceful
 shutdown, Behaviours with concurrent leaves, the agent runtime with handoffs,
@@ -492,7 +507,9 @@ OpenAI-compatible, which covers local models), prompt caching, the spend
 ledger, the audit trail, OpenAPI, the MCP server, TypeScript generation, the
 context pack and `evolve`, images in and out of agent runs and MCP, actuators
 and the emergency stop, the device hub (cameras, sensors, watchers, WebSocket
-ingest and streams, agents over WebSocket). **427 tests** (132 Rust, 295 Python, including a
+ingest and streams, agents over WebSocket), and diagnostics (stable error codes
+with hints on every failure, `webcortex doctor`, the live `/_webcortex/status`
+view and its MCP tool). **490 tests** (155 Rust, 335 Python, including a
 54-test adversarial suite and offline end-to-end suites that drive the whole
 agent stack over HTTP), clippy clean.
 

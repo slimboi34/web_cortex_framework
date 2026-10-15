@@ -99,6 +99,15 @@ welcoming; humans should start with this site.
 
 ---
 
+## When something fails
+
+A coding agent debugging an app needs failures it can branch on and look up, not prose
+in a log. Since 2.5 every failure carries a stable code and a hint (HTTP bodies, agent
+runs and their steps, MCP tool errors, the CLI), `webcortex doctor` checks an app before
+it runs, and the app's own MCP endpoint offers `webcortex_status` and `webcortex_explain`
+— so an agent connected with `webcortex mcp-config` can find the request that failed and
+read what to do about its code. See [Diagnostics](diagnostics.md).
+
 ## Why this shape
 
 A framework is easy for a model to write against when:

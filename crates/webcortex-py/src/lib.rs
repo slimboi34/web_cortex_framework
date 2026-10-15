@@ -416,6 +416,25 @@ fn ask_model(
     })
 }
 
+/// The error catalogue as JSON: `[{code, title, category, status, hint}]`.
+/// The Rust table is the single source; `webcortex explain` reads it here.
+#[pyfunction]
+fn error_catalogue() -> String {
+    webcortex_core::errors::catalogue_json().to_string()
+}
+
+/// How every model the app names would resolve right now, from the manifest
+/// and the environment, without calling anything: the runtime's own routing,
+/// so `webcortex doctor` reports exactly the error a run would fail with.
+#[pyfunction]
+fn diagnose_models(manifest_json: &str, models: Vec<String>) -> PyResult<String> {
+    let manifest: Manifest = serde_json::from_str(manifest_json)
+        .map_err(|e| PyValueError::new_err(format!("invalid manifest: {e}")))?;
+    let registry = webcortex_core::ProviderRegistry::from_env(&manifest.models);
+    let out: Vec<serde_json::Value> = models.iter().map(|m| registry.diagnose(m)).collect();
+    Ok(serde_json::json!({"fake": registry.describe()["fake"], "models": out}).to_string())
+}
+
 // `gil_used = false` marks this extension as free-threading compatible, which is
 // what lets CPython 3.13+/3.14 skip re-enabling the GIL when it is imported.
 #[pymodule(gil_used = false)]
@@ -430,6 +449,8 @@ fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(typescript_client, m)?)?;
     m.add_function(wrap_pyfunction!(generate_api_key, m)?)?;
     m.add_function(wrap_pyfunction!(ask_model, m)?)?;
+    m.add_function(wrap_pyfunction!(error_catalogue, m)?)?;
+    m.add_function(wrap_pyfunction!(diagnose_models, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

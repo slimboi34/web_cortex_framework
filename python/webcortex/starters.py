@@ -58,7 +58,19 @@ worker pool.
 | `webcortex tools` | the agent tool manifest |
 | `webcortex dev` | run it (`export WEBCORTEX_API_KEY=$(webcortex keygen)` first) |
 | `webcortex mcp-config` | the MCP client configuration for this app, and the `claude mcp add` line |
+| `webcortex doctor` | is it ready to run: core version, manifest, provider keys (never their values), security, e-stop, budgets, port. `--online` probes the model providers. Exit 1 on a failure. |
+| `webcortex status` | what the **running** app is doing: requests per route, recent errors with codes and request ids, agent runs in flight and recent, spend, devices. Needs an admin key. |
+| `webcortex explain WCnnn` | what an error code means and what to do about it |
 | `pytest` | the tests; `WEBCORTEX_FAKE_PROVIDER=1` runs agents against an offline provider |
+
+## When something fails
+
+Every error carries a stable `code` (`WC201`, `WC402`, …) and a `hint`: in an HTTP error body,
+on an agent run that did not complete (and its failed steps), in an MCP tool error, and in a
+CLI failure. Branch on the code, not the message; read the hint before guessing. Run
+`webcortex doctor` first when the app will not start or a model call fails, and
+`webcortex status` (or the `webcortex_status` MCP tool) to see what the running app did. In a
+handler, raise `HTTPError(status, message, hint="…")` so callers get the same.
 
 ## The rules that matter most
 

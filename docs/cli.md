@@ -229,3 +229,53 @@ Both commands call the control plane of the app at `WEBCORTEX_HOST` and
 
 That last line is worth having: it fails the build when someone changes a route
 without regenerating the client.
+
+## `webcortex doctor`
+
+Checks the app is ready to run without starting it: Python and core versions, the manifest,
+every model the app uses (resolved exactly as the runtime would; keys are checked for presence,
+never printed), the environment variables it names, security posture, the e-stop, watchers,
+budgets, storage paths and the port. Exits 1 if any check fails. See
+[Diagnostics](diagnostics.md#webcortex-doctor).
+
+```console
+$ webcortex doctor
+$ webcortex doctor --online      # also probe each model provider (3 s timeout)
+$ webcortex doctor --json
+```
+
+| Option | Default | |
+|---|---|---|
+| `--online` | off | Probe each provider endpoint |
+| `--json` | off | `{"ok", "summary", "checks": [{id, status, message, hint, code?}]}` |
+| `--url` | the app's host and port | Where a running instance would be |
+| `--key` | `$WEBCORTEX_API_KEY` | Used when talking to a running instance |
+
+## `webcortex status`
+
+What the running app is doing: requests per route by status class and latency, the most recent
+errors with their codes and request ids, agent runs in flight and recent, spend, budgets, the
+e-stop and devices. Reads `GET {control_prefix}/status`, which needs `webcortex:admin` once auth
+is configured.
+
+```console
+$ webcortex status
+$ webcortex status --json
+$ webcortex status --url https://api.example.com --key "$ADMIN_KEY"
+```
+
+## `webcortex explain`
+
+What an error code means and what to do about it. Every error the runtime, the MCP endpoint or
+the CLI reports carries one; see the [error code reference](error-codes.md).
+
+```console
+$ webcortex explain WC301
+$ webcortex explain --list [--json]
+```
+
+## Errors from the CLI
+
+A failing command prints `error[WCnnn]: …`, a `hint:` line and `see: webcortex explain WCnnn`
+to stderr and exits 1. With `--json` (and always for `webcortex check`, whose output is JSON)
+the failure is `{"ok": false, "error": {"code", "message", "hint"}}` on stdout.

@@ -199,7 +199,7 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
                 "request handler panicked; returning 500"
             );
             (
-                WebCortexResponse::error(500, "internal error"),
+                WebCortexResponse::coded(500, "WC001", "internal error"),
                 "panic".to_string(),
             )
         }
@@ -211,13 +211,26 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
         res.headers.push(h);
     }
 
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    let target = if path.starts_with(&app.manifest.server.control_prefix) {
+        crate::status::Target::Control
+    } else {
+        match app.route_id_for(&method, &path) {
+            Some(id) => crate::status::Target::Route(id),
+            None => crate::status::Target::Unmatched,
+        }
+    };
+    let code = if res.status >= 400 { res.error_code() } else { None };
+    app.recorder().record_request(target, &method, &path, res.status, elapsed_us, &request_id, code.as_deref());
+
     tracing::info!(
         request_id = %request_id,
         method = %method,
         path = %path,
         status = res.status,
+        code = code.as_deref().unwrap_or("-"),
         principal = %principal_id,
-        elapsed_us = started.elapsed().as_micros() as u64,
+        elapsed_us,
         "request"
     );
     to_hyper(res)
@@ -250,7 +263,7 @@ async fn route_request(
                 "-".into(),
             );
         }
-        return (WebCortexResponse::error(403, "origin not allowed"), "-".into());
+        return (WebCortexResponse::coded(403, "WC606", "origin not allowed"), "-".into());
     }
 
     // 1b. Cross-origin protection. A browser sends a "simple" cross-site POST
@@ -271,7 +284,7 @@ async fn route_request(
                 origin = origin.as_deref().unwrap_or("-"),
                 "refused a cross-origin browser request; list the origin in cors() to allow it"
             );
-            let mut res = WebCortexResponse::error(403, "cross-origin request refused");
+            let mut res = WebCortexResponse::coded(403, "WC605", "cross-origin request refused");
             finish_cors(app, &mut res, origin.as_deref());
             return (res, "-".into());
         }
@@ -305,7 +318,7 @@ async fn route_request(
                     return (res, "invalid".into());
                 }
             }
-            let mut res = WebCortexResponse::error(e.status(), e.message());
+            let mut res = WebCortexResponse::coded(e.status(), "WC603", e.message());
             res.headers.push((
                 "www-authenticate".into(),
                 "Bearer realm=\"webcortex\"".into(),
@@ -374,7 +387,7 @@ async fn route_request(
         // A handler that hangs must not hold a connection forever.
         match tokio::time::timeout(timeout, dispatch).await {
             Ok(r) => r,
-            Err(_) => WebCortexResponse::error(504, "handler exceeded the request timeout"),
+            Err(_) => WebCortexResponse::coded(504, "WC203", "handler exceeded the request timeout"),
         }
     };
 
@@ -383,7 +396,7 @@ async fn route_request(
 }
 
 fn rate_limited(decision: &middleware::RateDecision) -> WebCortexResponse {
-    let mut res = WebCortexResponse::error(429, "rate limit exceeded");
+    let mut res = WebCortexResponse::coded(429, "WC401", "rate limit exceeded");
     res.headers.push(("retry-after".into(), decision.retry_after_secs.to_string()));
     res.headers.push(("x-ratelimit-limit".into(), decision.limit.to_string()));
     res.headers.push(("x-ratelimit-remaining".into(), "0".into()));
@@ -407,7 +420,7 @@ fn finish_cors(app: &Arc<App>, res: &mut WebCortexResponse, origin: Option<&str>
 }
 
 async fn read_body(req: Request<Incoming>) -> Result<Bytes, WebCortexResponse> {
-    let too_large = || WebCortexResponse::error(413, format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+    let too_large = || WebCortexResponse::coded(413, "WC204", format!("request body exceeds {MAX_BODY_BYTES} bytes"));
     let mut body = req.into_body();
     let mut buf = bytes::BytesMut::new();
     while let Some(frame) = body.frame().await {
@@ -448,8 +461,10 @@ async fn control_plane(
     let admin_required = auth_configured && rest != "/health";
     if admin_required && !principal.has_scope("webcortex:admin") {
         let status = if principal.is_anonymous() { 401 } else { 403 };
-        return WebCortexResponse::error(
+        let code = if status == 401 { "WC604" } else { "WC602" };
+        return WebCortexResponse::coded(
             status,
+            code,
             "the webcortex control plane requires the 'webcortex:admin' scope",
         );
     }
@@ -476,6 +491,15 @@ async fn control_plane(
         ),
 
         ("GET", "/devices") => WebCortexResponse::json(200, &app.devices().describe()),
+
+        // The live view: what is this app doing right now.
+        ("GET", "/status") => WebCortexResponse::json(200, &app.status()),
+
+        // The error catalogue, so a client can explain a code it received.
+        ("GET", "/errors") => WebCortexResponse::json(
+            200,
+            &serde_json::json!({"errors": crate::errors::catalogue_json()}),
+        ),
 
         // The emergency stop. Engaging it needs the same admin scope as every
         // other control route, but nothing else: no body is required, because
@@ -519,12 +543,12 @@ async fn control_plane(
             let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
             let approve = parsed.get("approve").and_then(|v| v.as_bool());
             let Some(approve) = approve else {
-                return WebCortexResponse::error(400, "body must be {\"approve\": true|false, \"note\": \"…\"}");
+                return WebCortexResponse::coded(400, "WC205", "body must be {\"approve\": true|false, \"note\": \"…\"}");
             };
             let note = parsed.get("note").and_then(|v| v.as_str()).unwrap_or("");
             match app.resolve_approval(id, approve, note, principal).await {
                 Ok(result) => crate::app::run_result_response(&result),
-                Err(e) => WebCortexResponse::error(404, e),
+                Err(e) => WebCortexResponse::coded(404, "WC310", e),
             }
         }
 
@@ -577,7 +601,7 @@ async fn control_plane(
             }),
         ),
 
-        ("POST", "/mcp") => mcp::handle(app, body, principal).await,
+        ("POST", "/mcp") => mcp::handle_request(app, body, principal, request_id).await,
 
         ("GET", "/mcp") => WebCortexResponse::json(
             200,
@@ -663,8 +687,9 @@ async fn control_plane(
             )
         }
 
-        _ => WebCortexResponse::error(
+        _ => WebCortexResponse::coded(
             404,
+            "WC212",
             format!("no control endpoint {method} {rest} (request {request_id})"),
         ),
     }

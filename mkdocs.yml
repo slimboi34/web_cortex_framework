@@ -91,11 +91,13 @@ nav:
   - Operating:
       - Security: security.md
       - Deployment: deployment.md
+      - Diagnostics: diagnostics.md
       - AI-native development: ai-development.md
 
   - Reference:
       - Use cases: use-cases.md
       - CLI: cli.md
+      - Error codes: error-codes.md
       - API: api-reference.md
       - FAQ: faq.md
 

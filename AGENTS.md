@@ -49,7 +49,8 @@ handler when there is real logic, not as a default.
 crates/webcortex-core/     Rust runtime: router, server, auth, db, mcp, openapi,
                            templates, typegen, agent loop (agent.rs), providers
                            and model registry (agent/), flows (flow.rs), context
-                           providers (context.rs), spend ledger (ledger.rs)
+                           providers (context.rs), spend ledger (ledger.rs),
+                           error catalogue (errors.rs), live status view (status.rs)
 crates/webcortex-py/       PyO3 bindings. Compiles to webcortex._core. The
                            behaviour ctx lives in behaviour.rs
 python/webcortex/          The Python package users import
@@ -58,6 +59,8 @@ python/webcortex/          The Python package users import
   _bridge.py                 Request / Response / HTTPError / Dispatcher
   schema.py                  type annotation → JSON Schema
   contextpack.py             `webcortex context`: the app described for a model
+  errors.py                  the error catalogue, read from _core (never a second copy)
+  diagnostics.py             `webcortex doctor` and the `webcortex status` client
   cli.py                     the `webcortex` command
   starters.py                templates used by `webcortex new`
 tests/                     pytest. test_pentest.py and test_security.py are
@@ -66,6 +69,7 @@ tests/                     pytest. test_pentest.py and test_security.py are
                            over HTTP against the offline fake provider
 docs/                      MkDocs site (built with --strict; see §10)
 examples/hello/            a complete app exercising every subsystem
+benchmarks/diagnostics/    the failure-reporting benchmark (2.4.0 vs current), RESULTS.md
 scout/                     a local-model reviewer for this repository (§13)
 ```
 
@@ -514,6 +518,8 @@ step_limit | budget_exhausted | awaiting_approval | failed` (`max_tokens`: the
 last response was cut off, and no tool call in it was run). Step kinds: `model, tool_call,
 tool_refused, approval_requested, approval_denied, handoff, compaction`.
 HTTP status: 202 for `awaiting_approval`, 502 for `failed`, 200 otherwise.
+Since 2.5 a run that did not complete also carries `code` and `hint` (§10a),
+and a failed step carries `code` and `hint`.
 
 ### 8a. The shared budget, sessions, approvals
 
@@ -657,7 +663,8 @@ No vision model is embedded (DESIGN §5); pixels are carried to the model.
 Control plane (admin scope once auth is configured): `/health`,
 `/openapi.json`, `/tools`, `/routes`, `/agents`, `/behaviours`, `/flows`,
 `/contexts`, `/models`, `/usage`, `/audit`, `/approvals`,
-`POST /approvals/{id}`, `/security`, `POST /mcp`.
+`POST /approvals/{id}`, `/security`, `/status`, `/errors`, `/devices`,
+`/halt`, `POST /halt|release`, `POST /mcp`. Only `/health` is open.
 
 `check()`, `openapi()`, `typescript_client()` and `security_report()` all
 `from . import _core`. They are the first things to fail when the extension is
@@ -693,7 +700,15 @@ webcortex context  [target] [--json]
 webcortex evolve   REQUEST [target] [-m MODEL] [-o FILE] [--json]
 webcortex halt     [target] [--reason R] [--status] [--key K]
 webcortex release  [target] [--key K]
+webcortex doctor   [target] [--online] [--json] [--url U] [--key K]
+webcortex status   [target] [--json] [--url U] [--key K]
+webcortex explain  [CODE] [--list] [--json]
 ```
+
+`doctor` exits 1 when any check fails; `status` and every other command exit 1
+on a coded failure. A CLI failure prints `error[WCnnn]: …` + `hint:` to stderr,
+or `{"ok": false, "error": {code, message, hint}}` on stdout with `--json` (and
+always for `check`).
 
 `halt` and `release` call the running app's control plane (`POST
 {control_prefix}/halt|release`, admin scope) using `--key` or
@@ -711,6 +726,64 @@ file is loaded before the app is imported, for every command except `new` and
 `webcortex security` exits 0 even when nothing is authenticated, but prints a
 warning to **stderr**. If you are scripting a gate, check
 `security_report()["auth_configured"]`, not the exit code.
+
+---
+
+## 10a. Diagnostics (2.5): error codes, doctor, the live view
+
+**The catalogue** is `crates/webcortex-core/src/errors.rs` (`CATALOGUE`, one
+`ErrorInfo {code, title, category, status, hint}` per code). It is the single
+source: Python reads it through `_core.error_catalogue()` (`webcortex/errors.py`),
+and `docs/error-codes.md` lists it (regenerate the page from
+`webcortex explain --list --json` when you add a code). Ranges: `WC0xx`
+internal, `WC1xx` config, `WC2xx` HTTP, `WC3xx` agents/providers, `WC4xx`
+limits, `WC5xx` devices/actuators, `WC6xx` auth. Tests on both sides scan the
+sources for `"WCnnn"` literals and fail on one that is not catalogued, and the
+Python test also fails if the docs page lacks one.
+
+- **A code, once released, keeps its meaning.** Add codes; never renumber or
+  repurpose one.
+- **Every new error site uses `WebCortexResponse::coded(status, "WCnnn", msg)`**
+  (or `coded_with_hint` for a hint specific to the occurrence).
+  `WebCortexResponse::error(status, msg)` still works and picks the generic
+  code for the status (`errors::code_for_status`); prefer a specific one.
+  Bodies are `{"error": {status, message, code, hint}}` — `status` and
+  `message` are the 2.4 fields and must stay — plus the `x-webcortex-error`
+  header, which is what `error_code()` reads.
+- Python: `HTTPError(status, message, *, code=None, hint=None)`; unhandled
+  handler exceptions are `WC002`, behaviours `WC003`.
+- Agent runs: `RunResult.code`/`hint` for every status except `completed` and
+  `awaiting_approval` (`outcome_code` in agent.rs); `Step.code`/`hint` on
+  failed steps. Provider errors are strings, classified by
+  `errors::classify_run_error` — if you reword a provider error, its test in
+  errors.rs tells you.
+- MCP tool errors: `structuredContent.error {code, message, hint}`; JSON-RPC
+  errors: `error.data {code, hint}`.
+
+**The live view** is `status.rs`. `Recorder` (on `App`, `app.recorder()`) is fed
+by `server::handle` once per request (`record_request`: lock-free atomics in a
+slot per route id, plus a mutex-guarded ring of the last 100 failures), by the
+agent runtime (`run_started` / `run_progress` / `run_finished`, failed and
+refused tool calls via `record_failure("tool", …)`), by MCP tool errors and by
+watchers. `status::snapshot(app)` (`app.status()`) builds the document for
+`GET {prefix}/status`, the `webcortex_status` MCP tool and the
+`webcortex://status` resource. **Never put a body, header, query string or
+credential into the recorder**; failures record the route *pattern*.
+Throughput with and without it is in `benchmarks/diagnostics/RESULTS.md`; keep
+the request path free of locks and allocation on success.
+
+**MCP built-ins**: `webcortex_status` and `webcortex_explain` tools and the
+`webcortex://status` / `webcortex://errors` resources, offered only when the
+caller may read the control plane (`mcp::may_observe`). An app tool with the
+same name shadows the built-in.
+
+**Doctor** (`diagnostics.py`) checks presence of every env var the app names,
+never its value; model resolution goes through `_core.diagnose_models`, i.e.
+the runtime's own `ProviderRegistry::diagnose`, so it reports the exact error a
+run would fail with.
+
+**Fake provider:** `fail:<message>` as the input makes the call fail with that
+message (e.g. `fail:anthropic 529: overloaded` → `WC304`).
 
 ---
 
@@ -880,6 +953,7 @@ reads.
 (`agent/provider.rs`), which answers from a tiny command language in the last
 user message: `tool:<name> <json>`, `handoff:<agent>`, `json:<object>` (for a
 forced tool), `context?` (echoes the system suffix), anything else is echoed.
+`fail:<message>` fails the call with that message, as a provider error.
 After tool results it summarises them and stops. Input tokens scale with the
 conversation, so compaction is observable. `tests/test_orchestration.py` is
 built on it; extend the DSL rather than mocking around it.

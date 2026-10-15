@@ -250,12 +250,21 @@ class Response:
 
 
 class HTTPError(Exception):
-    """Raise for an expected failure. Becomes a clean JSON error response."""
+    """Raise for an expected failure. Becomes a clean JSON error response.
 
-    def __init__(self, status: int, message: str) -> None:
+    The body is ``{"error": {"status", "message", "code", "hint"}}``. ``code``
+    defaults to the catalogued code for ``status`` (``webcortex explain
+    --list``); pass your own ``code`` and ``hint`` to say more. A hint is
+    what the caller should do next, written for a person or a model.
+    """
+
+    def __init__(self, status: int, message: str, *, code: str | None = None,
+                 hint: str | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        self.code = code
+        self.hint = hint
 
 
 def _encode(value: Any) -> tuple[int, bytes, str, list]:
@@ -327,7 +336,11 @@ def _deliver_exception(exc: BaseException, completer: Any) -> None:
     if isinstance(exc, HTTPError):
         # Deliberately raised by the application: the message is intended for
         # the caller, so it is safe to pass through.
-        _deliver(Response({"error": {"status": exc.status, "message": exc.message}}, exc.status), completer)
+        from .errors import error_body
+
+        body = error_body(exc.status, exc.message, exc.code, exc.hint)
+        _deliver(Response(body, exc.status, headers={"x-webcortex-error": body["error"]["code"]}),
+                 completer)
         return
 
     detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))

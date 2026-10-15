@@ -1,0 +1,211 @@
+{
+  "version": "2.5.0",
+  "summary": {
+    "failed": "18/18",
+    "code": "18/18",
+    "hint": "18/18",
+    "json": "18/18",
+    "status_view": "16/16",
+    "fix_in_message": "11/18"
+  },
+  "scenarios": [
+    {
+      "scenario": "missing provider key",
+      "failed": true,
+      "http_status": 502,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"agent\":\"keyless\",\"code\":\"WC301\",\"hint\":\"The model's provider needs an API key that is not set. Export ANTHROPIC_API_KEY or OPENAI_API_KEY (or the provider's api_key_env), use a local ollama/<model>, or set WEBCORTEX_FAKE_PROVIDER=1 for tests. `webcortex doctor` checks every model.\",\"output\":\"\",\"path\":[\"keyless\"],\"run_id\":\"db60df09-0444-439a-93fe-8fce75e38e3b\",\"status\":\"failed\",\"steps\":[{\"code\":\"WC301\",\"duration_ms\":0,\"error\":\"model \\\"claude-opus-5\\\" needs ANTHROPIC_API_KEY, which is not set. For a local model use a prefixed name such as ollama/<model>\",\"hint\":\"The model's provider needs an A"
+    },
+    {
+      "scenario": "provider unreachable",
+      "failed": true,
+      "http_status": 502,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": false,
+      "output": "{\"agent\":\"deadagent\",\"code\":\"WC303\",\"hint\":\"The model provider could not be reached. Check the base URL and network; for Ollama run `ollama serve` (OLLAMA_HOST). `webcortex doctor --online` probes each provider.\",\"output\":\"\",\"path\":[\"deadagent\"],\"run_id\":\"7072b29a-7025-44cb-82d5-d32b57863d4e\",\"status\":\"failed\",\"steps\":[{\"code\":\"WC303\",\"duration_ms\":0,\"error\":\"openai-compatible request failed: error sending request for url (http://127.0.0.1:9/v1/chat/completions)\",\"hint\":\"The model provider could not be reached. Check the base URL and network; for Ollama run `ollama serve` (OLLAMA_HOST). `webco"
+    },
+    {
+      "scenario": "bad route",
+      "failed": true,
+      "http_status": 404,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": false,
+      "output": "{\"error\":{\"code\":\"WC201\",\"hint\":\"No route matches this path. `webcortex check` lists every route, and GET /_webcortex/routes lists them on a running app.\",\"message\":\"no route for GET /no/such/route\",\"status\":404}}"
+    },
+    {
+      "scenario": "wrong method",
+      "failed": true,
+      "http_status": 405,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"code\":\"WC202\",\"hint\":\"The path exists but not for this method; the `allow` header lists the methods it takes.\",\"message\":\"DELETE not allowed on /ping; try: GET\",\"status\":405}}"
+    },
+    {
+      "scenario": "budget exceeded",
+      "failed": true,
+      "http_status": 200,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"agent\":\"tight\",\"code\":\"WC402\",\"hint\":\"The run hit its token_budget (its own, or the request tree's shared one). Raise token_budget, use a cheaper model alias, or bound context with tool_result_limit / context_window.\",\"output\":\"\",\"path\":[\"tight\"],\"run_id\":\"38f03238-ea3a-4514-a1ed-7e9cfca2f7be\",\"status\":\"budget_exhausted\",\"steps\":[{\"duration_ms\":0,\"index\":0,\"kind\":\"model\",\"result\":{\"input_tokens\":4,\"model\":\"claude-opus-5\",\"output_tokens\":10}},{\"arguments\":{},\"duration_ms\":0,\"index\":1,\"kind\":\"tool_call\",\"result\":{\"pong\":true},\"tool\":\"ping\"}],\"usage\":{\"cache_read_tokens\":0,\"cache_write_tokens\":"
+    },
+    {
+      "scenario": "actuator called while halted",
+      "failed": true,
+      "http_status": 423,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"code\":\"WC502\",\"hint\":\"The emergency stop is engaged, so nothing that moves hardware runs. An operator releases it with `webcortex release` or POST /_webcortex/release (admin scope).\",\"message\":\"actuators are halted (started halted; release to enable actuators); nothing that moves hardware will run until an operator releases the stop at /_webcortex/release\",\"status\":423}}"
+    },
+    {
+      "scenario": "malformed agent request",
+      "failed": true,
+      "http_status": 400,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"code\":\"WC306\",\"hint\":\"An agent route takes {\\\"input\\\": str, \\\"session_id\\\"?: str, \\\"reset\\\"?: bool, \\\"images\\\"?: [...]}; `input` is required and must be a string.\",\"message\":\"agent invocation requires an 'input' string\",\"status\":400}}"
+    },
+    {
+      "scenario": "tool argument missing (HTTP)",
+      "failed": true,
+      "http_status": 422,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"error\": {\"status\": 422, \"message\": \"missing required parameter 'title'\", \"code\": \"WC206\", \"hint\": \"A required parameter was absent or could not be read. Send every required field named in the route's input schema (path, query string or JSON body).\"}}"
+    },
+    {
+      "scenario": "tool argument missing (inside an agent run)",
+      "failed": true,
+      "http_status": 200,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"agent\":\"desk\",\"output\":\"desk says: \\\\\\\": \\\\\\\"A required parameter was absent or could not be read. Send every required field named in the route's input schema (path, query string or JSON body).\\\\\\\"}}\\\"} (len=311)\",\"path\":[\"desk\"],\"run_id\":\"35edb328-daf9-4a2e-a41b-236b122a5f68\",\"status\":\"completed\",\"steps\":[{\"duration_ms\":0,\"index\":0,\"kind\":\"model\",\"result\":{\"input_tokens\":5,\"model\":\"claude-opus-5\",\"output_tokens\":10}},{\"arguments\":{},\"code\":\"WC206\",\"duration_ms\":0,\"error\":\"tool add_note failed with 422: {\\\"error\\\": {\\\"status\\\": 422, \\\"message\\\": \\\"missing required parameter 'title'\\\", \\\"code"
+    },
+    {
+      "scenario": "unauthenticated admin call",
+      "failed": true,
+      "http_status": 401,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"code\":\"WC604\",\"hint\":\"The /_webcortex control plane needs the 'webcortex:admin' scope once any auth is configured. Use an admin key: app.api_key(env, id=..., scopes=['webcortex:admin']).\",\"message\":\"the webcortex control plane requires the 'webcortex:admin' scope\",\"status\":401}}"
+    },
+    {
+      "scenario": "authenticated but missing scope",
+      "failed": true,
+      "http_status": 403,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"code\":\"WC602\",\"hint\":\"This caller lacks write. Use a key registered with app.api_key(..., scopes=[\\\"write\\\"]).\",\"message\":\"missing required scope(s): write\",\"status\":403}}"
+    },
+    {
+      "scenario": "cross-origin browser POST",
+      "failed": true,
+      "http_status": 403,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": false,
+      "output": "{\"error\":{\"code\":\"WC605\",\"hint\":\"A browser on another origin sent a state-changing request or a WebSocket upgrade. List that origin in app.cors(...) if it should be allowed.\",\"message\":\"cross-origin request refused\",\"status\":403}}"
+    },
+    {
+      "scenario": "unknown device",
+      "failed": true,
+      "http_status": 404,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": false,
+      "output": "{\"error\":{\"code\":\"WC201\",\"hint\":\"No route matches this path. `webcortex check` lists every route, and GET /_webcortex/routes lists them on a running app.\",\"message\":\"no route for GET /devices/ghost/latest\",\"status\":404}}"
+    },
+    {
+      "scenario": "camera has sent no frame",
+      "failed": true,
+      "http_status": 404,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": false,
+      "output": "{\"error\":{\"code\":\"WC503\",\"hint\":\"The device has not sent a frame. Open /devices/<name>/connect on the camera, or push frames to its ingest route.\",\"message\":\"device \\\"cam\\\" has not sent a frame yet\",\"status\":404}}"
+    },
+    {
+      "scenario": "Python handler raised",
+      "failed": true,
+      "http_status": 500,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"code\":\"WC002\",\"hint\":\"An unhandled exception escaped a Python handler; its traceback is in the server log. Raise webcortex.HTTPError(status, message) for failures the caller should see.\",\"message\":\"internal error\",\"status\":500}}"
+    },
+    {
+      "scenario": "gated tool called over MCP",
+      "failed": true,
+      "http_status": 200,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": true,
+      "fix_in_message": true,
+      "output": "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"text\":\"tool \\\"move\\\" requires human approval and cannot be invoked directly over MCP\\n\\n[WC309] This tool is gated with approval=\\\"required\\\". A human decides with POST /_webcortex/approvals/{id}; it cannot be called directly over MCP.\",\"type\":\"text\"}],\"isError\":true,\"structuredContent\":{\"error\":{\"code\":\"WC309\",\"hint\":\"This tool is gated with approval=\\\"required\\\". A human decides with POST /_webcortex/approvals/{id}; it cannot be called directly over MCP.\",\"message\":\"tool \\\"move\\\" requires human approval and cannot be invoked directly over MCP\"}}"
+    },
+    {
+      "scenario": "bad manifest (agent names a missing tool)",
+      "failed": true,
+      "exit_code": 1,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": null,
+      "fix_in_message": false,
+      "output": "{\n  \"ok\": false,\n  \"error\": {\n    \"code\": \"WC101\",\n    \"message\": \"invalid application: agent \\\"helper\\\" references tool \\\"pnig\\\", which is not an exposed route. Did you mean \\\"ping\\\"?\",\n    \"hint\": \"The app's declarations do not validate. The message names the declaration; fix it in api.py and run `webcortex check`.\"\n  }\n}\n"
+    },
+    {
+      "scenario": "app module fails to import",
+      "failed": true,
+      "exit_code": 1,
+      "code": true,
+      "hint": true,
+      "json": true,
+      "status_view": null,
+      "fix_in_message": false,
+      "output": "{\n  \"ok\": false,\n  \"error\": {\n    \"code\": \"WC102\",\n    \"message\": \"loading <repo>/benchmarks/diagnostics/import_error_app.py failed: ModuleNotFoundError: No module named 'a_dependency_that_is_not_installed' (at <repo>/benchmarks/diagnostics/import_error_app.py:2)\",\n    \"hint\": \"Importing the app module raised, or it does not define `app`. Run `python api.py` to see the traceback, or pass module:attr.\"\n  }\n}\n"
+    }
+  ]
+}

@@ -1,0 +1,211 @@
+{
+  "version": "2.4.0",
+  "summary": {
+    "failed": "17/18",
+    "code": "0/18",
+    "hint": "0/18",
+    "json": "15/18",
+    "status_view": "0/16",
+    "fix_in_message": "8/18"
+  },
+  "scenarios": [
+    {
+      "scenario": "missing provider key",
+      "failed": true,
+      "http_status": 502,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": true,
+      "output": "{\"agent\":\"keyless\",\"output\":\"\",\"path\":[\"keyless\"],\"run_id\":\"4169376b-903b-4a47-88fa-15dbeb4c3db8\",\"status\":\"failed\",\"steps\":[{\"duration_ms\":0,\"error\":\"model \\\"claude-opus-5\\\" needs ANTHROPIC_API_KEY, which is not set. For a local model use a prefixed name such as ollama/<model>\",\"index\":0,\"kind\":\"model\"}],\"usage\":{\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"compactions\":0,\"handoffs\":0,\"images_dropped\":0,\"input_tokens\":0,\"output_tokens\":0,\"steps\":0,\"tool_calls\":0,\"tree_tokens\":0}}"
+    },
+    {
+      "scenario": "provider unreachable",
+      "failed": true,
+      "http_status": 502,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"agent\":\"deadagent\",\"output\":\"\",\"path\":[\"deadagent\"],\"run_id\":\"4aef466e-4717-4f50-aa2c-daf8fed7f553\",\"status\":\"failed\",\"steps\":[{\"duration_ms\":1,\"error\":\"openai-compatible request failed: error sending request for url (http://127.0.0.1:9/v1/chat/completions)\",\"index\":0,\"kind\":\"model\"}],\"usage\":{\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"compactions\":0,\"handoffs\":0,\"images_dropped\":0,\"input_tokens\":0,\"output_tokens\":0,\"steps\":0,\"tool_calls\":0,\"tree_tokens\":0}}"
+    },
+    {
+      "scenario": "bad route",
+      "failed": true,
+      "http_status": 404,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"error\":{\"message\":\"no route for GET /no/such/route\",\"status\":404}}"
+    },
+    {
+      "scenario": "wrong method",
+      "failed": true,
+      "http_status": 405,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"message\":\"DELETE not allowed on /ping; try: GET\",\"status\":405}}"
+    },
+    {
+      "scenario": "budget exceeded",
+      "failed": true,
+      "http_status": 200,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"agent\":\"tight\",\"output\":\"\",\"path\":[\"tight\"],\"run_id\":\"23804d08-ce89-4de6-97f6-ce56f3822b3c\",\"status\":\"budget_exhausted\",\"steps\":[{\"duration_ms\":0,\"index\":0,\"kind\":\"model\",\"result\":{\"input_tokens\":4,\"model\":\"claude-opus-5\",\"output_tokens\":10}},{\"arguments\":{},\"duration_ms\":0,\"index\":1,\"kind\":\"tool_call\",\"result\":{\"pong\":true},\"tool\":\"ping\"}],\"usage\":{\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"compactions\":0,\"handoffs\":0,\"images_dropped\":0,\"input_tokens\":4,\"output_tokens\":10,\"steps\":1,\"tool_calls\":1,\"tree_tokens\":14}}"
+    },
+    {
+      "scenario": "actuator called while halted",
+      "failed": true,
+      "http_status": 423,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"message\":\"actuators are halted (started halted; release to enable actuators); nothing that moves hardware will run until an operator releases the stop at /_webcortex/release\",\"status\":423}}"
+    },
+    {
+      "scenario": "malformed agent request",
+      "failed": true,
+      "http_status": 400,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"message\":\"agent invocation requires an 'input' string\",\"status\":400}}"
+    },
+    {
+      "scenario": "tool argument missing (HTTP)",
+      "failed": true,
+      "http_status": 422,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"error\": {\"status\": 422, \"message\": \"missing required parameter 'title'\"}}"
+    },
+    {
+      "scenario": "tool argument missing (inside an agent run)",
+      "failed": true,
+      "http_status": 200,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"agent\":\"desk\",\"output\":\"desk says: {\\\"error\\\":\\\"tool add_note failed with 422: {\\\\\\\"error\\\\\\\": {\\\\\\\"status\\\\\\\": 422, \\\\\\\"message\\\\\\\": \\\\\\\"missing required parameter 'title'\\\\\\\"}}\\\"} (len=126)\",\"path\":[\"desk\"],\"run_id\":\"19443ecc-6ae7-42a1-93f3-ac61cba443d2\",\"status\":\"completed\",\"steps\":[{\"duration_ms\":0,\"index\":0,\"kind\":\"model\",\"result\":{\"input_tokens\":5,\"model\":\"claude-opus-5\",\"output_tokens\":10}},{\"arguments\":{},\"duration_ms\":0,\"error\":\"tool add_note failed with 422: {\\\"error\\\": {\\\"status\\\": 422, \\\"message\\\": \\\"missing required parameter 'title'\\\"}}\",\"index\":1,\"kind\":\"tool_call\",\"tool\":\"add"
+    },
+    {
+      "scenario": "unauthenticated admin call",
+      "failed": true,
+      "http_status": 401,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": true,
+      "output": "{\"error\":{\"message\":\"the webcortex control plane requires the 'webcortex:admin' scope\",\"status\":401}}"
+    },
+    {
+      "scenario": "authenticated but missing scope",
+      "failed": true,
+      "http_status": 403,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"error\":{\"message\":\"missing required scope(s): write\",\"status\":403}}"
+    },
+    {
+      "scenario": "cross-origin browser POST",
+      "failed": false,
+      "http_status": 200,
+      "code": false,
+      "hint": false,
+      "json": false,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"title\": \"x\"}"
+    },
+    {
+      "scenario": "unknown device",
+      "failed": true,
+      "http_status": 404,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"error\":{\"message\":\"no route for GET /devices/ghost/latest\",\"status\":404}}"
+    },
+    {
+      "scenario": "camera has sent no frame",
+      "failed": true,
+      "http_status": 404,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"error\":{\"message\":\"device \\\"cam\\\" has not sent a frame yet\",\"status\":404}}"
+    },
+    {
+      "scenario": "Python handler raised",
+      "failed": true,
+      "http_status": 500,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": false,
+      "output": "{\"error\":{\"message\":\"internal error\",\"status\":500}}"
+    },
+    {
+      "scenario": "gated tool called over MCP",
+      "failed": true,
+      "http_status": 200,
+      "code": false,
+      "hint": false,
+      "json": true,
+      "status_view": false,
+      "fix_in_message": true,
+      "output": "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"text\":\"tool \\\"move\\\" requires human approval and cannot be invoked directly over MCP\",\"type\":\"text\"}],\"isError\":true}}"
+    },
+    {
+      "scenario": "bad manifest (agent names a missing tool)",
+      "failed": true,
+      "exit_code": 1,
+      "code": false,
+      "hint": false,
+      "json": false,
+      "status_view": null,
+      "fix_in_message": true,
+      "output": "…<venv-2.4.0>/lib/python3.13/site-packages/webcortex/cli.py\", line 372, in main\n    report = app.check()\n  File \"<venv-2.4.0>/lib/python3.13/site-packages/webcortex/app.py\", line 1604, in check\n    return json.loads(_core.inspect_manifest(self.manifest_json()))\n                      ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^\nValueError: invalid application: agent \"helper\" references tool \"pnig\", which is not an exposed route. Did you mean \"ping\"?\n"
+    },
+    {
+      "scenario": "app module fails to import",
+      "failed": true,
+      "exit_code": 1,
+      "code": false,
+      "hint": false,
+      "json": false,
+      "status_view": null,
+      "fix_in_message": true,
+      "output": "ad/venv240/lib/python3.13/site-packages/webcortex/cli.py\", line 45, in _load_app\n    spec.loader.exec_module(module)\n    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^\n  File \"<frozen importlib._bootstrap_external>\", line 1023, in exec_module\n  File \"<frozen importlib._bootstrap>\", line 488, in _call_with_frames_removed\n  File \"<repo>/benchmarks/diagnostics/import_error_app.py\", line 2, in <module>\n    import a_dependency_that_is_not_installed  # noqa: F401\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nModuleNotFoundError: No module named 'a_dependency_that_is_not_installed'\n"
+    }
+  ]
+}

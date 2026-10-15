@@ -311,6 +311,22 @@ Ordered by what unblocks the most.
    detection that has to run on every frame belongs in a sidecar that pushes
    its results as telemetry.
 
+**v2.5 — shipped: diagnostics**
+✅ A stable error code and a hint on every failure that reaches a user — HTTP
+   bodies (added beside the 2.4 fields), agent runs and their steps, MCP tool
+   errors, the CLI — from one table in the Rust core that Python reads, with
+   tests that fail on a code used anywhere but not catalogued.
+✅ `GET /_webcortex/status` and the `webcortex_status` MCP tool: per-route
+   counters and latency, recent failures by code and request id, runs in flight
+   and recent with tokens and cost, budgets, e-stop, devices. Lock-free on the
+   success path; the measured cost is in `benchmarks/diagnostics/RESULTS.md`.
+✅ `webcortex doctor`, which resolves models through the runtime's own registry
+   so it reports the error a run would fail with.
+   The design rule behind it: a framework meant to be extended by coding agents
+   has to be *debuggable* by them, which means failures they can branch on
+   (codes), recover from (hints) and look up afterwards (the live view) — not
+   prose and a log file.
+
 **Later, if warranted**
 12. Durable agent runs — only with a real design for exactly-once tool
     execution. Sessions and approvals stay in memory until then, and say so.

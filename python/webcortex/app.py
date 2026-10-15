@@ -1727,6 +1727,27 @@ class WebCortex:
                 )
         return out
 
+    def doctor(self, *, online: bool = False, url: str | None = None, key: str | None = None) -> dict:
+        """Check this app is ready to run: `webcortex doctor`.
+
+        Returns ``{"ok", "summary", "checks": [{id, status, message, hint, code?}]}``
+        with ``status`` in ``ok | warn | fail``. Key values are never read
+        into the report, only whether they are set. ``online=True`` also
+        probes each model provider's endpoint with a short timeout.
+        """
+        from .diagnostics import doctor
+
+        return doctor(self, online=online, url=url, key=key)
+
+    def status(self, *, url: str | None = None, key: str | None = None) -> dict:
+        """The running app's live view, from ``GET {control_prefix}/status``.
+
+        Uses ``key`` or ``$WEBCORTEX_API_KEY`` (admin scope once auth is on).
+        """
+        from .diagnostics import fetch_status
+
+        return fetch_status(self, url=url, key=key)
+
     def run(self) -> None:
         """Boot the runtime and serve. Blocks."""
         from . import _core

@@ -196,6 +196,32 @@ impl ProviderRegistry {
             })
     }
 
+    /// What `webcortex doctor` reports for one model name: the alias chain
+    /// resolved, the provider it routes to and its endpoint, or why it cannot
+    /// be used — the exact message, and catalogued code, a run would fail with.
+    pub fn diagnose(&self, name: &str) -> serde_json::Value {
+        let concrete = self.resolve_alias(name);
+        match self.route(&concrete) {
+            Ok((provider, wire)) => serde_json::json!({
+                "model": name,
+                "resolved": concrete,
+                "ok": true,
+                "provider": provider.name(),
+                "wire_name": wire,
+                "base_url": provider.base_url(),
+                "priced": self.price_for(&concrete).is_some(),
+            }),
+            Err(e) => serde_json::json!({
+                "model": name,
+                "resolved": concrete,
+                "ok": false,
+                "error": e,
+                "code": crate::errors::classify_run_error(&e),
+                "priced": self.price_for(&concrete).is_some(),
+            }),
+        }
+    }
+
     pub fn price_for(&self, model: &str) -> Option<Price> {
         // Try the exact name, then without a provider prefix.
         self.pricing

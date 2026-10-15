@@ -12,6 +12,7 @@ pub mod auth;
 pub mod bridge;
 pub mod context;
 pub mod devices;
+pub mod errors;
 pub mod files;
 pub mod flow;
 pub mod http;
@@ -22,6 +23,7 @@ pub mod middleware;
 pub mod openapi;
 pub mod router;
 pub mod server;
+pub mod status;
 pub mod templates;
 pub mod typegen;
 pub mod ws;
@@ -152,8 +154,10 @@ mod tests {
         let req = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
         let res = mcp::handle(&app, req, &Principal::anonymous()).await;
         let tools = res.json_value()["result"]["tools"].clone();
-        assert_eq!(tools.as_array().expect("tools array").len(), 1);
-        assert_eq!(tools[0]["name"], "a");
+        let names: Vec<&str> = tools.as_array().expect("tools array").iter()
+            .filter_map(|t| t["name"].as_str()).collect();
+        // The app's exposed route, then the two built-in observability tools.
+        assert_eq!(names, vec!["a", mcp::STATUS_TOOL, mcp::EXPLAIN_TOOL]);
     }
 
     #[tokio::test]

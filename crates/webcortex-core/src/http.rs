@@ -132,12 +132,44 @@ impl WebCortexResponse {
         }
     }
 
+    /// An error body: `{"error": {"status", "message", "code", "hint"}}`.
+    ///
+    /// The code is the generic one for `status` ([`crate::errors::code_for_status`]);
+    /// prefer [`Self::coded`] wherever a more specific code applies.
     pub fn error(status: u16, message: impl Into<String>) -> Self {
+        Self::coded(status, crate::errors::code_for_status(status), message)
+    }
+
+    /// An error body carrying a catalogued code and that code's hint.
+    pub fn coded(status: u16, code: &str, message: impl Into<String>) -> Self {
+        Self::coded_with_hint(status, code, message, crate::errors::hint(code))
+    }
+
+    /// As [`Self::coded`], with a hint specific to this occurrence.
+    pub fn coded_with_hint(status: u16, code: &str, message: impl Into<String>, hint: &str) -> Self {
         let message = message.into();
-        Self::json(
+        let mut res = Self::json(
             status,
-            &serde_json::json!({ "error": { "status": status, "message": message } }),
-        )
+            &serde_json::json!({
+                "error": { "status": status, "message": message, "code": code, "hint": hint }
+            }),
+        );
+        res.headers.push(("x-webcortex-error".into(), code.to_string()));
+        res
+    }
+
+    /// The `WCnnn` code of an error response, from the header [`Self::coded`]
+    /// sets, or from a JSON body a Python handler wrote.
+    pub fn error_code(&self) -> Option<String> {
+        if let Some((_, v)) = self.headers.iter().find(|(k, _)| k == "x-webcortex-error") {
+            return Some(v.clone());
+        }
+        if self.status < 400 || self.body.len() > 64 * 1024 {
+            return None;
+        }
+        serde_json::from_slice::<serde_json::Value>(&self.body)
+            .ok()
+            .and_then(|v| v.pointer("/error/code").and_then(|c| c.as_str()).map(str::to_string))
     }
 
     pub fn text(status: u16, body: impl Into<String>) -> Self {

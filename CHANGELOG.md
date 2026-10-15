@@ -3,7 +3,83 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
-## [2.4.1] — 2026-10-07
+## [2.5.0] — 2026-10-15
+
+The diagnostics release: every failure says what it is and what to do about it, a
+running app can be asked what it is doing, and `webcortex doctor` checks an app before
+it runs. Built so a coding agent can debug a WebCortex app the way a person would.
+
+**2.4.1 never reached PyPI** — its release run stopped at the `cargo audit` gate on
+advisories published after it was tagged — so **2.5.0 ships everything in 2.4.1**
+(below), including its one behaviour change: cross-origin browser requests that change
+state are refused unless the origin is listed in `app.cors(...)`.
+
+Measured, not claimed: on 18 scripted broken scenarios, failures with a stable code went
+from 0/18 (2.4.0) to 18/18, with an explicit hint from 0/18 to 18/18, machine-readable
+from 15/18 to 18/18, and visible in the live status view from 0/16 to 16/16. Rust-route
+throughput is unchanged within noise; a flood of 404s is about 3% slower.
+See [benchmarks/diagnostics/RESULTS.md](benchmarks/diagnostics/RESULTS.md).
+
+### Added
+
+- **Error catalogue with stable codes.** One table in the Rust core
+  (`errors.rs`, `WC0xx`–`WC6xx`), read by Python through `_core.error_catalogue()`.
+  Every HTTP error body gains `code` and `hint` beside the existing `status` and
+  `message` (backward-compatible), and the `x-webcortex-error` response header. Agent
+  runs that did not complete carry `code`/`hint` (`WC3xx` for a failure, `WC402` budget,
+  `WC404` step limit, `WC312` cut off at max_tokens); failed steps carry `code`/`hint`
+  (a tool that answered 422 shows `WC206`). MCP tool errors carry
+  `structuredContent.error {code, message, hint}`; JSON-RPC errors carry
+  `error.data {code, hint}`; watcher insights carry `code`. Reference:
+  `docs/error-codes.md`.
+- `HTTPError(status, message, *, code=None, hint=None)`.
+- **`webcortex explain CODE`**, `webcortex explain --list [--json]`, and
+  `GET /_webcortex/errors`.
+- **`GET /_webcortex/status`** (admin scope, like the rest of the control plane):
+  uptime and versions; requests per route pattern by status class with mean/p50/p95/p99/
+  max latency; the last 100 failures (code, route, request id, time — no bodies or
+  credentials) from HTTP, MCP, failed tool calls inside runs, agent runs and watchers;
+  agent runs in flight and the last 50 (steps, tokens, cost from declared prices,
+  outcome, code); budgets per agent/behaviour/flow; e-stop state; per-device fps, frames
+  in/dropped, last-frame age, subscribers; watcher runs. Counting is lock-free per route.
+  `app.status()`, and **`webcortex status [--url] [--json]`**.
+- **MCP built-ins** on every app's endpoint, for callers who may read the control plane:
+  tools `webcortex_status` (optionally one `section`) and `webcortex_explain`, and
+  resources `webcortex://status` and `webcortex://errors`. A coding agent connected with
+  `webcortex mcp-config` can ask what the app is doing. An app tool of the same name wins.
+- **`webcortex doctor [--online] [--json]`**, `app.doctor()`, `webcortex.doctor(app)`:
+  Python and core versions match, the app loads, the manifest validates, every model the
+  app uses resolves (the runtime's own routing, via `_core.diagnose_models`; keys checked
+  for presence, never printed), named env vars (API keys, JWT secret, upstream and camera
+  bearer tokens, provider keys), security posture and actuator warnings, e-stop at boot,
+  watchers, budgets, SQLite and template paths, the port (and a running instance's live
+  e-stop). `--online` probes each provider endpoint with a 3 s timeout. Exit 1 on a failure.
+- CLI failures are coded: `error[WCnnn]: …` and `hint:` on stderr, or
+  `{"ok": false, "error": {…}}` on stdout with `--json` and always for `webcortex check`.
+  An app that does not import is `WC102`; an invalid declaration `WC101`.
+- FakeProvider: `fail:<message>` fails the call with that message, so failure paths are
+  testable offline.
+- `ModelProvider::base_url()`, `ProviderRegistry::diagnose()`, `DeviceHub::stats()`,
+  `Device::recent_fps()`, `App::status()`, `App::recorder()`.
+- `webcortex context`, the starters' `AGENTS.md` and the repository's `AGENTS.md` teach
+  doctor, status, explain and the codes. Docs: `docs/diagnostics.md`,
+  `docs/error-codes.md`.
+- `benchmarks/diagnostics/`: the scripted failure suite and its scorer.
+
+### Security (dependencies)
+
+- `quinn-proto` 0.11.16 → 0.11.19 (RUSTSEC-2026-0338, RUSTSEC-2026-0340) and `rustls`
+  0.23.45 → 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349): the nine advisories that
+  stopped the 2.4.1 release. `rustls` is compiled in through `reqwest`'s client
+  (providers, upstreams, cameras, webhooks — the server does not terminate TLS);
+  `quinn-proto` is in `Cargo.lock` but not built for any target (`cargo tree -i
+  quinn-proto --target all` is empty), and is updated so the audit gate passes.
+  `cargo audit` is clean, and `pip-audit` of the docs toolchain is clean.
+- Also from the open Dependabot group: tokio 1.53.3, hyper 1.12.0, hyper-util 0.1.21,
+  http-body-util 0.1.5, jsonwebtoken 11.1.0, uuid 1.26.1, pyo3 0.29.3. (futures stays at
+  0.3.33: the resolver keeps 0.3.34 back under the declared `rust-version`.)
+
+## [2.4.1] — 2026-10-07 (tagged, never published; shipped in 2.5.0)
 
 A security release: a second adversarial pass over the 2.x surface. Details, and what
 was checked and held, are in [SECURITY.md](SECURITY.md). No public API was

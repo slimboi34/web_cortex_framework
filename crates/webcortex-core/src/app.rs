@@ -58,6 +58,8 @@ pub struct App {
     halt: Mutex<Option<serde_json::Value>>,
     /// Cameras and sensors: frames, telemetry, insights and their subscribers.
     devices: crate::devices::DeviceHub,
+    /// Request counters, recent failures and agent runs: the live view.
+    recorder: crate::status::Recorder,
 }
 
 impl App {
@@ -166,6 +168,7 @@ impl App {
             .map_err(|e| format!("http client build failed: {e}"))?;
         let manifest_start_halted = manifest.server.start_halted;
         let devices = crate::devices::DeviceHub::new(&manifest.devices, client.clone());
+        let recorder = crate::status::Recorder::new(&manifest);
 
         Ok(Self {
             manifest,
@@ -196,6 +199,7 @@ impl App {
                                    "by": "boot", "since_unix": 0})
             })),
             devices,
+            recorder,
         })
     }
 
@@ -299,6 +303,21 @@ impl App {
         &self.devices
     }
 
+    /// The live counters behind `GET {control_prefix}/status`.
+    pub fn recorder(&self) -> &crate::status::Recorder {
+        &self.recorder
+    }
+
+    /// The live system view: requests, failures, runs, spend, e-stop, devices.
+    pub fn status(&self) -> serde_json::Value {
+        crate::status::snapshot(self)
+    }
+
+    /// Which route a request would reach, for counting it. `None` when none does.
+    pub fn route_id_for(&self, method: &str, path: &str) -> Option<u32> {
+        self.router.find(method, path).ok().map(|m| m.route_id)
+    }
+
     /// The shared outbound HTTP client: upstreams, pulled cameras, webhooks.
     pub fn http_client(&self) -> &reqwest::Client {
         &self.client
@@ -309,8 +328,8 @@ impl App {
     /// same scopes as the route it is mounted on.
     pub fn authorize(&self, method: &str, path: &str, principal: &Principal) -> Result<&Route, WebCortexResponse> {
         let matched = self.router.find(method, path).map_err(|e| match e {
-            MatchError::NotFound => WebCortexResponse::error(404, format!("no route for {method} {path}")),
-            MatchError::MethodNotAllowed => WebCortexResponse::error(405, format!("{method} not allowed on {path}")),
+            MatchError::NotFound => WebCortexResponse::coded(404, "WC201", format!("no route for {method} {path}")),
+            MatchError::MethodNotAllowed => WebCortexResponse::coded(405, "WC202", format!("{method} not allowed on {path}")),
         })?;
         let route = self
             .routes_by_id
@@ -319,10 +338,7 @@ impl App {
         let missing = principal.missing_scopes(&Self::required_scopes(route));
         if !missing.is_empty() {
             let status = if principal.is_anonymous() { 401 } else { 403 };
-            return Err(WebCortexResponse::error(
-                status,
-                format!("missing required scope(s): {}", missing.join(", ")),
-            ));
+            return Err(scope_refusal(status, &missing));
         }
         Ok(route)
     }
@@ -429,12 +445,13 @@ impl App {
         let matched = match self.router.find(&req.method, &req.path) {
             Ok(m) => m,
             Err(MatchError::NotFound) => {
-                return WebCortexResponse::error(404, format!("no route for {} {}", req.method, req.path));
+                return WebCortexResponse::coded(404, "WC201", format!("no route for {} {}", req.method, req.path));
             }
             Err(MatchError::MethodNotAllowed) => {
                 let allowed = self.router.allowed_methods(&req.path).join(", ");
-                let mut res = WebCortexResponse::error(
+                let mut res = WebCortexResponse::coded(
                     405,
+                    "WC202",
                     format!("{} not allowed on {}; try: {}", req.method, req.path, allowed),
                 );
                 res.headers.push(("allow".into(), allowed));
@@ -448,8 +465,9 @@ impl App {
         // `/notes/purge`, say — refuse rather than run it: approval gates are
         // checked against the tool that was named, so this would be a way round them.
         if req.route_id.is_some_and(|expected| expected != matched.route_id) {
-            return WebCortexResponse::error(
+            return WebCortexResponse::coded(
                 400,
+                "WC208",
                 "the arguments do not address this tool's route; a path argument may not \
                  select a different route",
             );
@@ -469,10 +487,7 @@ impl App {
                 // logging in); 403 when a known principal simply lacks the
                 // scope. Collapsing both to 403 makes auth bugs hard to debug.
                 let status = if req.principal.is_anonymous() { 401 } else { 403 };
-                return WebCortexResponse::error(
-                    status,
-                    format!("missing required scope(s): {}", missing.join(", ")),
-                );
+                return scope_refusal(status, &missing);
             }
         }
 
@@ -482,8 +497,9 @@ impl App {
         if route.actuator {
             if let Some(state) = self.halted() {
                 let reason = state.get("reason").and_then(|r| r.as_str()).unwrap_or("");
-                return WebCortexResponse::error(
+                return WebCortexResponse::coded(
                     423,
+                    "WC502",
                     format!(
                         "actuators are halted ({reason}); nothing that moves hardware will run \
                          until an operator releases the stop at {}/release",
@@ -495,7 +511,7 @@ impl App {
 
         match self.execute(&route.op, req).await {
             Ok(res) => res,
-            Err(e) => WebCortexResponse::error(500, e),
+            Err(e) => WebCortexResponse::coded(500, op_failure_code(&route.op, &e), e),
         }
     }
 
@@ -518,10 +534,10 @@ impl App {
                         .collect();
                     let value = match db.run(sql, &bindings, *returns).await {
                         Ok(v) => v,
-                        Err(e) => return Ok(WebCortexResponse::error(e.status(), e.message())),
+                        Err(e) => return Ok(WebCortexResponse::coded(e.status(), e.code(), e.message())),
                     };
                     if value.is_null() && *returns == crate::manifest::QueryReturns::One {
-                        return Ok(WebCortexResponse::error(404, "not found"));
+                        return Ok(WebCortexResponse::coded(404, "WC207", "not found"));
                     }
                     Ok(WebCortexResponse::json(200, &value))
                 }
@@ -593,7 +609,8 @@ impl App {
         Ok(match action {
             A::Snapshot => match self.devices.snapshot(device).await {
                 Ok(v) => WebCortexResponse::json(200, &v),
-                Err(e) => WebCortexResponse::error(if device.def.source.is_some() { 502 } else { 404 }, e),
+                Err(e) if device.def.source.is_some() => WebCortexResponse::coded(502, "WC506", e),
+                Err(e) => WebCortexResponse::coded(404, "WC503", e),
             },
             A::Image => match self.devices.current_frame(device).await {
                 Ok(Some(frame)) => WebCortexResponse {
@@ -605,8 +622,8 @@ impl App {
                     ],
                     body: frame.data.clone(),
                 },
-                Ok(None) => WebCortexResponse::error(404, format!("device {name:?} has not sent a frame yet")),
-                Err(e) => WebCortexResponse::error(502, e),
+                Ok(None) => WebCortexResponse::coded(404, "WC503", format!("device {name:?} has not sent a frame yet")),
+                Err(e) => WebCortexResponse::coded(502, "WC506", e),
             },
             A::Telemetry => {
                 let t = device.telemetry();
@@ -622,19 +639,19 @@ impl App {
             ),
             A::IngestFrame => match device.push_frame(req.body.clone()) {
                 Ok(seq) => WebCortexResponse::json(200, &serde_json::json!({"device": name, "seq": seq})),
-                Err(e) => WebCortexResponse::error(e.status(), e.message()),
+                Err(e) => WebCortexResponse::coded(e.status(), e.code(), e.message()),
             },
             A::IngestTelemetry => {
                 let Ok(value) = req.json_body() else {
-                    return Ok(WebCortexResponse::error(400, "telemetry must be a JSON body"));
+                    return Ok(WebCortexResponse::coded(400, "WC505", "telemetry must be a JSON body"));
                 };
                 match device.push_telemetry(value) {
                     Ok(()) => WebCortexResponse::json(200, &serde_json::json!({"device": name, "ok": true})),
-                    Err(e) => WebCortexResponse::error(e.status(), e.message()),
+                    Err(e) => WebCortexResponse::coded(e.status(), e.code(), e.message()),
                 }
             }
             A::SocketIngest | A::SocketStream => {
-                let mut res = WebCortexResponse::error(426, "this route is a WebSocket; connect with Upgrade: websocket");
+                let mut res = WebCortexResponse::coded(426, "WC213", "this route is a WebSocket; connect with Upgrade: websocket");
                 res.headers.push(("upgrade".into(), "websocket".into()));
                 res
             }
@@ -652,7 +669,10 @@ impl App {
         let input = req.json_body().unwrap_or(serde_json::Value::Null);
         match crate::flow::run(self, &def, input, &req.principal, req.depth, req.budget.clone()).await {
             Ok(value) => Ok(WebCortexResponse::json(200, &value)),
-            Err(e) => Ok(WebCortexResponse::error(500, e)),
+            Err(e) => {
+                let code = if e.contains("token budget") { "WC402" } else { "WC315" };
+                Ok(WebCortexResponse::coded(500, code, e))
+            }
         }
     }
 
@@ -673,8 +693,9 @@ impl App {
             "refused an invocation past the nesting ceiling; likely a recursive behaviour"
         );
         // 508 Loop Detected says precisely what happened.
-        Some(WebCortexResponse::error(
+        Some(WebCortexResponse::coded(
             508,
+            "WC403",
             format!(
                 "invocation nested {} deep, exceeding the ceiling of {max}; \
                  a behaviour or agent is calling itself",
@@ -726,7 +747,7 @@ impl App {
                     tool: Some(name.to_string()),
                     detail: serde_json::json!({"error": &e}),
                 });
-                Ok(WebCortexResponse::error(500, e))
+                Ok(WebCortexResponse::coded(500, "WC003", e))
             }
         }
     }
@@ -761,10 +782,10 @@ impl App {
                         .collect();
                     let value = match db.run(sql, &bindings, *returns).await {
                         Ok(v) => v,
-                        Err(e) => return Ok(WebCortexResponse::error(e.status(), e.message())),
+                        Err(e) => return Ok(WebCortexResponse::coded(e.status(), e.code(), e.message())),
                     };
                     if value.is_null() && *returns == crate::manifest::QueryReturns::One {
-                        return Ok(WebCortexResponse::error(404, "not found"));
+                        return Ok(WebCortexResponse::coded(404, "WC207", "not found"));
                     }
                     context.insert(bind.clone(), value);
                 }
@@ -807,15 +828,16 @@ impl App {
 
     async fn run_agent(&self, name: &str, req: WebCortexRequest) -> Result<WebCortexResponse, String> {
         let Some(runtime) = &self.agent_runtime else {
-            return Ok(WebCortexResponse::error(503, "agent runtime is unavailable"));
+            return Ok(WebCortexResponse::coded(503, "WC215", "agent runtime is unavailable"));
         };
         let def = self
             .agent(name)
             .ok_or_else(|| format!("unknown agent {name:?}"))?;
 
         let Some(input) = req.lookup("input").and_then(|v| v.as_str().map(str::to_string)) else {
-            return Ok(WebCortexResponse::error(
+            return Ok(WebCortexResponse::coded(
                 400,
+                "WC306",
                 "agent invocation requires an 'input' string",
             ));
         };
@@ -830,8 +852,9 @@ impl App {
         // Every anonymous caller is the same `anonymous` principal, so a session
         // keyed by it would be one conversation shared by strangers.
         if session_id.is_some() && req.principal.root_is_anonymous() {
-            return Ok(WebCortexResponse::error(
+            return Ok(WebCortexResponse::coded(
                 401,
+                "WC607",
                 "sessions need an authenticated caller: anonymous callers share one identity, \
                  so they would share one conversation",
             ));
@@ -839,7 +862,7 @@ impl App {
 
         let images = match crate::agent::vision::input_images(req.lookup("images").as_ref()) {
             Ok(images) => images,
-            Err(e) => return Ok(WebCortexResponse::error(400, e)),
+            Err(e) => return Ok(WebCortexResponse::coded(400, "WC313", e)),
         };
 
         let opts = RunOptions {
@@ -893,7 +916,7 @@ impl App {
                     upstream = %upstream_name, param = %name,
                     "rejected proxy request whose path parameter contained traversal"
                 );
-                return Ok(WebCortexResponse::error(400, "invalid path parameter"));
+                return Ok(WebCortexResponse::coded(400, "WC209", "invalid path parameter"));
             }
         }
 
@@ -905,7 +928,7 @@ impl App {
         // Belt and braces: even with clean parameters, the assembled tail must
         // not contain a traversal segment.
         if tail.split('/').any(|seg| seg == ".." || seg == ".") {
-            return Ok(WebCortexResponse::error(400, "invalid upstream path"));
+            return Ok(WebCortexResponse::coded(400, "WC209", "invalid upstream path"));
         }
 
         let url = format!("{}{}", up.base_url.trim_end_matches('/'), tail);
@@ -1109,7 +1132,45 @@ pub fn run_result_response(result: &RunResult) -> WebCortexResponse {
     };
     match serde_json::to_value(result) {
         Ok(v) => WebCortexResponse::json(status, &v),
-        Err(e) => WebCortexResponse::error(500, e.to_string()),
+        Err(e) => WebCortexResponse::coded(500, "WC001", e.to_string()),
+    }
+}
+
+/// 401 (nobody authenticated) or 403 (a known caller without the scope), with
+/// a hint naming the scopes to hold.
+fn scope_refusal(status: u16, missing: &[String]) -> WebCortexResponse {
+    let code = if status == 401 { "WC601" } else { "WC602" };
+    let hint = if status == 401 {
+        format!(
+            "Authenticate: send an API key (x-api-key) or a bearer token whose scopes include {}.",
+            missing.join(", ")
+        )
+    } else {
+        format!(
+            "This caller lacks {}. Use a key registered with app.api_key(..., scopes=[{}]).",
+            missing.join(", "),
+            missing.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", ")
+        )
+    };
+    WebCortexResponse::coded_with_hint(status, code, format!("missing required scope(s): {}", missing.join(", ")), &hint)
+}
+
+/// The code for an op that failed with an `Err` string rather than a response.
+fn op_failure_code(op: &Op, message: &str) -> &'static str {
+    if let Some(code) = crate::errors::code_in(message) {
+        return code;
+    }
+    match op {
+        Op::Python { .. } => "WC002",
+        Op::Behaviour { .. } => "WC003",
+        Op::Page { .. } if message.contains("database") => "WC105",
+        Op::Page { .. } => "WC004",
+        Op::Query { .. } if message.contains("database") => "WC105",
+        Op::Proxy { .. } => "WC210",
+        Op::Flow { .. } => "WC315",
+        Op::Agent { .. } => "WC300",
+        Op::Device { .. } if message.contains("unknown device") => "WC501",
+        _ => "WC001",
     }
 }
 
@@ -1121,8 +1182,9 @@ fn binds_principal(params: &[String]) -> bool {
 /// Every anonymous caller shares the id `anonymous`, so a route scoped to
 /// `@principal` would pool their data. It needs a real caller instead.
 fn anonymous_principal_refused() -> WebCortexResponse {
-    WebCortexResponse::error(
+    WebCortexResponse::coded(
         401,
+        "WC607",
         "this route is scoped to the caller (@principal) and needs an authenticated caller",
     )
 }

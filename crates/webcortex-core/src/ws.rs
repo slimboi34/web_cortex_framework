@@ -66,7 +66,7 @@ pub fn accept(
     principal: Principal,
 ) -> WebCortexResponse {
     if headers.get("sec-websocket-version").map(String::as_str) != Some("13") {
-        let mut res = WebCortexResponse::error(426, "unsupported WebSocket version; use 13");
+        let mut res = WebCortexResponse::coded(426, "WC213", "unsupported WebSocket version; use 13");
         res.headers.push(("sec-websocket-version".into(), "13".into()));
         return res;
     }

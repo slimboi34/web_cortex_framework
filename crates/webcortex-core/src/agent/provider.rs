@@ -82,6 +82,12 @@ pub trait ModelProvider: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<ProviderResponse, String>>;
 
     fn name(&self) -> &'static str;
+
+    /// Where requests go, for `webcortex doctor --online`. `None` for
+    /// providers with no network endpoint (the fakes).
+    fn base_url(&self) -> Option<&str> {
+        None
+    }
 }
 
 fn full_system(req: &CompletionRequest<'_>) -> String {
@@ -132,6 +138,10 @@ impl AnthropicProvider {
 impl ModelProvider for AnthropicProvider {
     fn name(&self) -> &'static str {
         "anthropic"
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        Some(&self.base_url)
     }
 
     fn complete<'a>(
@@ -323,6 +333,10 @@ impl OpenAiCompatProvider {
 impl ModelProvider for OpenAiCompatProvider {
     fn name(&self) -> &'static str {
         self.label
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        Some(&self.base_url)
     }
 
     fn complete<'a>(
@@ -989,6 +1003,14 @@ impl ModelProvider for FakeProvider {
                     json!([{"type": "text", "text": reply}]),
                     StopReason::EndTurn,
                 );
+            }
+
+            // `fail:<message>` answers as a provider error would, so the failure
+            // path (codes, hints, the status view) is testable offline. Write
+            // the message the way a real provider error reads, e.g.
+            // `fail:anthropic 529: overloaded`.
+            if let Some(message) = text.trim().strip_prefix("fail:") {
+                return Err(message.trim().to_string());
             }
 
             let mut calls = Vec::new();

@@ -98,6 +98,18 @@ approval="required" tools suspend a run (resume via POST /_webcortex/approvals/{
 max_steps and token_budget are hard limits; nesting is capped at 8; every step is audited;
 actuator=True routes refuse with 423 while the emergency stop is engaged.
 CLI: webcortex check | security | tools | context | evolve "…" | typegen | openapi | sql | dev | halt | release
+
+# diagnosing (2.5): every error carries a stable code + hint
+# HTTP error body: {"error": {"status", "message", "code": "WC201", "hint"}}  (+ header x-webcortex-error)
+# agent run that did not complete: {"status": "failed|budget_exhausted|…", "code", "hint"}; failed steps carry "code"
+# raise HTTPError(409, "msg", code="WC214", hint="what to do") from a handler
+webcortex doctor [--online] [--json]     # keys present?, models resolve?, security, e-stop, budgets, port; exit 1 on fail
+webcortex status [--url U] [--json]      # live: requests/route, recent errors (code, route, request id), runs, spend, devices
+webcortex explain WC402 | --list         # what a code means and what to do; GET /_webcortex/errors
+# MCP (webcortex mcp-config): tools webcortex_status(section?) and webcortex_explain(code);
+# resources webcortex://status and webcortex://errors. Codes: WC1xx config, WC2xx HTTP,
+# WC3xx agents/providers, WC4xx budgets/limits, WC5xx devices/actuators, WC6xx auth.
+# Offline failure test: WEBCORTEX_FAKE_PROVIDER=1 and agent input "fail:anthropic 529: overloaded"
 """
 
 

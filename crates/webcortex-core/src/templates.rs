@@ -66,7 +66,7 @@ impl Templates {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(template = %name, error = %e, "template not found");
-                return WebCortexResponse::error(500, format!("template {name:?} is unavailable"));
+                return WebCortexResponse::coded(500, "WC004", format!("template {name:?} is unavailable"));
             }
         };
 
@@ -80,7 +80,7 @@ impl Templates {
                 // Template errors carry source snippets; those belong in the log,
                 // never in a response body where they leak app internals.
                 tracing::error!(template = %name, error = %e, "template render failed");
-                WebCortexResponse::error(500, format!("failed to render {name:?}"))
+                WebCortexResponse::coded(500, "WC004", format!("failed to render {name:?}"))
             }
         }
     }

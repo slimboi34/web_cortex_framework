@@ -296,6 +296,31 @@ request path become a 500; default bind `127.0.0.1`. `cargo audit` and
   input), and a public name resolving to a private address is not caught.
 - **Proxy responses** are buffered whole. The upstream is the operator's.
 
+## Review — 2.5.0 (diagnostics)
+
+2.5.0 adds surface that describes the running app, so it was checked for what it
+could disclose:
+
+- `GET /_webcortex/status` and `/errors` sit behind the same `webcortex:admin` gate
+  as every control-plane route (only `/health` is open). `tests/test_diagnostics.py`
+  asserts 401 anonymous / 403 without the scope.
+- The MCP built-ins (`webcortex_status`, `webcortex_explain`, `webcortex://status`,
+  `webcortex://errors`) are offered only to callers who may read the control plane
+  (`mcp::may_observe`); reaching `/mcp` already requires admin once auth is on, and
+  the check is repeated so another embedding of `mcp::handle` cannot leak them.
+- The status view records no request or response bodies, headers, query strings or
+  credentials. A failure records the matched route *pattern*; only an unmatched path
+  (404) is recorded as sent, truncated to 96 bytes. Request ids are the
+  already-sanitised `x-request-id`. Tests assert that keys and handler exception text
+  never appear in it.
+- Hints are static catalogue text, or built from scope names the app declared; they
+  never echo caller input. Unhandled Python exceptions still return only
+  "internal error" (`WC002`), with the traceback in the log.
+- `webcortex doctor` reads whether an environment variable is set, never its value;
+  a test runs it with a key set and asserts the value is absent from the output.
+- Dependencies: the nine advisories that blocked the 2.4.1 release (quinn-proto,
+  rustls) are resolved; `cargo audit` and `pip-audit` (docs toolchain) are clean.
+
 ## Reporting
 
 Report a vulnerability privately through

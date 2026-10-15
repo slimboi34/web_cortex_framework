@@ -19,6 +19,22 @@ from .starters import TEMPLATES
 DEFAULT_MODULE = "api.py"
 
 
+class CLIError(Exception):
+    """A failure the CLI reports with a catalogued code (see `webcortex explain`)."""
+
+    def __init__(self, code: str, message: str, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.hint = hint
+
+    def as_json(self) -> dict:
+        from .errors import hint as catalogue_hint
+
+        return {"ok": False, "error": {"code": self.code, "message": self.message,
+                                       "hint": self.hint if self.hint is not None else catalogue_hint(self.code)}}
+
+
 def _load_app(target: str) -> Any:
     """Import a module by path and return its `app`.
 
@@ -31,6 +47,38 @@ def _load_app(target: str) -> Any:
     if not path.suffix:
         path = path.with_suffix(".py")
 
+    try:
+        module = _import_target(path, module_part)
+    except CLIError:
+        raise
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 - whatever the module raised is the finding
+        import traceback
+
+        frames = traceback.extract_tb(e.__traceback__)
+        package = str(Path(__file__).resolve().parent)
+        inside = [str(Path(f.filename).resolve()).startswith(package) for f in frames]
+        user = [f for f, mine in zip(frames, inside) if not mine]
+        where = f" (at {user[-1].filename}:{user[-1].lineno})" if user else ""
+        detail = f"{type(e).__name__}: {e}{where}"
+        # A ValueError raised by webcortex itself is a declaration it refused.
+        declaration = isinstance(e, ValueError) and bool(inside) and inside[-1]
+        code = "WC101" if declaration else "WC102"
+        hint = ("A declaration in the app is invalid; the message names it and the location is the "
+                "line that declared it.") if declaration else None
+        raise CLIError(code, f"loading {target} failed: {detail}", hint) from None
+
+    if not hasattr(module, attr):
+        raise CLIError(
+            "WC102",
+            f"{module_part} does not define {attr!r}",
+            f"Define `{attr} = WebCortex(...)` or pass module:name.",
+        )
+    return getattr(module, attr)
+
+
+def _import_target(path: Path, module_part: str) -> Any:
     if path.exists():
         # Sibling modules must be importable: an app split across api.py and
         # agents.py is the expected shape, not an edge case.
@@ -39,19 +87,16 @@ def _load_app(target: str) -> Any:
             sys.path.insert(0, directory)
         spec = importlib.util.spec_from_file_location(path.stem, path)
         if spec is None or spec.loader is None:
-            raise SystemExit(f"webcortex: cannot load {path}")
+            raise CLIError("WC102", f"cannot load {path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[path.stem] = module
         spec.loader.exec_module(module)
     else:
+        if not path.exists() and module_part.endswith(".py"):
+            raise CLIError("WC102", f"{path} does not exist",
+                           "Run the command where api.py lives, or pass the module path.")
         module = importlib.import_module(module_part)
-
-    if not hasattr(module, attr):
-        raise SystemExit(
-            f"webcortex: {module_part} does not define {attr!r}. "
-            f"Define `{attr} = WebCortex(...)` or pass module:name."
-        )
-    return getattr(module, attr)
+    return module
 
 
 def _load_dotenv() -> None:
@@ -231,9 +276,17 @@ def _control(app: Any, method: str, path: str, body: dict | None = None,
         with urllib.request.urlopen(req, timeout=5) as res:
             return json.loads(res.read() or b"{}")
     except urllib.error.HTTPError as e:
-        raise SystemExit(f"webcortex: {url} answered {e.code}: {e.read().decode(errors='replace')}")
+        raw = e.read().decode(errors="replace")
+        try:
+            err = json.loads(raw).get("error", {})
+        except (ValueError, AttributeError):
+            err = {}
+        from .errors import code_for_status
+
+        raise CLIError(err.get("code") or code_for_status(e.code), f"{url} answered {e.code}: "
+                       f"{err.get('message', raw)}", err.get("hint"))
     except urllib.error.URLError as e:
-        raise SystemExit(f"webcortex: cannot reach {url}: {e.reason}. Is the app running?")
+        raise CLIError("WC108", f"cannot reach {url}: {e.reason}")
 
 
 def _cmd_new(args: argparse.Namespace) -> int:
@@ -267,6 +320,21 @@ def _cmd_new(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        return _run(parser, args)
+    except CLIError as e:
+        if getattr(args, "json", False) or args.command == "check":
+            print(json.dumps(e.as_json(), indent=2))
+        else:
+            from .errors import format_error
+
+            print(format_error(e.code, e.message, e.hint), file=sys.stderr)
+        return 1
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="webcortex", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -300,6 +368,8 @@ def main(argv: list[str] | None = None) -> int:
         ("evolve", "ask a model to propose an extension, anchored on the context pack"),
         ("halt", "engage the emergency stop on the running app: every actuator refuses to run"),
         ("release", "release the emergency stop on the running app"),
+        ("doctor", "check the app is ready to run: versions, manifest, provider keys, security, e-stop, port"),
+        ("status", "what the running app is doing: requests, recent errors, agent runs, spend, devices"),
     ]:
         p = sub.add_parser(name, help=help_text)
         if name == "evolve":
@@ -320,6 +390,14 @@ def main(argv: list[str] | None = None) -> int:
         if name == "halt":
             p.add_argument("--reason", "-r", default="", help="recorded in the audit log")
             p.add_argument("--status", action="store_true", help="only report whether it is halted")
+        if name in ("doctor", "status"):
+            p.add_argument("--json", action="store_true", help="machine-readable output")
+            p.add_argument("--url", default=None,
+                           help="the running app's base URL (default: WEBCORTEX_HOST/PORT or the app's own)")
+            p.add_argument("--key", default=None, help="admin API key (default: $WEBCORTEX_API_KEY)")
+        if name == "doctor":
+            p.add_argument("--online", action="store_true",
+                           help="also probe each model provider's endpoint (3 s timeout)")
         if name == "evolve":
             p.add_argument("--model", "-m", default="default",
                            help="model or alias, e.g. default, fast, ollama/qwen3.5:9b")
@@ -327,10 +405,80 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--json", action="store_true",
                            help="ask for {summary, code, notes} as JSON")
 
-    args = parser.parse_args(argv)
+    explain = sub.add_parser("explain", help="explain an error code (WCnnn), or list them all")
+    explain.add_argument("code", nargs="?", default=None)
+    explain.add_argument("--list", action="store_true", help="list every code")
+    explain.add_argument("--json", action="store_true", help="machine-readable output")
+    return parser
 
+
+def _cmd_explain(args: argparse.Namespace) -> int:
+    from . import errors
+
+    if args.list or not args.code:
+        entries = list(errors.catalogue())
+        if args.json:
+            print(json.dumps({"errors": entries}, indent=2))
+            return 0
+        category = None
+        for e in entries:
+            if e["category"] != category:
+                category = e["category"]
+                print(f"\n{category}")
+            status = f" ({e['status']})" if e["status"] else ""
+            print(f"  {e['code']}  {e['title']}{status}")
+        print("\n`webcortex explain CODE` for what to do about one.")
+        return 0
+    entry = errors.explain(args.code)
+    if entry is None:
+        raise CLIError("WC205", f"{args.code!r} is not a WebCortex error code",
+                       "Codes look like WC201; `webcortex explain --list` shows them all.")
+    if args.json:
+        print(json.dumps(entry, indent=2))
+        return 0
+    status = f"  ·  HTTP {entry['status']}" if entry["status"] else ""
+    print(f"{entry['code']}  {entry['title']}  ·  {entry['category']}{status}\n")
+    print(entry["hint"])
+    print(f"\n{entry['docs']}")
+    return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    from .diagnostics import _check, _summarise, doctor, render_doctor
+
+    try:
+        app = _load_app(args.target)
+    except CLIError as e:
+        report = _summarise([_check("app", "fail", e.message, e.hint or "", code=e.code)])
+    else:
+        report = doctor(app, online=args.online, url=args.url, key=args.key)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(render_doctor(report))
+    return 0 if report["ok"] else 1
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    from .diagnostics import StatusError, fetch_status, render_status
+
+    app = None
+    if not (args.url and args.target == DEFAULT_MODULE and not Path(DEFAULT_MODULE).exists()):
+        app = _load_app(args.target)
+    try:
+        status = fetch_status(app, url=args.url, key=args.key)
+    except StatusError as e:
+        raise CLIError(e.code, e.message, e.hint) from None
+    print(json.dumps(status, indent=2) if args.json else render_status(status))
+    return 0
+
+
+def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.command == "new":
         return _cmd_new(args)
+
+    if args.command == "explain":
+        return _cmd_explain(args)
 
     if args.command == "keygen":
         from . import _core
@@ -339,6 +487,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     _load_dotenv()
+    if args.command == "doctor":
+        return _cmd_doctor(args)
+    if args.command == "status":
+        return _cmd_status(args)
     app = _load_app(args.target)
 
     if args.command in ("dev", "run"):
@@ -350,7 +502,10 @@ def main(argv: list[str] | None = None) -> int:
             app.workers = args.workers
         if args.command == "dev":
             os.environ.setdefault("WEBCORTEX_LOG", "info")
-        _banner(app)
+        try:
+            _banner(app)
+        except ValueError as e:
+            raise CLIError("WC101", str(e)) from None
         app.run()
         return 0
 
@@ -369,7 +524,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "check":
-        report = app.check()
+        try:
+            report = app.check()
+        except ValueError as e:
+            raise CLIError("WC101", str(e)) from None
         print(json.dumps({**report, "security": app.security_report()}, indent=2))
         return 0
 
