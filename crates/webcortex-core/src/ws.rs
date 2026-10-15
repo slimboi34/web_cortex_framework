@@ -32,7 +32,8 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
 
 type Socket = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
@@ -165,7 +166,25 @@ async fn ingest(app: Arc<App>, name: String, principal: Principal, mut ws: Socke
                 Ok(v) => device.push_telemetry(v).err().map(|e| error(e.code(), e.message())),
                 Err(e) => Some(error("WC505", format!("telemetry must be JSON: {e}"))),
             },
-            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(Message::Close(_)) => break,
+            Err(tokio_tungstenite::tungstenite::Error::Capacity(e)) => {
+                // A frame over the socket's ceiling: say why before closing,
+                // in the log and (if the device still reads) a 1009 close,
+                // rather than a bare reset nobody can explain.
+                tracing::warn!(device = %name, error = %e, max_frame_bytes = device.def.max_frame_bytes,
+                               "device socket closed: message too large");
+                let _ = ws
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Size,
+                        reason: "[WC505] message over max_frame_bytes".into(),
+                    })))
+                    .await;
+                break;
+            }
+            Err(e) => {
+                tracing::debug!(device = %name, error = %e, "device socket error");
+                break;
+            }
             Ok(_) => None,
         };
         if let Some(reply) = reply

@@ -37,7 +37,7 @@ app.sensor("dock_env", description="temperature and humidity")
 | `headers`, `bearer_env` | — | Credentials for a pulled camera |
 | `keep` | `8` | Frames held in the ring buffer |
 | `max_fps` | `30` | Ingest ceiling. Faster frames are dropped (WebSocket) or refused with 429 (HTTP) |
-| `max_frame_bytes` | 5 MB | Frames larger than this are refused |
+| `max_frame_bytes` | 5 MB | Frames larger than this are refused (422 over HTTP; over the socket, a message past it closes the connection with 1009 and a warning in the log) |
 | `ingest_scopes` | `["devices:ingest"]` | Required to send frames and telemetry |
 | `read_scopes` | `["devices:read"]` | Required to read anything back |
 | `tool` | `True` | Whether agents get the device's tools |

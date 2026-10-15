@@ -63,7 +63,7 @@ impl Histogram {
         }
         // A bucket's upper bound can lie above every sample in it; the true
         // maximum is known exactly, and no percentile can exceed it.
-        round3(upper.min(max_us.max(1)) as f64 / 1000.0)
+        round3(upper.min(max_us) as f64 / 1000.0)
     }
 
     /// p50/p95/p99, none of them above `max_us`, the largest sample recorded.
@@ -182,6 +182,8 @@ pub enum Target {
 }
 
 struct LiveRun {
+    /// The agent the run started as; `agent` follows handoffs.
+    entry: String,
     agent: String,
     caller: String,
     depth: u32,
@@ -200,6 +202,9 @@ struct AgentTally {
     step_limit: u64,
     max_tokens: u64,
     awaiting_approval: u64,
+    /// Runs abandoned before they finished: the request timed out, or the
+    /// client went away and the run was dropped with it.
+    cancelled: u64,
     tokens: u64,
     largest_run_tokens: u64,
 }
@@ -349,6 +354,7 @@ impl Recorder {
         book.in_flight.insert(
             run_id.to_string(),
             LiveRun {
+                entry: agent.to_string(),
                 agent: agent.to_string(),
                 caller: caller.to_string(),
                 depth,
@@ -411,6 +417,38 @@ impl Recorder {
             && s.status == "failed" {
                 self.record_failure("agent", &format!("agent {}", s.agent), code, s.run_id);
             }
+    }
+
+    /// A run that was dropped before it finished: its request timed out or its
+    /// client disconnected, and the future driving it went with them. Without
+    /// this it stayed "in flight" for the life of the process.
+    pub fn run_cancelled(&self, run_id: &str) {
+        let mut book = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(live) = book.in_flight.remove(run_id) else { return };
+        let tally = book.by_agent.entry(live.entry.clone()).or_default();
+        tally.runs += 1;
+        tally.cancelled += 1;
+        tally.tokens = tally.tokens.saturating_add(live.tokens);
+        tally.largest_run_tokens = tally.largest_run_tokens.max(live.tokens);
+        if book.recent.len() >= RECENT_RUNS {
+            book.recent.pop_front();
+        }
+        book.recent.push_back(json!({
+            "run_id": run_id,
+            "agent": live.agent,
+            "path": [live.entry],
+            "caller": live.caller,
+            "depth": live.depth,
+            "outcome": "cancelled",
+            "code": null,
+            "steps": live.steps,
+            "tool_calls": null,
+            "tokens": live.tokens,
+            "tree_tokens": null,
+            "cost_usd": null,
+            "duration_ms": live.started.elapsed().as_millis() as u64,
+            "finished_at_ms": unix_ms(),
+        }));
     }
 
     pub fn watcher_run(&self, name: &str, status: &str, code: Option<&str>) {
@@ -670,6 +708,43 @@ mod tests {
         assert_eq!(s["p50_ms"], 0.128);
         assert!(s["p99_ms"].as_f64().unwrap() <= 0.128);
         assert!(s["p99_ms"].as_f64().unwrap() >= 0.1);
+    }
+
+    #[test]
+    fn a_cancelled_run_leaves_in_flight_and_is_counted() {
+        let r = Recorder::new(&manifest());
+        r.run_started("run1", "desk", "alice", 0);
+        r.run_progress("run1", "billing", 3, 120);
+        r.run_cancelled("run1");
+        r.run_cancelled("run1"); // a second drop is a no-op
+        let (runs, tally) = r.runs();
+        assert!(runs["in_flight"].as_array().unwrap().is_empty());
+        assert_eq!(runs["recent"][0]["outcome"], "cancelled");
+        assert_eq!(runs["recent"][0]["agent"], "billing");
+        assert_eq!(runs["recent"][0]["tokens"], 120);
+        assert_eq!(tally["desk"].cancelled, 1);
+        assert_eq!(tally["desk"].runs, 1);
+        // A run that finished normally is not touched by a late cancel.
+        r.run_started("run2", "desk", "alice", 0);
+        r.run_finished(RunSummary {
+            run_id: "run2", agent: "desk", path: &["desk".to_string()], status: "completed",
+            steps: 1, tool_calls: 0, tokens: 5, tree_tokens: 5, cost_usd: None, code: None,
+        });
+        r.run_cancelled("run2");
+        let (_, tally) = r.runs();
+        assert_eq!(tally["desk"].cancelled, 1);
+        assert_eq!(tally["desk"].completed, 1);
+    }
+
+    #[test]
+    fn a_percentile_of_zero_latency_samples_is_zero() {
+        // The cap used max(1) µs, so all-zero samples reported p50 0.001 ms
+        // against a max of 0.0.
+        let slot = Slot::new("GET /".into());
+        slot.record(200, 0);
+        let v = slot.describe().unwrap();
+        assert_eq!(v["max_ms"], 0.0);
+        assert_eq!(v["p50_ms"], 0.0);
     }
 
     #[test]

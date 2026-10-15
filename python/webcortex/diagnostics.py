@@ -427,7 +427,8 @@ def render_status(s: dict) -> str:
     devices = s.get("devices", {})
     for d in devices.get("devices", []):
         out.append(f"  device {d['name']}: {'connected' if d['connected'] else 'idle'}, {d['fps']} fps, "
-                   f"{d['frames_in']} in, {d['frames_dropped']} dropped, {d['subscribers']} subscriber(s)")
+                   f"{d['frames_in']} in, {d['frames_dropped']} dropped, {d.get('frames_rejected', 0)} rejected, "
+                   f"{d['subscribers']} subscriber(s)")
     for w in devices.get("watchers", []):
         st = w["stats"]
         out.append(f"  watcher {w['name']}: {st.get('runs', 0)} runs, {st.get('failed', 0)} failed"

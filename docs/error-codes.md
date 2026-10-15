@@ -186,6 +186,12 @@ The request conflicts with the current state of the resource; re-read it and ret
 
 A subsystem this route needs is not running in this process (for example the agent runtime). Check the server log at boot.
 
+### WC216 — Request body too slow {#wc216}
+
+*http · HTTP 408*
+
+The client announced a body but did not finish sending it within request_timeout (agent_timeout on agent, behaviour and flow routes). Send the whole body promptly, or raise the limit on WebCortex(...).
+
 ## Agents, behaviours, flows and providers (WC3xx)
 
 ### WC300 — Agent run failed {#wc300}
@@ -352,7 +358,7 @@ The device is sending faster than its max_fps; the frame was dropped. Slow the s
 
 *devices · HTTP 422*
 
-The frame is not a PNG/JPEG/GIF/WebP, is over max_frame_bytes, or the telemetry is not a JSON body.
+The frame is not a PNG/JPEG/GIF/WebP, is over max_frame_bytes, or the telemetry is not a JSON body (a body that is not JSON at all is answered 400; the rest 422).
 
 ### WC506 — Camera unreachable {#wc506}
 

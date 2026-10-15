@@ -131,11 +131,11 @@ control-plane route) describes what the running app is doing:
 | top level | `app`, `app_version`, `webcortex` (core version), `uptime_secs`, `started_at_ms`, `python_workers` |
 | `requests` | totals and, per route pattern, request counts by status class, mean / p50 / p95 / p99 / max latency |
 | `errors` | total failures and the last 100: `{at_ms, source: http|mcp|agent|watcher, route, status, code, request_id}` |
-| `agents` | runs `in_flight` (agent, caller, depth, steps, tokens so far, running time) and the last 50 `recent` (outcome, code, steps, tool calls, tokens, tree tokens, cost, duration); per-agent tallies; sessions; pending approvals |
+| `agents` | runs `in_flight` (agent, caller, depth, steps, tokens so far, running time) and the last 50 `recent` (outcome, code, steps, tool calls, tokens, tree tokens, cost, duration); per-agent tallies, including `cancelled` — runs dropped because their request timed out or their client went away; sessions; pending approvals |
 | `usage` | the spend ledger's totals: tokens, estimated cost (null when a model is unpriced), by model |
 | `budgets` | each agent, behaviour and flow: its `token_budget` and `max_steps`, tokens spent, largest run, how often it hit a limit |
 | `estop` | halted or armed, the halt state, the actuator tools |
-| `devices` | per device: connected, recent fps, frames in and dropped, last frame and telemetry age, subscribers; per watcher: runs, failures, last outcome and code |
+| `devices` | per device: connected, recent fps, frames in, dropped (over `max_fps`) and rejected (not an image, empty, too large), last frame and telemetry age, subscribers; per watcher: runs, failures, last outcome and code |
 
 Request ids are the `x-request-id` the client sent (or the one the server assigned and returned),
 so a failure a user reports can be found here. Nothing in the view holds a body, a header, a

@@ -45,7 +45,17 @@ OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x
 
 
 class WebSocketError(ConnectionError):
-    pass
+    """A refused upgrade, a closed socket, or an error message from the server.
+
+    For a server error message, ``code`` and ``hint`` carry the catalogued
+    code (``WC306``, ``WC203``, …) and what to do about it; both are ``None``
+    otherwise.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
 
 
 class WebSocket:
@@ -295,7 +305,9 @@ class AgentSocket:
             elif kind == "result":
                 return event["result"]
             elif kind == "error":
-                raise WebSocketError(event.get("message", "agent error"))
+                code = event.get("code")
+                message = event.get("message", "agent error")
+                raise WebSocketError(f"[{code}] {message}" if code else message, code=code, hint=event.get("hint"))
 
     def close(self) -> None:
         self.ws.close()

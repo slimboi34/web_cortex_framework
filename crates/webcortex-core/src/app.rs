@@ -333,7 +333,7 @@ impl App {
     /// same scopes as the route it is mounted on.
     pub fn authorize(&self, method: &str, path: &str, principal: &Principal) -> Result<&Route, WebCortexResponse> {
         let matched = self.router.find(method, path).map_err(|e| match e {
-            MatchError::NotFound => WebCortexResponse::coded(404, "WC201", format!("no route for {method} {path}")),
+            MatchError::NotFound => self.no_route(method, path),
             MatchError::MethodNotAllowed => WebCortexResponse::coded(405, "WC202", format!("{method} not allowed on {path}")),
         })?;
         let route = self
@@ -446,12 +446,47 @@ impl App {
         all
     }
 
+    /// The 404 for a path no route matches. Under a device prefix, naming a
+    /// device that was never declared, it is WC501 "unknown device" rather
+    /// than WC201, whose hint sends the reader looking for a route.
+    fn no_route(&self, method: &str, path: &str) -> WebCortexResponse {
+        if let Some(name) = self.undeclared_device_in(path) {
+            return WebCortexResponse::coded(
+                404,
+                "WC501",
+                format!("no device named {name:?} (no route for {method} {path})"),
+            );
+        }
+        WebCortexResponse::coded(404, "WC201", format!("no route for {method} {path}"))
+    }
+
+    /// The device segment of `path`, when `path` sits under the prefix of a
+    /// declared device's routes and names a device that does not exist.
+    fn undeclared_device_in<'p>(&self, path: &'p str) -> Option<&'p str> {
+        if self.devices().is_empty() {
+            return None;
+        }
+        for route in &self.manifest.routes {
+            let Op::Device { device, .. } = &route.op else { continue };
+            let Some(at) = route.path.find(&format!("/{device}/")) else { continue };
+            let prefix = &route.path[..at];
+            if prefix.is_empty() {
+                continue;
+            }
+            let Some(rest) = path.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')) else { continue };
+            let Some((name, _)) = rest.split_once('/') else { continue };
+            if !name.is_empty() && name.len() <= 64 && self.devices().get(name).is_none() {
+                return Some(name);
+            }
+            return None;
+        }
+        None
+    }
+
     pub async fn dispatch(&self, mut req: WebCortexRequest) -> WebCortexResponse {
         let matched = match self.router.find(&req.method, &req.path) {
             Ok(m) => m,
-            Err(MatchError::NotFound) => {
-                return WebCortexResponse::coded(404, "WC201", format!("no route for {} {}", req.method, req.path));
-            }
+            Err(MatchError::NotFound) => return self.no_route(&req.method, &req.path),
             Err(MatchError::MethodNotAllowed) => {
                 let allowed = self.router.allowed_methods(&req.path).join(", ");
                 let mut res = WebCortexResponse::coded(

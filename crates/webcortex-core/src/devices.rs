@@ -36,6 +36,8 @@ pub const MAX_TELEMETRY_BYTES: usize = 64 * 1024;
 const KEEP_INSIGHTS: usize = 32;
 /// Events buffered per subscriber before a slow one starts missing them.
 const CHANNEL_CAPACITY: usize = 64;
+/// Arrival times kept for the frame rate, whatever `keep` is.
+const RATE_WINDOW: usize = 32;
 
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -124,12 +126,18 @@ pub fn sniff(data: &[u8]) -> Option<&'static str> {
 pub struct Device {
     pub def: DeviceDef,
     frames: Mutex<VecDeque<Arc<Frame>>>,
+    /// When the newest frames arrived, for `recent_fps`. Separate from the
+    /// ring, which may hold a single frame (`keep=1`) and so no interval.
+    arrivals: Mutex<VecDeque<u64>>,
     telemetry: Mutex<Option<(u64, Arc<Value>)>>,
     insights: Mutex<VecDeque<Value>>,
     seq: AtomicU64,
     last_ingest: Mutex<Option<Instant>>,
     frames_in: AtomicU64,
     frames_dropped: AtomicU64,
+    /// Frames refused as invalid (not an image, empty, over max_frame_bytes,
+    /// sent to a sensor). Over a WebSocket these are otherwise invisible.
+    frames_rejected: AtomicU64,
     tx: broadcast::Sender<Event>,
 }
 
@@ -139,12 +147,14 @@ impl Device {
         Self {
             def,
             frames: Mutex::new(VecDeque::new()),
+            arrivals: Mutex::new(VecDeque::new()),
             telemetry: Mutex::new(None),
             insights: Mutex::new(VecDeque::new()),
             seq: AtomicU64::new(0),
             last_ingest: Mutex::new(None),
             frames_in: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
+            frames_rejected: AtomicU64::new(0),
             tx,
         }
     }
@@ -152,6 +162,14 @@ impl Device {
     /// Accept one encoded frame. The type is sniffed from the bytes; the
     /// declared content type is only a fallback for the error message.
     pub fn push_frame(&self, data: Bytes) -> Result<u64, IngestError> {
+        let result = self.accept_frame(data);
+        if matches!(result, Err(IngestError::Invalid(_))) {
+            self.frames_rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn accept_frame(&self, data: Bytes) -> Result<u64, IngestError> {
         if self.def.kind == DeviceKind::Sensor {
             return Err(IngestError::Invalid(format!(
                 "{:?} is a sensor; send telemetry, not frames",
@@ -172,7 +190,9 @@ impl Device {
             IngestError::Invalid("frame is not a PNG, JPEG, GIF or WebP image".into())
         })?;
         {
-            let interval = Duration::from_secs_f64(1.0 / self.def.max_fps);
+            // try_: a vanishingly small max_fps overflows a Duration, and the
+            // panic took the request (or the device's socket) down with it.
+            let interval = Duration::try_from_secs_f64(1.0 / self.def.max_fps).unwrap_or(Duration::MAX);
             let mut last = self.last_ingest.lock().unwrap_or_else(|p| p.into_inner());
             if last.is_some_and(|t| t.elapsed() < interval) {
                 self.frames_dropped.fetch_add(1, Ordering::Relaxed);
@@ -186,6 +206,13 @@ impl Device {
     fn store(&self, media_type: &'static str, data: Bytes) -> u64 {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let frame = Arc::new(Frame { seq, media_type, data, at_ms: now_ms() });
+        {
+            let mut arrivals = self.arrivals.lock().unwrap_or_else(|p| p.into_inner());
+            arrivals.push_back(frame.at_ms);
+            while arrivals.len() > RATE_WINDOW {
+                arrivals.pop_front();
+            }
+        }
         {
             let mut frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
             frames.push_back(frame.clone());
@@ -240,15 +267,15 @@ impl Device {
         self.tx.subscribe()
     }
 
-    /// Frames per second over the frames still held in the ring, or 0 when
-    /// fewer than two are held or the newest is over ten seconds old.
+    /// Frames per second over the last few arrivals, or 0 when fewer than two
+    /// have arrived or the newest is over ten seconds old.
     pub fn recent_fps(&self) -> f64 {
-        let frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
-        let (Some(first), Some(last)) = (frames.front(), frames.back()) else { return 0.0 };
-        if frames.len() < 2 || now_ms().saturating_sub(last.at_ms) > 10_000 || last.at_ms <= first.at_ms {
+        let arrivals = self.arrivals.lock().unwrap_or_else(|p| p.into_inner());
+        let (Some(&first), Some(&last)) = (arrivals.front(), arrivals.back()) else { return 0.0 };
+        if arrivals.len() < 2 || now_ms().saturating_sub(last) > 10_000 || last <= first {
             return 0.0;
         }
-        let fps = (frames.len() - 1) as f64 * 1000.0 / (last.at_ms - first.at_ms) as f64;
+        let fps = (arrivals.len() - 1) as f64 * 1000.0 / (last - first) as f64;
         (fps * 100.0).round() / 100.0
     }
 
@@ -262,6 +289,7 @@ impl Device {
             "telemetry_at_ms": self.telemetry().map(|(at, _)| at),
             "frames_in": self.frames_in.load(Ordering::Relaxed),
             "frames_dropped": self.frames_dropped.load(Ordering::Relaxed),
+            "frames_rejected": self.frames_rejected.load(Ordering::Relaxed),
             "subscribers": self.tx.receiver_count(),
             "insights": self.insights.lock().unwrap_or_else(|p| p.into_inner()).len(),
             "max_fps": self.def.max_fps,
@@ -314,6 +342,7 @@ impl DeviceHub {
                     "max_fps": d.def.max_fps,
                     "frames_in": d.frames_in.load(Ordering::Relaxed),
                     "frames_dropped": d.frames_dropped.load(Ordering::Relaxed),
+                    "frames_rejected": d.frames_rejected.load(Ordering::Relaxed),
                     "last_frame_age_ms": latest.map(|f| now.saturating_sub(f.at_ms)),
                     "last_telemetry_age_ms": d.telemetry().map(|(at, _)| now.saturating_sub(at)),
                     "subscribers": d.tx.receiver_count(),
@@ -721,6 +750,34 @@ mod tests {
         assert!(matches!(Device::new(small).push_frame(Bytes::from_static(PNG)), Err(IngestError::Invalid(_))));
         let big = json!({"x": "y".repeat(MAX_TELEMETRY_BYTES)});
         assert!(d.push_telemetry(big).is_err());
+    }
+
+    #[test]
+    fn the_frame_rate_is_measured_even_when_only_one_frame_is_kept() {
+        // 2.5.1 measured fps over the ring, so a keep=1 camera always read 0.
+        let d = Device::new(def(1000.0, 1));
+        for _ in 0..5 {
+            d.push_frame(Bytes::from_static(PNG)).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let fps = d.recent_fps();
+        assert!(fps > 10.0 && fps < 60.0, "fps {fps}");
+    }
+
+    #[test]
+    fn a_tiny_max_fps_drops_frames_instead_of_panicking() {
+        let d = Device::new(def(1e-300, 2));
+        d.push_frame(Bytes::from_static(PNG)).unwrap();
+        assert_eq!(d.push_frame(Bytes::from_static(PNG)), Err(IngestError::TooFast));
+    }
+
+    #[test]
+    fn rejected_frames_are_counted() {
+        let d = Device::new(def(1000.0, 2));
+        assert!(d.push_frame(Bytes::from_static(b"nope")).is_err());
+        assert!(d.push_frame(Bytes::new()).is_err());
+        assert_eq!(d.describe()["frames_rejected"], 2);
+        assert_eq!(d.describe()["frames_in"], 0);
     }
 
     #[test]

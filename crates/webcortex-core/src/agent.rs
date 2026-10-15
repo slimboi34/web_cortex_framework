@@ -510,6 +510,9 @@ impl AgentRuntime {
         let SuspendedRun { state: mut st, calls, gated, mut results, approval_id, .. } = suspended;
         let call = &calls[gated];
         app.recorder().run_started(&st.run_id, &st.def.name, &st.caller.id, st.depth);
+        // The approved call runs before `drive` does; dropped there, the run
+        // is cancelled just the same.
+        let mut guard = CancelGuard { app, run_id: Some(st.run_id.clone()) };
 
         if approve {
             self.audit.record(AuditEvent::approval_decided(
@@ -539,17 +542,29 @@ impl AgentRuntime {
             results.push(tool_result(&call.id, &json!({"error": msg}), true));
         }
 
-        match self.execute_calls(app, &mut st, &calls, gated + 1, results).await {
+        let result = match self.execute_calls(app, &mut st, &calls, gated + 1, results).await {
             CallsOutcome::Done(results) => {
                 st.conversation.messages.push(Message { role: "user".into(), content: Value::Array(results) });
                 self.drive(app, st).await
             }
             CallsOutcome::Suspended { gated, results } => self.suspend(app, st, calls, gated, results),
-        }
+        };
+        guard.run_id = None;
+        result
     }
 
     /// The main loop. Everything mutable lives in `st`.
-    async fn drive(&self, app: &App, mut st: RunState) -> RunResult {
+    async fn drive(&self, app: &App, st: RunState) -> RunResult {
+        // The future driving a run is dropped when its request times out or
+        // its client goes away; the run then never reaches `finish`. The
+        // guard takes it out of the status view's in-flight list either way.
+        let mut guard = CancelGuard { app, run_id: Some(st.run_id.clone()) };
+        let result = self.drive_steps(app, st).await;
+        guard.run_id = None;
+        result
+    }
+
+    async fn drive_steps(&self, app: &App, mut st: RunState) -> RunResult {
         let max_steps = st.entry.max_steps.unwrap_or(12);
 
         loop {
@@ -1166,6 +1181,21 @@ fn outcome_code(status: RunStatus, steps: &[Step]) -> Option<&'static str> {
                 .find_map(|s| s.code.as_deref().and_then(crate::errors::lookup).map(|e| e.code))
                 .unwrap_or("WC300"),
         ),
+    }
+}
+
+/// Reports a run as cancelled if it is dropped before `drive` returns.
+struct CancelGuard<'a> {
+    app: &'a App,
+    run_id: Option<String>,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(run_id) = self.run_id.take() {
+            tracing::info!(run_id = %run_id, "agent run cancelled before it finished (timeout or client gone)");
+            self.app.recorder().run_cancelled(&run_id);
+        }
     }
 }
 

@@ -23,7 +23,7 @@ use std::panic::AssertUnwindSafe;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -39,6 +39,17 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// connection is cut off, as before.
 const DRAIN_BYTES: usize = 8 * 1024 * 1024;
 const DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+/// The longest a connection may take to send a request's headers, and the
+/// longest an idle keep-alive connection is held open waiting for the next
+/// one. Without it a client that opens connections and sends nothing (or a
+/// header a byte at a time) holds a socket each, indefinitely.
+const MAX_HEADER_READ_SECS: u64 = 30;
+
+/// The header read timeout for this app: its request timeout, at most
+/// [`MAX_HEADER_READ_SECS`], at least one second.
+fn header_read_timeout(request_timeout_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(request_timeout_secs.clamp(1, MAX_HEADER_READ_SECS))
+}
 
 pub async fn serve(app: Arc<App>) -> Result<(), String> {
     serve_with_shutdown(app, shutdown_signal()).await
@@ -100,19 +111,29 @@ where
                     }
                 };
                 let app = app.clone();
+                let header_timeout = header_read_timeout(app.manifest.server.request_timeout_secs);
                 let permit = tracker.clone().acquire_owned().await.ok();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    // hyper's header timeout starts once it reads; the auto
+                    // builder's protocol sniff before that waits forever, so
+                    // a client that connects and sends nothing is dropped here.
+                    if tokio::time::timeout(header_timeout, stream.readable()).await.is_err() {
+                        tracing::debug!(%peer, "connection sent nothing; closed");
+                        return;
+                    }
                     let io = TokioIo::new(stream);
                     let svc = service_fn(move |req| {
                         let app = app.clone();
                         let client_ip = peer.ip().to_string();
                         async move { Ok::<_, Infallible>(handle(app, req, client_ip).await) }
                     });
-                    if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(io, svc)
-                        .await
-                    {
+                    let mut builder = auto::Builder::new(TokioExecutor::new());
+                    // hyper applies a header read timeout only when it has a
+                    // timer; without one, slow or silent clients were held forever.
+                    builder.http1().timer(TokioTimer::new()).header_read_timeout(header_timeout);
+                    builder.http2().timer(TokioTimer::new());
+                    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
                         tracing::debug!(%peer, error = %e, "connection closed");
                     }
                 });
@@ -362,9 +383,28 @@ async fn route_request(
         return (res, principal_id);
     }
 
-    let body = match read_body(req).await {
-        Ok(b) => b,
-        Err(mut res) => {
+    // A model loop routinely outlasts an ordinary handler's ceiling, and a
+    // timeout drops the run mid-flight.
+    let limits = &app.manifest.server;
+    let secs = if app.runs_a_model_loop(&method, &path) {
+        limits.agent_timeout_secs.max(limits.request_timeout_secs)
+    } else {
+        limits.request_timeout_secs
+    };
+
+    // The body is read under the same limit: a client that announces a body
+    // and then sends it a byte at a time must not hold the request open.
+    let body_timeout = std::time::Duration::from_secs(secs.max(1));
+    let body = match tokio::time::timeout(body_timeout, read_body(req)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(mut res)) => {
+            finish_cors(app, &mut res, origin.as_deref());
+            return (res, principal_id);
+        }
+        Err(_) => {
+            let mut res =
+                WebCortexResponse::coded(408, "WC216", "the request body did not arrive within the request timeout");
+            res.headers.push(("connection".into(), "close".into()));
             finish_cors(app, &mut res, origin.as_deref());
             return (res, principal_id);
         }
@@ -374,14 +414,6 @@ async fn route_request(
     let mut res = if let Some(rest) = path.strip_prefix(&prefix) {
         control_plane(app, &method, rest, &body, &principal, request_id).await
     } else {
-        // A model loop routinely outlasts an ordinary handler's ceiling, and a
-        // timeout drops the run mid-flight.
-        let limits = &app.manifest.server;
-        let secs = if app.runs_a_model_loop(&method, &path) {
-            limits.agent_timeout_secs.max(limits.request_timeout_secs)
-        } else {
-            limits.request_timeout_secs
-        };
         let timeout = std::time::Duration::from_secs(secs);
         let dispatch = app.dispatch(WebCortexRequest {
             method,
@@ -435,7 +467,11 @@ async fn read_body(req: Request<Incoming>) -> Result<Bytes, WebCortexResponse> {
     let mut body = req.into_body();
     let mut buf = bytes::BytesMut::new();
     while let Some(frame) = body.frame().await {
-        let Ok(frame) = frame else { return Err(too_large()) };
+        // A body that fails to decode (a malformed chunk size, a connection
+        // cut mid-body) is a bad request, not an oversized one.
+        let Ok(frame) = frame else {
+            return Err(WebCortexResponse::coded(400, "WC205", "malformed or incomplete request body"));
+        };
         let Ok(data) = frame.into_data() else { continue };
         if buf.len() + data.len() > MAX_BODY_BYTES {
             let _ = tokio::time::timeout(DRAIN_TIME, async {

@@ -108,6 +108,8 @@ pub static CATALOGUE: &[ErrorInfo] = &[
        "The request conflicts with the current state of the resource; re-read it and retry."),
     e!("WC215", "http", Some(503), "Unavailable",
        "A subsystem this route needs is not running in this process (for example the agent runtime). Check the server log at boot."),
+    e!("WC216", "http", Some(408), "Request body too slow",
+       "The client announced a body but did not finish sending it within request_timeout (agent_timeout on agent, behaviour and flow routes). Send the whole body promptly, or raise the limit on WebCortex(...)."),
 
     // ---- WC3xx agents and providers -------------------------------------
     e!("WC300", "agent", Some(502), "Agent run failed",
@@ -167,7 +169,7 @@ pub static CATALOGUE: &[ErrorInfo] = &[
     e!("WC504", "devices", Some(429), "Frame faster than max_fps",
        "The device is sending faster than its max_fps; the frame was dropped. Slow the sender or raise max_fps."),
     e!("WC505", "devices", Some(422), "Invalid frame or telemetry",
-       "The frame is not a PNG/JPEG/GIF/WebP, is over max_frame_bytes, or the telemetry is not a JSON body."),
+       "The frame is not a PNG/JPEG/GIF/WebP, is over max_frame_bytes, or the telemetry is not a JSON body (a body that is not JSON at all is answered 400; the rest 422)."),
     e!("WC506", "devices", Some(502), "Camera unreachable",
        "A pulled IP camera did not answer with a snapshot. Check its URL, its bearer_env, and that it is reachable from the server."),
 
@@ -208,6 +210,7 @@ pub fn code_for_status(status: u16) -> &'static str {
         403 => "WC602",
         404 => "WC207",
         405 => "WC202",
+        408 => "WC216",
         409 => "WC214",
         413 => "WC204",
         422 => "WC206",

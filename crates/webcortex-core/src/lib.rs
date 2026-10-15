@@ -47,13 +47,31 @@ pub fn init_tracing(default_level: &str) {
     let filter = EnvFilter::try_from_env("WEBCORTEX_LOG")
         .unwrap_or_else(|_| EnvFilter::new(default_level));
     // Colour only on a terminal: redirected to a file or a platform's log
-    // collector, escape codes are noise around every field. NO_COLOR is honoured.
-    let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var_os("NO_COLOR").is_none();
+    // collector, escape codes are noise around every field. NO_COLOR is honoured
+    // when set to anything but the empty string, as no-color.org specifies.
+    let ansi = use_colour(
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        std::env::var_os("NO_COLOR").as_deref(),
+    );
     let _ = fmt().with_env_filter(filter).with_target(false).with_ansi(ansi).try_init();
+}
+
+fn use_colour(terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    terminal && no_color.is_none_or(|v| v.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn colour_only_on_a_terminal_without_no_color() {
+        use std::ffi::OsStr;
+        assert!(super::use_colour(true, None));
+        assert!(!super::use_colour(false, None));
+        assert!(!super::use_colour(true, Some(OsStr::new("1"))));
+        // no-color.org: an empty NO_COLOR does not disable colour.
+        assert!(super::use_colour(true, Some(OsStr::new(""))));
+    }
+
     use super::*;
     use manifest::derive_tool_name;
 

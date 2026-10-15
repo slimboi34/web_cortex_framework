@@ -3,6 +3,52 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.5.2] — 2026-10-15
+
+Fixes from a second round of testing, aimed at what the first did not cover: the
+2.5.1 changes themselves, WebSockets and the device hub under real clients (slow,
+abrupt, oversized, hundreds at once), agent runs that are abandoned part-way, and
+malformed or deliberately slow HTTP. No API changes.
+
+### Fixed
+
+- **An agent run whose request timed out, or whose client went away, stayed "in
+  flight" in the status view forever** — over HTTP (504 or a dropped connection) and
+  over an agent WebSocket (`agent_timeout`). It never reached `recent` or the per-agent
+  tallies, and after 10,000 such runs new runs stopped being tracked at all. A dropped
+  run is now recorded with the outcome `cancelled` and counted in a new per-agent
+  `cancelled` tally; this includes a run resumed from an approval.
+- **Slow and silent clients held connections forever.** No header read timeout was
+  in effect (hyper applies one only when given a timer), so a client that connected
+  and sent nothing, sent headers a byte at a time, or announced a body and never sent
+  it kept a socket each, indefinitely. Headers (and an idle keep-alive connection) now
+  have the request timeout, at most 30 s; the body must arrive within the route's
+  timeout or the answer is **408 `WC216`** (a new code).
+- **A malformed chunked body was answered 413 "body too large"**; it is 400 `WC205`.
+- **A camera with `keep=1` always reported 0 fps** in the status view: the rate was
+  measured over the ring buffer, which then holds one frame. It is measured over the
+  last 32 arrivals.
+- **A frame over `max_frame_bytes` sent on a device socket reset the connection with
+  no reason anywhere.** The server logs a warning naming the device and closes with
+  1009; frames refused as invalid (not an image, empty, too large, sent to a sensor)
+  are counted as `frames_rejected` per device, so a camera sending garbage over a
+  socket is visible in `/status` and `webcortex status`.
+- A vanishingly small `max_fps` (e.g. `1e-300`) panicked on every frame; such a
+  device now simply drops everything after its first frame.
+- `GET /devices/<undeclared>/…` answered `WC201` "no route"; it is `WC501` "unknown
+  device" (still 404), whose hint says how to declare one. A declared device's
+  missing route, and paths outside the device prefix, are still `WC201`.
+- Status percentiles for samples of 0 µs read `0.001 ms` against a maximum of `0.0`.
+- `NO_COLOR=` (set but empty) disabled colour; per no-color.org only a non-empty
+  value does.
+- `webcortex.client.AgentSocket.ask` raised `WebSocketError` with the message only;
+  the error now carries `.code` and `.hint` (and the message is prefixed `[WCnnn]`).
+
+### Changed
+
+- `WC505`'s hint says that telemetry which is not JSON at all is answered 400, the
+  other `WC505` cases 422 (the statuses are unchanged).
+
 ## [2.5.1] — 2026-10-15
 
 Fixes from black-box testing the published 2.5.0 wheel the way a new user and a coding

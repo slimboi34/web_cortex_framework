@@ -24,7 +24,7 @@ CODE_RE = re.compile(r"\bWC\d{3}\b")
 DOCS_URL = "https://slimboi34.github.io/web_cortex_framework/error-codes/"
 
 _STATUS_DEFAULTS = {
-    400: "WC205", 401: "WC601", 403: "WC602", 404: "WC207", 405: "WC202", 409: "WC214",
+    400: "WC205", 401: "WC601", 403: "WC602", 404: "WC207", 405: "WC202", 408: "WC216", 409: "WC214",
     413: "WC204", 422: "WC206", 423: "WC502", 426: "WC213", 429: "WC401", 500: "WC001",
     502: "WC300", 503: "WC215", 504: "WC203", 508: "WC403",
 }

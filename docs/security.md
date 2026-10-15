@@ -183,7 +183,8 @@ footgun in local development.
 | Limit | Default | Configurable |
 |---|---|---|
 | Body size | 32 MB | compile-time |
-| Request timeout | 30s | `request_timeout` |
+| Request timeout | 30s | `request_timeout` (`agent_timeout` on agent, behaviour and flow routes); the body must arrive within it too, or 408 `WC216` |
+| Header read / idle connection | the request timeout, at most 30s | `request_timeout` |
 | Shutdown drain | 25s | `shutdown_timeout` |
 | Invocation depth | 8 | not yet (`server.max_invocation_depth`) |
 

@@ -25,7 +25,7 @@ def doctor(app: "WebCortex", *, online: bool = False, url: str | None = None,
     return app.doctor(online=online, url=url, key=key)
 
 
-__version__ = "2.5.1"
+__version__ = "2.5.2"
 
 __all__ = [
     "WebCortex",
