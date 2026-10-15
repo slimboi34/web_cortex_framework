@@ -55,8 +55,8 @@ export interface ClientOptions {{
         if is_internal(r) {
             continue;
         }
-        if let Some(schema) = &r.input_schema {
-            if schema.get("properties").and_then(|p| p.as_object()).is_some_and(|p| !p.is_empty()) {
+        if let Some(schema) = &r.input_schema
+            && schema.get("properties").and_then(|p| p.as_object()).is_some_and(|p| !p.is_empty()) {
                 let _ = writeln!(
                     out,
                     "export interface {}Params {}\n",
@@ -64,7 +64,6 @@ export interface ClientOptions {{
                     ts_object(schema, 0)
                 );
             }
-        }
         if let Some(shape) = result_object_schema(r) {
             let _ = writeln!(
                 out,

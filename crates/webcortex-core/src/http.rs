@@ -80,11 +80,10 @@ impl WebCortexRequest {
         if let Some(v) = self.query.get(name) {
             return Some(coerce_scalar(v));
         }
-        if let Ok(serde_json::Value::Object(map)) = self.json_body() {
-            if let Some(v) = map.get(name) {
+        if let Ok(serde_json::Value::Object(map)) = self.json_body()
+            && let Some(v) = map.get(name) {
                 return Some(v.clone());
             }
-        }
         None
     }
 

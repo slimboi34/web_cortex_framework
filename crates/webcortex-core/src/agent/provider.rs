@@ -608,21 +608,19 @@ pub fn parse_openai(payload: &Value, model: &str) -> Result<ProviderResponse, St
 /// return structured output" failures into successes.
 pub fn recover_json(text: &str) -> Option<Value> {
     let trimmed = text.trim();
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        if v.is_object() || v.is_array() {
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed)
+        && (v.is_object() || v.is_array()) {
             return Some(v);
         }
-    }
     let unfenced = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
         .and_then(|s| s.strip_suffix("```"))
         .map(str::trim);
-    if let Some(inner) = unfenced {
-        if let Ok(v) = serde_json::from_str::<Value>(inner) {
+    if let Some(inner) = unfenced
+        && let Ok(v) = serde_json::from_str::<Value>(inner) {
             return Some(v);
         }
-    }
     // The first balanced `{ … }` in the text.
     let start = trimmed.find('{')?;
     let mut depth = 0i32;

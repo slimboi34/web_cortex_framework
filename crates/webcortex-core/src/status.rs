@@ -400,11 +400,10 @@ impl Recorder {
             "finished_at_ms": unix_ms(),
         }));
         drop(book);
-        if let Some(code) = s.code {
-            if s.status == "failed" {
+        if let Some(code) = s.code
+            && s.status == "failed" {
                 self.record_failure("agent", &format!("agent {}", s.agent), code, s.run_id);
             }
-        }
     }
 
     pub fn watcher_run(&self, name: &str, status: &str, code: Option<&str>) {

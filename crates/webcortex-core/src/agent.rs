@@ -557,11 +557,10 @@ impl AgentRuntime {
             if st.usage.steps >= max_steps {
                 return self.finish(app, st, RunStatus::StepLimit, None);
             }
-            if let Some(budget) = st.entry.token_budget {
-                if st.usage.total_tokens() >= budget {
+            if let Some(budget) = st.entry.token_budget
+                && st.usage.total_tokens() >= budget {
                     return self.finish(app, st, RunStatus::BudgetExhausted, None);
                 }
-            }
             if st.budget.exhausted() {
                 return self.finish(app, st, RunStatus::BudgetExhausted, None);
             }
@@ -693,8 +692,8 @@ impl AgentRuntime {
             let started = std::time::Instant::now();
 
             // 0. A handoff: swap the agent in control and carry on.
-            if let Some(target) = call.name.strip_prefix("transfer_to_") {
-                if st.def.handoffs.iter().any(|h| h == target) {
+            if let Some(target) = call.name.strip_prefix("transfer_to_")
+                && st.def.handoffs.iter().any(|h| h == target) {
                     match self.handoff(app, st, target, &call.arguments).await {
                         Ok(msg) => {
                             st.steps.push(Step {
@@ -717,7 +716,6 @@ impl AgentRuntime {
                     }
                     continue;
                 }
-            }
 
             // 1. Is the tool one this agent was given?
             if !st.def.tools.iter().any(|t| t == &call.name) {
@@ -1121,11 +1119,10 @@ impl AgentRuntime {
         self.audit
             .record(AuditEvent::agent_finished(&st.run_id, &st.def.name, status, &st.usage));
         app.ledger().count_run();
-        if status != RunStatus::AwaitingApproval {
-            if let Some(key) = &st.session_key {
+        if status != RunStatus::AwaitingApproval
+            && let Some(key) = &st.session_key {
                 app.sessions().save(key.clone(), st.conversation.clone());
             }
-        }
         for step in &mut st.steps {
             if let (Some(code), None) = (&step.code, &step.hint) {
                 step.hint = Some(crate::errors::hint(code).to_string());

@@ -298,22 +298,20 @@ async fn call_tool(app: &App, params: &Value, caller: &Principal, request_id: &s
         .ok_or((-32602, "tools/call requires a 'name'".to_string()))?;
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
-    if may_observe(app, caller) {
-        if let Some(result) = call_builtin(app, name, &args) {
+    if may_observe(app, caller)
+        && let Some(result) = call_builtin(app, name, &args) {
             return Ok(result);
         }
-    }
 
     // A gated tool is not callable straight off the MCP surface: approval gates
     // exist so a human sees the call first, and honouring them only inside the
     // agent loop would leave an obvious way around them.
-    if let Some(route) = app.route_for_tool(name) {
-        if route.approval == crate::manifest::Approval::Required {
+    if let Some(route) = app.route_for_tool(name)
+        && route.approval == crate::manifest::Approval::Required {
             let message = format!("tool {name:?} requires human approval and cannot be invoked directly over MCP");
             app.recorder().record_failure("mcp", &format!("tools/call {name}"), "WC309", request_id);
             return Ok(tool_error(&message, "WC309"));
         }
-    }
 
     // The MCP caller's own principal is used — no scope substitution. This is
     // the same authority the caller would have over plain HTTP.

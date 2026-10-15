@@ -1072,11 +1072,10 @@ impl Manifest {
             if !d.max_fps.is_finite() || d.max_fps <= 0.0 || d.keep == 0 || d.max_frame_bytes == 0 {
                 return Err(format!("device {:?}: max_fps, keep and max_frame_bytes must be positive", d.name));
             }
-            if let Some(src) = &d.source {
-                if !(src.url.starts_with("http://") || src.url.starts_with("https://")) {
+            if let Some(src) = &d.source
+                && !(src.url.starts_with("http://") || src.url.starts_with("https://")) {
                     return Err(format!("device {:?}: source must be an http(s) URL", d.name));
                 }
-            }
         }
         let mut watcher_seen = std::collections::HashSet::new();
         for w in &self.watchers {

@@ -273,11 +273,10 @@ pub fn code_in(text: &str) -> Option<&'static str> {
         if bytes[i] == b'W' && bytes[i + 1] == b'C' && bytes[i + 2..i + 5].iter().all(u8::is_ascii_digit) {
             let after_ok = bytes.get(i + 5).is_none_or(|b| !b.is_ascii_digit());
             let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-            if after_ok && before_ok {
-                if let Some(info) = lookup(&text[i..i + 5]) {
+            if after_ok && before_ok
+                && let Some(info) = lookup(&text[i..i + 5]) {
                     return Some(info.code);
                 }
-            }
         }
         i += 1;
     }

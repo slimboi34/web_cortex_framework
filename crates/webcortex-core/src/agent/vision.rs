@@ -90,14 +90,13 @@ pub fn input_images(value: Option<&Value>) -> Result<Vec<Value>, String> {
         .enumerate()
         .map(|(i, v)| {
             let block = image_block(v).map_err(|e| format!("images[{i}]: {e}"))?;
-            if let Some(url) = block["source"]["url"].as_str() {
-                if names_an_internal_host(url) {
+            if let Some(url) = block["source"]["url"].as_str()
+                && names_an_internal_host(url) {
                     return Err(format!(
                         "images[{i}]: an image url may not point at a loopback, private, \
                          link-local or metadata address; send the bytes instead"
                     ));
                 }
-            }
             Ok(block)
         })
         .collect()

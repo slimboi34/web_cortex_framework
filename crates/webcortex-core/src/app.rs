@@ -245,15 +245,14 @@ impl App {
         let ttl = Duration::from_secs(self.manifest.server.approval_ttl_secs);
         let mut map = self.approvals.lock().unwrap_or_else(|p| p.into_inner());
         map.retain(|_, r| r.created.elapsed() <= ttl);
-        if map.len() >= 1000 {
-            if let Some(oldest) = map
+        if map.len() >= 1000
+            && let Some(oldest) = map
                 .iter()
                 .min_by_key(|(_, r)| r.created)
                 .map(|(k, _)| k.clone())
             {
                 map.remove(&oldest);
             }
-        }
         map.insert(run.approval_id.clone(), run);
     }
 
@@ -494,8 +493,8 @@ impl App {
         // The emergency stop sits here, after authentication and before the
         // op, so it covers HTTP, agent tool calls, behaviours, flows, MCP and
         // approvals resumed after the halt — they all come through dispatch.
-        if route.actuator {
-            if let Some(state) = self.halted() {
+        if route.actuator
+            && let Some(state) = self.halted() {
                 let reason = state.get("reason").and_then(|r| r.as_str()).unwrap_or("");
                 return WebCortexResponse::coded(
                     423,
@@ -507,7 +506,6 @@ impl App {
                     ),
                 );
             }
-        }
 
         match self.execute(&route.op, req).await {
             Ok(res) => res,
@@ -1055,11 +1053,10 @@ impl App {
 
         let mut path_params = std::collections::BTreeMap::new();
         for seg in route.path.split('/') {
-            if let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                if let Some(v) = obj.get(name) {
+            if let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
+                && let Some(v) = obj.get(name) {
                     path_params.insert(name.to_string(), json_to_path_string(v));
                 }
-            }
         }
 
         let concrete_path = substitute_path(&route.path, &path_params);

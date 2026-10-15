@@ -161,11 +161,10 @@ async fn ingest(app: Arc<App>, name: String, principal: Principal, mut ws: Socke
             Ok(Message::Close(_)) | Err(_) => break,
             Ok(_) => None,
         };
-        if let Some(reply) = reply {
-            if ws.send(reply).await.is_err() {
+        if let Some(reply) = reply
+            && ws.send(reply).await.is_err() {
                 break;
             }
-        }
     }
     tracing::info!(device = %name, "device disconnected");
 }

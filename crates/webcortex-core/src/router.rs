@@ -43,8 +43,8 @@ impl Router {
     }
 
     pub fn find(&self, method: &str, path: &str) -> Result<Matched, MatchError> {
-        if let Some(router) = self.by_method.get(&method.to_ascii_uppercase()) {
-            if let Ok(m) = router.at(path) {
+        if let Some(router) = self.by_method.get(&method.to_ascii_uppercase())
+            && let Ok(m) = router.at(path) {
                 let path_params = m
                     .params
                     .iter()
@@ -52,7 +52,6 @@ impl Router {
                     .collect();
                 return Ok(Matched { route_id: *m.value, path_params });
             }
-        }
         if self.all_paths.at(path).is_ok() {
             return Err(MatchError::MethodNotAllowed);
         }

@@ -296,11 +296,10 @@ async fn route_request(
     // the query.
     if upgrade {
         let key_header = app.authenticator.api_key_header().to_string();
-        if !headers.contains_key(&key_header) && !headers.contains_key("authorization") {
-            if let Some(token) = query.get("access_token") {
+        if !headers.contains_key(&key_header) && !headers.contains_key("authorization")
+            && let Some(token) = query.get("access_token") {
                 headers.insert(key_header, token.clone());
             }
-        }
     }
 
     // 2. Authenticate. Done before rate limiting is *keyed*, but the limiter

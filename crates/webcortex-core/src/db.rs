@@ -195,21 +195,18 @@ impl std::fmt::Display for QueryError {
 /// other representations before giving up and returning null.
 fn decode_column(row: &sqlx::sqlite::SqliteRow, i: usize, type_name: &str) -> Value {
     let upper = type_name.to_ascii_uppercase();
-    if upper.contains("INT") {
-        if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+    if upper.contains("INT")
+        && let Ok(v) = row.try_get::<Option<i64>, _>(i) {
             return v.map(Value::from).unwrap_or(Value::Null);
         }
-    }
-    if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
-        if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+    if (upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB"))
+        && let Ok(v) = row.try_get::<Option<f64>, _>(i) {
             return v.map(Value::from).unwrap_or(Value::Null);
         }
-    }
-    if upper.contains("BOOL") {
-        if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
+    if upper.contains("BOOL")
+        && let Ok(v) = row.try_get::<Option<bool>, _>(i) {
             return v.map(Value::from).unwrap_or(Value::Null);
         }
-    }
     if let Ok(v) = row.try_get::<Option<String>, _>(i) {
         return v.map(Value::from).unwrap_or(Value::Null);
     }

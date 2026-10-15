@@ -170,14 +170,13 @@ impl BehaviourContext {
         if let Err(e) = self.budget.charge(input.saturating_add(output).saturating_add(cache)) {
             return Err(BehaviourHalted::new_err(e));
         }
-        if let Some(budget) = self.token_budget {
-            if total > budget {
+        if let Some(budget) = self.token_budget
+            && total > budget {
                 return Err(BehaviourHalted::new_err(format!(
                     "behaviour {:?} exhausted its token budget of {budget}",
                     self.behaviour
                 )));
             }
-        }
         Ok(())
     }
 
@@ -203,14 +202,13 @@ impl BehaviourContext {
         }
         // An approval gate must stop a behaviour just as it stops an agent,
         // otherwise wrapping a gated tool in a behaviour would launder it.
-        if let Some(route) = self.app.route_for_tool(tool) {
-            if route.approval == webcortex_core::manifest::Approval::Required {
+        if let Some(route) = self.app.route_for_tool(tool)
+            && route.approval == webcortex_core::manifest::Approval::Required {
                 return Err(BehaviourHalted::new_err(format!(
                     "tool {tool:?} requires human approval and cannot run unattended \
                      inside a behaviour"
                 )));
             }
-        }
         Ok(())
     }
 
@@ -305,8 +303,8 @@ impl BehaviourContext {
 
 /// One `(tool, kwargs)` request to `gather`.
 fn parse_gather_item(item: &Bound<'_, PyAny>) -> PyResult<(String, serde_json::Value)> {
-    if let Ok(t) = item.cast::<pyo3::types::PyTuple>() {
-        if t.len() == 1 || t.len() == 2 {
+    if let Ok(t) = item.cast::<pyo3::types::PyTuple>()
+        && (t.len() == 1 || t.len() == 2) {
             let name: String = t.get_item(0)?.extract()?;
             let args = if t.len() == 2 { py_to_json(&t.get_item(1)?)? } else { serde_json::json!({}) };
             if !args.is_object() {
@@ -314,7 +312,6 @@ fn parse_gather_item(item: &Bound<'_, PyAny>) -> PyResult<(String, serde_json::V
             }
             return Ok((name, args));
         }
-    }
     if let Ok(s) = item.extract::<String>() {
         return Ok((s, serde_json::json!({})));
     }
@@ -805,17 +802,15 @@ pub fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
 
     // Dataclasses, pydantic models, and anything else with a standard hook.
     for attr in ["model_dump", "_asdict"] {
-        if let Ok(method) = value.getattr(attr) {
-            if method.is_callable() {
+        if let Ok(method) = value.getattr(attr)
+            && method.is_callable() {
                 return py_to_json(&method.call0()?);
             }
-        }
     }
-    if let Ok(d) = value.getattr("__dict__") {
-        if d.cast::<PyDict>().is_ok() {
+    if let Ok(d) = value.getattr("__dict__")
+        && d.cast::<PyDict>().is_ok() {
             return py_to_json(&d);
         }
-    }
 
     Err(PyValueError::new_err(format!(
         "cannot convert {} to JSON",

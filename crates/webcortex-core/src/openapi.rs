@@ -75,8 +75,8 @@ fn operation(r: &Route) -> Value {
 
     // Only methods with a body get a requestBody, and path params are stripped
     // from it so the schema matches what a client actually sends.
-    if matches!(r.method.as_str(), "POST" | "PUT" | "PATCH") {
-        if let Some(schema) = body_schema(r) {
+    if matches!(r.method.as_str(), "POST" | "PUT" | "PATCH")
+        && let Some(schema) = body_schema(r) {
             op.as_object_mut().unwrap().insert(
                 "requestBody".into(),
                 json!({
@@ -85,7 +85,6 @@ fn operation(r: &Route) -> Value {
                 }),
             );
         }
-    }
     op
 }
 
