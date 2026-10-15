@@ -46,6 +46,7 @@ meaning once released: branch on `WC402`, not on the wording of a message.
 | A failed step | `"code"` on the step: a refused tool `WC307`, a tool that answered with an error carries *that* error's code (a missing argument is `WC206`), a provider failure `WC301`–`WC305` |
 | MCP tool error | `isError: true`, the hint appended to the text, and `structuredContent: {"error": {"code", "message", "hint"}}`; JSON-RPC errors carry `error.data.code` |
 | Watcher insight | `"code"` beside `"error"` when the run failed |
+| WebSocket error message | `{"type": "error", "message", "code", "hint"}` on an open device or agent socket (since 2.5.1) |
 | CLI | `error[WC101]: …` / `hint: …` on stderr, or `{"ok": false, "error": {…}}` with `--json` (and always for `webcortex check`), exit status 1 |
 
 ### From your own handlers
@@ -149,8 +150,8 @@ measured in seconds) take a lock. Measured with `ab`, interleaved against 2.4.0:
 route is within noise (−0.8%), and a flood in which *every* request is a 404 is about 3% slower;
 see
 [benchmarks/diagnostics/RESULTS.md](https://github.com/slimboi34/web_cortex_framework/blob/main/benchmarks/diagnostics/RESULTS.md).
-Percentiles are reported as the upper bound of their bucket, so they are never optimistic and
-within 2x of the truth.
+Percentiles are reported as the upper bound of their bucket, capped at the route's exact
+`max_ms`, so they are never optimistic, within 2x of the truth, and never above the maximum.
 
 ### From the command line
 

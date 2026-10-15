@@ -52,7 +52,11 @@ def _get_json(url: str, key: str | None, timeout: float) -> tuple[int, Any]:
         req.add_header("x-api-key", key)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
-            return res.status, json.loads(res.read() or b"null")
+            try:
+                return res.status, json.loads(res.read() or b"null")
+            except ValueError:
+                # Something answered, but not with JSON: not a WebCortex app.
+                return res.status, None
     except urllib.error.HTTPError as e:
         try:
             return e.code, json.loads(e.read() or b"null")
@@ -175,9 +179,14 @@ def doctor(app: Any, *, online: bool = False, url: str | None = None, key: str |
         if unpriced:
             add(_check("pricing", "ok",
                        f"no app.pricing for {', '.join(unpriced)}: spend is counted, cost is reported as null"))
-        if online:
-            for base, models in endpoints.items():
-                ok, detail = _probe(base, timeout)
+        if online and endpoints:
+            # Concurrently: each probe may wait out the whole timeout, and N
+            # unreachable providers should cost one timeout, not N.
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(8, len(endpoints))) as pool:
+                results = list(pool.map(lambda b: _probe(b, timeout), endpoints))
+            for (base, models), (ok, detail) in zip(endpoints.items(), results):
                 add(_check(f"online:{base}", "ok" if ok else "fail",
                            f"{base} {detail} (for {', '.join(models)})", code=None if ok else "WC303"))
         elif endpoints:
@@ -264,8 +273,9 @@ def doctor(app: Any, *, online: bool = False, url: str | None = None, key: str |
     unbounded = [f"agent {a['name']}" for a in app._agents if not a.get("token_budget")]
     unbounded += [f"behaviour {b['name']}" for b in app._behaviours if not b.get("token_budget")]
     if unbounded:
+        # No code: WC402 means a budget was exhausted, and here there is none.
         add(_check("budgets", "warn", f"no token_budget on {', '.join(unbounded)}: only max_steps bounds a run",
-                   "token_budget=... caps a run's spend (and the whole request tree it starts).", code="WC402"))
+                   "token_budget=... caps a run's spend (and the whole request tree it starts)."))
     elif app._agents or app._behaviours:
         add(_check("budgets", "ok", "every agent and behaviour has a token_budget"))
 
@@ -305,6 +315,13 @@ def doctor(app: Any, *, online: bool = False, url: str | None = None, key: str |
         elif in_use and not url:
             add(_check("port", "fail", f"{probe_host}:{port} is in use by something that is not {app.name}",
                        code="WC104"))
+        elif code:
+            # Something answered, so "nothing answered" would send the reader
+            # looking for a stopped server instead of a wrong --url.
+            other = health.get("app") if isinstance(health, dict) else None
+            what = f"the WebCortex app {other!r}" if other else "something that is not a WebCortex app"
+            add(_check("running", "warn", f"{base} answered {code}, but it is {what}, not {app.name}",
+                       "Check --url (or WEBCORTEX_HOST/WEBCORTEX_PORT) points at this app.", code="WC108"))
         else:
             add(_check("running", "warn", f"nothing answered at {base}", code="WC108"))
     else:
@@ -345,8 +362,14 @@ def fetch_status(app: Any = None, *, url: str | None = None, key: str | None = N
         status, body = _get_json(target, key, timeout)
     except (urllib.error.URLError, OSError) as e:
         raise StatusError("WC108", f"cannot reach {target}: {getattr(e, 'reason', e)}") from None
-    if status != 200 or not isinstance(body, dict):
-        err = (body or {}).get("error", {}) if isinstance(body, dict) else {}
+    err = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(err, dict) and (status != 200 or not isinstance(body, dict) or "requests" not in body):
+        # Not a WebCortex error body and not a status document: whatever is
+        # listening there is not a WebCortex app (or not at this prefix).
+        raise StatusError("WC108", f"{target} answered {status}, but not with a WebCortex status document",
+                          "Check --url (or WEBCORTEX_HOST/WEBCORTEX_PORT) points at the running WebCortex "
+                          "app, without a path.")
+    if status != 200:
         code = err.get("code") or ("WC212" if status == 404 else "WC001")
         raise StatusError(code, f"{target} answered {status}: {err.get('message', body)}", err.get("hint"))
     return body

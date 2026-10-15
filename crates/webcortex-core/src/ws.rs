@@ -138,8 +138,15 @@ fn text(v: Value) -> Message {
     Message::Text(v.to_string().into())
 }
 
-fn error(message: impl Into<String>) -> Message {
-    text(json!({"type": "error", "message": message.into()}))
+/// An error message on an open socket: the same `code` and `hint` an HTTP
+/// error body carries, so a device or agent client can branch on the code.
+fn error(code: &str, message: impl Into<String>) -> Message {
+    text(json!({
+        "type": "error",
+        "message": message.into(),
+        "code": code,
+        "hint": crate::errors::hint(code),
+    }))
 }
 
 async fn ingest(app: Arc<App>, name: String, principal: Principal, mut ws: Socket) {
@@ -152,11 +159,11 @@ async fn ingest(app: Arc<App>, name: String, principal: Principal, mut ws: Socke
                 // Dropping a frame that came too fast is the point of max_fps,
                 // not news worth a message per frame.
                 Ok(_) | Err(IngestError::TooFast) => None,
-                Err(e) => Some(error(e.message())),
+                Err(e) => Some(error(e.code(), e.message())),
             },
             Ok(Message::Text(t)) => match serde_json::from_str::<Value>(t.as_str()) {
-                Ok(v) => device.push_telemetry(v).err().map(|e| error(e.message())),
-                Err(e) => Some(error(format!("telemetry must be JSON: {e}"))),
+                Ok(v) => device.push_telemetry(v).err().map(|e| error(e.code(), e.message())),
+                Err(e) => Some(error("WC505", format!("telemetry must be JSON: {e}"))),
             },
             Ok(Message::Close(_)) | Err(_) => break,
             Ok(_) => None,
@@ -241,8 +248,8 @@ async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: S
         };
         let turn = match parse_turn(&raw, &principal) {
             Ok(t) => t,
-            Err(e) => {
-                if out.send(error(e)).await.is_err() {
+            Err((code, e)) => {
+                if out.send(error(code, e)).await.is_err() {
                     break;
                 }
                 continue;
@@ -275,8 +282,8 @@ async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: S
         }
         let reply = match outcome {
             Ok(Ok(result)) => text(json!({"type": "result", "result": result})),
-            Ok(Err(e)) => error(e),
-            Err(_) => error("the run exceeded agent_timeout_secs"),
+            Ok(Err(e)) => error(crate::errors::classify_run_error(&e), e),
+            Err(_) => error("WC203", "the run exceeded agent_timeout_secs"),
         };
         if out.send(reply).await.is_err() {
             break;
@@ -292,21 +299,22 @@ struct Turn {
     reset: bool,
 }
 
-fn parse_turn(raw: &str, principal: &Principal) -> Result<Turn, String> {
-    let body: Value = serde_json::from_str(raw).map_err(|e| format!("send JSON: {e}"))?;
+/// A turn, or the code and message of why it cannot be run.
+fn parse_turn(raw: &str, principal: &Principal) -> Result<Turn, (&'static str, String)> {
+    let body: Value = serde_json::from_str(raw).map_err(|e| ("WC306", format!("send JSON: {e}")))?;
     let input = body
         .get("input")
         .and_then(|v| v.as_str())
-        .ok_or("each message needs an 'input' string")?
+        .ok_or(("WC306", "each message needs an 'input' string".to_string()))?
         .to_string();
-    let images = crate::agent::vision::input_images(body.get("images"))?;
+    let images = crate::agent::vision::input_images(body.get("images")).map_err(|e| ("WC313", e))?;
     let session_id = body
         .get("session_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     if session_id.is_some() && principal.root_is_anonymous() {
-        return Err("sessions need an authenticated caller".into());
+        return Err(("WC607", "sessions need an authenticated caller".into()));
     }
     let reset = body.get("reset").and_then(|v| v.as_bool()).unwrap_or(false);
     Ok(Turn { input, images, session_id, reset })
@@ -328,11 +336,25 @@ mod tests {
     }
 
     #[test]
+    fn socket_errors_carry_a_code_and_its_hint() {
+        let anon = Principal::anonymous();
+        assert_eq!(parse_turn("not json", &anon).unwrap_err().0, "WC306");
+        assert_eq!(parse_turn(r#"{"inptu": 1}"#, &anon).unwrap_err().0, "WC306");
+        assert_eq!(parse_turn(r#"{"input": "x", "session_id": "s"}"#, &anon).unwrap_err().0, "WC607");
+        let Message::Text(t) = error("WC505", "telemetry must be JSON") else { panic!("text") };
+        let v: Value = serde_json::from_str(t.as_str()).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["code"], "WC505");
+        assert_eq!(v["hint"], crate::errors::hint("WC505"));
+        assert_eq!(v["message"], "telemetry must be JSON");
+    }
+
+    #[test]
     fn a_turn_needs_input_and_valid_images() {
         let anon = Principal::anonymous();
         assert!(parse_turn("{}", &anon).is_err());
         assert!(parse_turn("nope", &anon).is_err());
-        assert!(parse_turn(r#"{"input": "hi", "session_id": "s"}"#, &anon).unwrap_err().contains("authenticated"));
+        assert!(parse_turn(r#"{"input": "hi", "session_id": "s"}"#, &anon).unwrap_err().1.contains("authenticated"));
         let t = parse_turn(r#"{"input": "hi"}"#, &anon).unwrap();
         assert_eq!(t.input, "hi");
         assert!(parse_turn(r#"{"input": "hi", "images": [{"url": "ftp://x"}]}"#, &anon).is_err());

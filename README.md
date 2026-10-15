@@ -87,11 +87,13 @@ prints the lot in a form a coding model can extend.
 ## Start here
 
 ```bash
-uv venv --python 3.13 && uv pip install web-cortex-framework
+uv venv --python 3.13 && source .venv/bin/activate   # puts `webcortex` on PATH
+uv pip install web-cortex-framework
 
-webcortex new myapp                # --template api | fullstack | agent | behaviour | orchestration
+webcortex new myapp                # --template api | fullstack | agent | behaviour | orchestration | robotics | hub
 cd myapp
 export WEBCORTEX_API_KEY=$(webcortex keygen)
+webcortex doctor                   # anything else to set first: other keys, model provider keys
 webcortex dev
 ```
 
@@ -108,7 +110,7 @@ interpreter at request time*. In practice that is most of a CRUD API and all of
 an orchestration.
 
 ```
-$ webcortex check
+$ webcortex dev                # the boot banner
   19 routes, 17 served without touching Python
 ```
 
@@ -497,7 +499,7 @@ tested, the known limits, and what v2 added to the surface.
 
 ## Status
 
-v2.5.0. Working and tested: the manifest IR, router, native ops (static /
+v2.5.1. Working and tested: the manifest IR, router, native ops (static /
 query / proxy / page / files / flow), the free-threaded Python bridge,
 authentication and scopes, rate limiting, CORS, security headers, graceful
 shutdown, Behaviours with concurrent leaves, the agent runtime with handoffs,

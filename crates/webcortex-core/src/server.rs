@@ -168,6 +168,13 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
+    // An agent's WebSocket rides on its POST route, so its GET upgrade is
+    // counted against that route rather than as "(no route)".
+    let ws_upgrade = req
+        .headers()
+        .get(hyper::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
     // A caller's id is echoed and logged, so only a short, plain one is kept.
     let request_id = req
@@ -215,7 +222,12 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
     let target = if path.starts_with(&app.manifest.server.control_prefix) {
         crate::status::Target::Control
     } else {
-        match app.route_id_for(&method, &path) {
+        let id = app.route_id_for(&method, &path).or_else(|| {
+            (ws_upgrade && method == "GET")
+                .then(|| app.route_id_for("POST", &path))
+                .flatten()
+        });
+        match id {
             Some(id) => crate::status::Target::Route(id),
             None => crate::status::Target::Unmatched,
         }

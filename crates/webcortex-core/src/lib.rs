@@ -46,7 +46,10 @@ pub fn init_tracing(default_level: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_env("WEBCORTEX_LOG")
         .unwrap_or_else(|_| EnvFilter::new(default_level));
-    let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+    // Colour only on a terminal: redirected to a file or a platform's log
+    // collector, escape codes are noise around every field. NO_COLOR is honoured.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var_os("NO_COLOR").is_none();
+    let _ = fmt().with_env_filter(filter).with_target(false).with_ansi(ansi).try_init();
 }
 
 #[cfg(test)]

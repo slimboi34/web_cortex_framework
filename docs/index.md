@@ -57,7 +57,7 @@ at request time*.
 In practice, most of a CRUD API is exactly that kind of route.
 
 ```console
-$ webcortex check
+$ webcortex dev                # the boot banner
   12 routes, 11 served without touching Python
 ```
 
@@ -163,7 +163,7 @@ app.agent("assistant", context=["policy"], memory="notes",
 ## Status
 
 !!! warning "Young"
-    v2.5.0, on PyPI as `web-cortex-framework`. Working and tested, but young.
+    v2.5.1, on PyPI as `web-cortex-framework`. Working and tested, but young.
     Read [Deployment](deployment.md#is-it-production-ready) for an honest
     assessment of what it is and is not ready for.
 

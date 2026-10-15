@@ -161,3 +161,71 @@ async fn mcp_hides_the_status_view_from_a_caller_without_admin_once_auth_exists(
     let res = mcp::handle(&app, read, &reader).await.json_value();
     assert!(res["error"].is_object());
 }
+
+#[tokio::test]
+async fn a_failed_run_over_http_sends_its_own_code_in_the_header() {
+    // 2.5.0 sent no x-webcortex-error on a failed run's 502, so the request log
+    // and the status view recorded the generic WC300 beside the run's WC304.
+    let app = app().await;
+    let mut req = WebCortexRequest::synthetic("POST", "/agents/desk");
+    req.body = serde_json::to_vec(&json!({"input": "fail:anthropic 529: overloaded"})).unwrap().into();
+    let res = app.dispatch(req).await;
+    assert_eq!(res.status, 502);
+    assert_eq!(res.json_value()["code"], "WC304");
+    assert_eq!(res.error_code().as_deref(), Some("WC304"));
+
+    // A limit is an outcome, not an error: no header on its 200.
+    let mut req = WebCortexRequest::synthetic("POST", "/agents/tight");
+    req.body = serde_json::to_vec(&json!({"input": "tool:ping {}"})).unwrap().into();
+    let res = app.dispatch(req).await;
+    assert_eq!(res.status, 200);
+    assert!(!res.headers.iter().any(|(k, _)| k == "x-webcortex-error"));
+}
+
+#[tokio::test]
+async fn a_tool_call_missing_a_path_argument_is_wc206_not_no_route() {
+    // 2.5.0 built "/items/" from {} and failed with WC201 "no route", which
+    // sends a model hunting for a route instead of the argument it omitted.
+    let manifest: Manifest = serde_json::from_value(json!({
+        "name": "args",
+        "routes": [
+            {"id": 0, "method": "GET", "path": "/items/{id}", "op": {"kind": "static", "body": {"ok": true}},
+             "tool": {"expose": true, "name": "get_item"}}
+        ]
+    }))
+    .expect("manifest");
+    let app = App::build_without_python(manifest).await.expect("app").into_arc();
+    for args in [json!({}), json!({"id": null}), json!({"id": ""})] {
+        let err = app.call_tool("get_item", &args, vec![]).await.unwrap_err();
+        assert!(err.contains("failed with 422"), "{err}");
+        assert_eq!(webcortex_core::errors::code_in(&err), Some("WC206"), "{err}");
+        assert!(err.contains("\\\"id\\\""), "names the argument: {err}");
+    }
+    assert_eq!(app.call_tool("get_item", &json!({"id": 7}), vec![]).await.unwrap(), json!({"ok": true}));
+
+    let who = Principal::anonymous();
+    let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_item","arguments":{}}}"#;
+    let res = mcp::handle(&app, body, &who).await.json_value();
+    assert_eq!(res["result"]["structuredContent"]["error"]["code"], "WC206");
+}
+
+#[tokio::test]
+async fn mcp_builtins_refuse_a_bad_section_or_a_missing_code() {
+    let app = app().await;
+    let who = Principal::anonymous();
+    let call = |name: &str, args: Value| {
+        serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": name, "arguments": args}})).unwrap()
+    };
+    let res = mcp::handle(&app, &call(mcp::STATUS_TOOL, json!({"section": "bogus"})), &who).await.json_value();
+    assert_eq!(res["result"]["isError"], true);
+    assert_eq!(res["result"]["structuredContent"]["error"]["code"], "WC206");
+    assert!(res["result"]["structuredContent"]["error"]["hint"].as_str().unwrap().contains("requests"));
+
+    let res = mcp::handle(&app, &call(mcp::EXPLAIN_TOOL, json!({})), &who).await.json_value();
+    assert_eq!(res["result"]["structuredContent"]["error"]["code"], "WC206");
+
+    let res = mcp::handle(&app, br#"{"jsonrpc":"2.0","id":9,"method":"nosuch"}"#, &who).await.json_value();
+    assert_eq!(res["error"]["code"], -32601);
+    assert!(res["error"]["data"]["hint"].as_str().unwrap().contains("tools/call"));
+}

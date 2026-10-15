@@ -23,7 +23,7 @@ The consequence: a route whose work is expressible as data never re-enters the
 interpreter. Only routes with genuine custom logic cross the bridge.
 
 ```console
-$ webcortex check
+$ webcortex dev                # the boot banner
   12 routes, 11 served without touching Python
 ```
 

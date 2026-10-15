@@ -1377,11 +1377,25 @@ fn agent_names_all(m: &Manifest) -> std::collections::HashSet<&str> {
 
 /// Closest match by edit distance, for "did you mean" hints on typos.
 fn nearest(needle: &str, haystack: &std::collections::HashSet<String>) -> Option<String> {
+    // A handler's function name (`move`) is the usual mistake for its derived
+    // tool name (`create_arm_move`): prefer a name containing the needle as
+    // whole `_`-separated words over one that is merely a few edits away.
+    let words = |c: &str| {
+        let needle = needle.trim_matches('_');
+        !needle.is_empty()
+            && c != needle
+            && (c.starts_with(&format!("{needle}_"))
+                || c.ends_with(&format!("_{needle}"))
+                || c.contains(&format!("_{needle}_")))
+    };
+    if let Some(c) = haystack.iter().filter(|c| words(c)).min_by_key(|c| (c.len(), c.as_str())) {
+        return Some(c.clone());
+    }
     haystack
         .iter()
         .map(|c| (edit_distance(needle, c), c))
         .filter(|(d, _)| *d <= 3)
-        .min_by_key(|(d, _)| *d)
+        .min_by_key(|(d, c)| (*d, c.as_str()))
         .map(|(_, c)| c.clone())
 }
 
@@ -1429,4 +1443,25 @@ pub fn derive_tool_name(method: &str, path: &str) -> String {
         }
     }
     parts.join("_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nearest;
+
+    fn set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_handler_name_suggests_its_derived_tool_name() {
+        // 2.5.0 suggested the agent "mover" for tools=["move"], one edit away,
+        // when the route's tool was create_arm_move.
+        let tools = set(&["mover", "create_arm_move", "list_things", "get_typed_by_n"]);
+        assert_eq!(nearest("move", &tools).as_deref(), Some("create_arm_move"));
+        assert_eq!(nearest("typed", &tools).as_deref(), Some("get_typed_by_n"));
+        // A typo still finds its near neighbour.
+        assert_eq!(nearest("list_thing", &tools).as_deref(), Some("list_things"));
+        assert_eq!(nearest("zzzzzzzzzz", &tools), None);
+    }
 }

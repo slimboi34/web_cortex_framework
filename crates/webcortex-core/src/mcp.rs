@@ -125,7 +125,16 @@ async fn handle_one(app: &App, req: Value, caller: &Principal, request_id: &str)
         Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
         Err((code, message)) => {
             let wc = if code == -32601 { "WC212" } else { "WC205" };
-            error_obj(id, code, message, wc)
+            let mut obj = error_obj(id, code, message, wc);
+            if code == -32601 {
+                // WC212's own hint lists control-plane GET paths, which is no
+                // help to an MCP client that sent an unknown method.
+                obj["error"]["data"]["hint"] = json!(
+                    "This MCP server implements initialize, ping, tools/list, tools/call, \
+                     resources/list and resources/read."
+                );
+            }
+            obj
         }
     })
 }
@@ -186,7 +195,7 @@ fn builtin_tools(app: &App) -> Vec<Value> {
                             in flight and recent (steps, tokens, cost, outcome), budgets, e-stop, devices \
                             and watchers. Pass section to get one part only.",
             "inputSchema": {"type": "object", "properties": {
-                "section": {"type": "string", "enum": ["requests", "errors", "agents", "usage", "budgets", "estop", "devices"]}
+                "section": {"type": "string", "enum": STATUS_SECTIONS}
             }},
             "annotations": {"readOnlyHint": true, "idempotentHint": true, "destructiveHint": false,
                             "openWorldHint": false, "requiresApproval": false, "actuator": false},
@@ -205,6 +214,18 @@ fn builtin_tools(app: &App) -> Vec<Value> {
     out
 }
 
+/// The sections `webcortex_status` can return on their own.
+const STATUS_SECTIONS: [&str; 7] = ["requests", "errors", "agents", "usage", "budgets", "estop", "devices"];
+
+/// A built-in tool's error result with a hint of its own, shaped like [`tool_error`].
+fn builtin_error(code: &str, message: String, hint: &str) -> Value {
+    json!({
+        "content": [{"type": "text", "text": format!("{message}\n\n[{code}] {hint}")}],
+        "structuredContent": {"error": {"code": code, "message": message, "hint": hint}},
+        "isError": true,
+    })
+}
+
 /// A built-in tool call, or `None` when `name` is not one (or an app tool shadows it).
 fn call_builtin(app: &App, name: &str, args: &Value) -> Option<Value> {
     if app.route_for_tool(name).is_some() {
@@ -213,13 +234,31 @@ fn call_builtin(app: &App, name: &str, args: &Value) -> Option<Value> {
     let value = match name {
         STATUS_TOOL => {
             let all = app.status();
-            match args.get("section").and_then(|s| s.as_str()) {
-                Some(section) if all.get(section).is_some() => json!({ section: all[section] }),
-                _ => all,
+            match args.get("section").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+                None => all,
+                Some(section) if STATUS_SECTIONS.contains(&section) && all.get(section).is_some() => {
+                    json!({ section: all[section] })
+                }
+                // A typo used to return the whole document silently, so the
+                // caller could not tell its filter had been ignored.
+                Some(section) => {
+                    return Some(builtin_error(
+                        "WC206",
+                        format!("unknown status section {section:?}"),
+                        &format!("Pass one of {}, or omit section for everything.", STATUS_SECTIONS.join(", ")),
+                    ));
+                }
             }
         }
         EXPLAIN_TOOL => {
             let code = args.get("code").and_then(|c| c.as_str()).unwrap_or("").trim().to_ascii_uppercase();
+            if code.is_empty() {
+                return Some(builtin_error(
+                    "WC206",
+                    "missing required argument \"code\"".into(),
+                    "Pass the code to explain, e.g. {\"code\": \"WC402\"}; read webcortex://errors for the list.",
+                ));
+            }
             match crate::errors::lookup(&code) {
                 Some(e) => json!({"code": e.code, "title": e.title, "category": e.category,
                                   "status": e.status, "hint": e.hint}),

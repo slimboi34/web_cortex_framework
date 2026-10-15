@@ -3,6 +3,61 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.5.1] — 2026-10-15
+
+Fixes from black-box testing the published 2.5.0 wheel the way a new user and a coding
+agent would: every starter, the README followed literally, `doctor`/`status`/`explain`,
+the MCP endpoint over raw JSON-RPC, and deliberate breakage. No API changes.
+
+### Fixed
+
+- **A failed agent run's 502 carried no `x-webcortex-error` header**, so the request log
+  and the status view filed it under the generic `WC300` beside the run's own `WC304`.
+  The header now carries the run's code (failed runs only; a limit is still a 200).
+- **A tool call missing a path argument failed as `WC201` "no route"** (`/items/{id}`
+  became `/items/`), sending a model looking for a route that exists. It is now `WC206`
+  `missing required argument "id"`, from agents, behaviours, flows and MCP alike.
+- **Status percentiles could exceed the maximum** (`p95 0.256ms  max 0.162ms`; even
+  p50 > max): bucket upper bounds are now capped at the exact maximum.
+- `webcortex status --url` pointed at something that is not WebCortex crashed with a
+  `JSONDecodeError` traceback; it is now `WC108` naming the problem. `webcortex doctor
+  --url` said "nothing answered" when something had; it now says what answered.
+- `webcortex tools` and `webcortex typegen` printed a traceback for an invalid app; they
+  report `error[WC101]` like `check`.
+- `webcortex dev`/`run` on a busy port printed a `RuntimeError` traceback; it is
+  `error[WC104]` with its hint.
+- `--port`/`--host` were silently overridden by `WEBCORTEX_PORT`/`WEBCORTEX_HOST`; the
+  explicit flag now wins.
+- The boot banner printed the app's version as the framework's (`webcortex 0.1.0`); it
+  shows `webcortex 2.5.1  ·  myapp 0.1.0`.
+- An agent's WebSocket upgrade was counted under "(no route)" in the status view; it
+  counts against the agent's route.
+- A `SyntaxError` in `api.py` was located "at <frozen importlib._bootstrap>"; it names
+  the file and line, and the `WC102` hint names the actual module.
+- `doctor --online` probed providers one after another (N unreachable endpoints took
+  N × 3 s); probes now run concurrently.
+- The `budgets` doctor warning carried `WC402` ("Token budget exhausted") for an agent
+  with *no* budget; it no longer claims a code.
+- "Did you mean" for an unknown tool preferred any name a few edits away (`move` →
+  the agent `mover`) over the route's derived tool (`create_arm_move`); whole-word
+  matches now win.
+- A `start_halted` app reported `since_unix: 0`; it is the boot time.
+- `priced_cost_usd` read `-0.0` when nothing was priced.
+- Server logs carried ANSI colour codes when written to a file or a platform's log
+  collector; colour is used only on a terminal, and `NO_COLOR` is honoured.
+
+### Changed
+
+- WebSocket error messages on device and agent sockets carry `code` and `hint`
+  (`WC505`, `WC306`, `WC313`, `WC607`, `WC203`, or the run's `WC3xx`), like HTTP errors.
+- MCP: `webcortex_status` with an unknown `section` and `webcortex_explain` without a
+  `code` return `isError` with `WC206` instead of the whole document / `"" is not a WebCortex error code`;
+  an unknown JSON-RPC method's hint lists the methods the server implements.
+- Starter READMEs, `webcortex new` and the README quickstart point at `webcortex doctor`
+  (which names the other keys a starter needs — the hub and robotics starters use three),
+  list every template, and activate the venv so `webcortex` is on PATH. The README and
+  docs no longer show `webcortex check` printing the boot banner's route summary.
+
 ## [2.5.0] — 2026-10-15
 
 The diagnostics release: every failure says what it is and what to do about it, a

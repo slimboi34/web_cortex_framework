@@ -403,3 +403,221 @@ def test_status_defaults_agree_with_the_catalogue():
         entry = errors.lookup(code)
         assert entry is not None and entry["status"] in (status, None), (status, code)
     assert errors.code_for_status(418) == "WC200"
+
+
+# --- 2.5.1: found by black-box testing the 2.5.0 wheel ---------------------------------
+
+
+def test_a_failed_run_is_recorded_under_its_own_code(server):
+    # 2.5.0 sent no x-webcortex-error on a failed run's 502, so the status view
+    # filed the HTTP failure as the generic WC300 next to the run's WC304.
+    base, _, _ = server
+    rid = f"diag-run-{time.time_ns()}"
+    s, h, out = _request(base, "/agents/desk", "POST", {"input": "fail:anthropic 529: overloaded"},
+                         key=USER_KEY, headers={"x-request-id": rid})
+    assert s == 502 and out["code"] == "WC304"
+    assert h.get("x-webcortex-error") == "WC304"
+    hit = [e for e in _status(base)["errors"]["recent"] if e["request_id"] == rid]
+    assert hit and hit[0]["code"] == "WC304" and hit[0]["status"] == 502
+
+
+def test_no_percentile_exceeds_the_maximum(server):
+    # 2.5.0 printed "p95 0.256ms  max 0.162ms": bucket upper bounds, uncapped.
+    base, _, _ = server
+    for _ in range(5):
+        _request(base, "/ping", key=USER_KEY)
+    st = _status(base)["requests"]
+    for row in [st["total"], *st["routes"]]:
+        for p in ("p50_ms", "p95_ms", "p99_ms"):
+            assert row[p] <= row["max_ms"], row
+
+
+def test_sockets_carry_codes_and_count_against_their_route(server):
+    from webcortex.client import AgentSocket, WebSocket
+
+    base, _, _ = server
+    ws = WebSocket(base + "/devices/cam/ws", headers={"x-api-key": ADMIN_KEY}, timeout=10)
+    try:
+        assert ws.recv_json()["type"] == "ready"
+        ws.send_text("not json")
+        err = ws.recv_json()
+        assert err["type"] == "error" and err["code"] == "WC505" and err["hint"] == errors.hint("WC505")
+    finally:
+        ws.close()
+
+    with AgentSocket(base, "/agents/desk", key=USER_KEY, timeout=30) as agent:
+        agent.ws.send_text("{}")
+        err = agent.ws.recv_json()
+        while err.get("type") != "error":
+            err = agent.ws.recv_json()
+        assert err["code"] == "WC306"
+        assert agent.ask("hi")["status"] == "completed"
+
+    routes = {r["route"]: r for r in _status(base)["requests"]["routes"]}
+    # An agent's socket rides on its POST route; 2.5.0 counted it as "(no route)".
+    assert routes["POST /agents/desk"]["status"]["1xx"] >= 1
+    assert routes.get("(no route)", {"status": {"1xx": 0}})["status"]["1xx"] == 0
+
+
+def test_server_logs_are_plain_text_when_not_on_a_terminal(server):
+    _, workdir, _ = server
+    log = (workdir / "server.log").read_text()
+    assert "WARN" in log and "\x1b[" not in log
+
+
+def test_commands_report_an_invalid_app_with_a_code_not_a_traceback(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path, "from webcortex import WebCortex\napp = WebCortex('x')\n"
+                     "app.agent('a', tools=['no_such_tool'])\n")
+    for command in (["tools"], ["typegen"]):
+        assert main(command) == 1, command
+        err = capsys.readouterr().err
+        assert err.startswith("error[WC101]") and "no_such_tool" in err
+
+
+def test_a_syntax_error_names_the_file_and_line(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path, "from webcortex import WebCortex\napp = WebCortex('x')\ndef broken(:\n")
+    assert main(["check"]) == 1
+    message = json.loads(capsys.readouterr().out)["error"]["message"]
+    assert "api.py:3" in message and "importlib" not in message
+
+
+def test_a_handler_name_in_tools_suggests_the_derived_tool_name(tmp_path):
+    app = WebCortex("t")
+
+    @app.post("/arm/move", tool=True)
+    def move(joint: int) -> dict:
+        return {}
+
+    app.agent("mover", tools=["move"])
+    with pytest.raises(ValueError, match='Did you mean "create_arm_move"'):
+        app.check()
+
+
+class _NotWebCortex:
+    """A local HTTP server answering every GET with HTML, like a wrong --url."""
+
+    def __enter__(self):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"<html>not webcortex</html>"
+                self.send_response(200 if not self.path.endswith("/missing") else 404)
+                self.send_header("content-type", "text/html")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+
+
+def test_status_and_doctor_against_something_that_is_not_webcortex(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path, f"from webcortex import WebCortex\napp = WebCortex('mine', port={_free_port()})\n")
+    with _NotWebCortex() as url:
+        # 2.5.0: a JSONDecodeError traceback.
+        assert main(["status", "--json", "--url", url]) == 1
+        err = json.loads(capsys.readouterr().out)["error"]
+        assert err["code"] == "WC108" and "not with a WebCortex status document" in err["message"]
+        assert main(["status", "--url", url]) == 1
+        assert "Traceback" not in capsys.readouterr().err
+        # 2.5.0: "nothing answered", while something plainly did.
+        main(["doctor", "--json", "--url", url])
+        running = next(c for c in json.loads(capsys.readouterr().out)["checks"] if c["id"] == "running")
+        assert running["status"] == "warn" and "not a WebCortex app" in running["message"]
+
+
+def test_the_budget_warning_does_not_claim_a_budget_was_exhausted(tmp_path, monkeypatch):
+    monkeypatch.setenv("WEBCORTEX_FAKE_PROVIDER", "1")
+    app = WebCortex("b", port=_free_port())
+    app.agent("a")
+    budgets = next(c for c in app.doctor()["checks"] if c["id"] == "budgets")
+    assert budgets["status"] == "warn" and "code" not in budgets
+
+
+def test_doctor_online_probes_providers_concurrently(monkeypatch):
+    from webcortex.diagnostics import doctor
+
+    # Sockets that accept a connection (the backlog does) but never answer.
+    silent = []
+    for _ in range(3):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(8)
+        silent.append(s)
+    try:
+        app = WebCortex("probe", port=_free_port())
+        for i, s in enumerate(silent):
+            app.provider(f"p{i}", base_url=f"http://127.0.0.1:{s.getsockname()[1]}/v1")
+            app.agent(f"a{i}", model=f"p{i}/m", token_budget=100)
+        monkeypatch.delenv("WEBCORTEX_FAKE_PROVIDER", raising=False)
+        started = time.monotonic()
+        report = doctor(app, online=True, timeout=1.0)
+        elapsed = time.monotonic() - started
+        probes = [c for c in report["checks"] if c["id"].startswith("online:")]
+        assert len(probes) == 3 and all(c["code"] == "WC303" for c in probes)
+        assert elapsed < 2.5, f"three 1 s probes took {elapsed:.1f}s: run one after another"
+    finally:
+        for s in silent:
+            s.close()
+
+
+def _run_cli(workdir, args, env_extra, wait_for=None, timeout=30):
+    env = {**os.environ, "WEBCORTEX_LOG": "warn", **env_extra}
+    proc = subprocess.Popen([sys.executable, "-m", "webcortex.cli", *args], cwd=workdir,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    if wait_for is None:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out, err
+    deadline = time.time() + timeout
+    ok = False
+    while time.time() < deadline and proc.poll() is None:
+        try:
+            with urllib.request.urlopen(wait_for, timeout=1):
+                ok = True
+                break
+        except Exception:
+            time.sleep(0.1)
+    proc.terminate()
+    out, err = proc.communicate(timeout=10)
+    return ok, out, err
+
+
+def test_run_on_a_busy_port_is_wc104_not_a_traceback(tmp_path):
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        port = busy.getsockname()[1]
+        (tmp_path / "api.py").write_text(f"from webcortex import WebCortex\napp = WebCortex('b', port={port})\n")
+        code, _, err = _run_cli(tmp_path, ["run"], {})
+    assert code == 1
+    assert "error[WC104]" in err and "Traceback" not in err
+
+
+def test_the_port_flag_wins_over_the_environment_and_the_banner_names_both_versions(tmp_path):
+    import webcortex
+
+    want, other = _free_port(), _free_port()
+    (tmp_path / "api.py").write_text("from webcortex import WebCortex\napp = WebCortex('flagged', version='9.9.9')\n")
+    ok, out, err = _run_cli(tmp_path, ["run", "--port", str(want)], {"WEBCORTEX_PORT": str(other)},
+                            wait_for=f"http://127.0.0.1:{want}/_webcortex/health")
+    assert ok, err
+    assert f"webcortex {webcortex.__version__}  ·  flagged 9.9.9" in out
+    assert f"127.0.0.1:{want}" in out
+
+
+def test_starters_point_at_doctor():
+    from webcortex import starters
+    readme = starters.files_for("hub", "demo", "a demo")["README.md"]
+    assert "webcortex doctor" in readme and "webcortex status" in readme

@@ -31,7 +31,8 @@ pub fn unix_ms() -> u64 {
 
 /// Latency in power-of-two microsecond buckets: bucket `i` holds samples in
 /// `[2^(i-1), 2^i)` µs. Percentiles are reported as the bucket's upper bound,
-/// so they are never optimistic and within 2x of the truth.
+/// so they are never optimistic and within 2x of the truth — capped at the
+/// largest sample actually seen, so a percentile never exceeds `max_ms`.
 struct Histogram {
     buckets: [AtomicU64; BUCKETS],
 }
@@ -46,28 +47,33 @@ impl Histogram {
         self.buckets[i.min(BUCKETS - 1)].fetch_add(1, Relaxed);
     }
 
-    fn percentile_ms(&self, counts: &[u64; BUCKETS], total: u64, p: f64) -> f64 {
+    fn percentile_ms(&self, counts: &[u64; BUCKETS], total: u64, p: f64, max_us: u64) -> f64 {
         if total == 0 {
             return 0.0;
         }
         let target = ((total as f64) * p).ceil().max(1.0) as u64;
         let mut seen = 0;
+        let mut upper = 1u64 << (BUCKETS - 1);
         for (i, c) in counts.iter().enumerate() {
             seen += c;
             if seen >= target {
-                return (1u64 << i) as f64 / 1000.0;
+                upper = 1u64 << i;
+                break;
             }
         }
-        (1u64 << (BUCKETS - 1)) as f64 / 1000.0
+        // A bucket's upper bound can lie above every sample in it; the true
+        // maximum is known exactly, and no percentile can exceed it.
+        round3(upper.min(max_us.max(1)) as f64 / 1000.0)
     }
 
-    fn summary(&self) -> Value {
+    /// p50/p95/p99, none of them above `max_us`, the largest sample recorded.
+    fn summary(&self, max_us: u64) -> Value {
         let counts: [u64; BUCKETS] = std::array::from_fn(|i| self.buckets[i].load(Relaxed));
         let total: u64 = counts.iter().sum();
         json!({
-            "p50_ms": self.percentile_ms(&counts, total, 0.50),
-            "p95_ms": self.percentile_ms(&counts, total, 0.95),
-            "p99_ms": self.percentile_ms(&counts, total, 0.99),
+            "p50_ms": self.percentile_ms(&counts, total, 0.50, max_us),
+            "p95_ms": self.percentile_ms(&counts, total, 0.95, max_us),
+            "p99_ms": self.percentile_ms(&counts, total, 0.99, max_us),
         })
     }
 }
@@ -143,6 +149,7 @@ impl Slot {
             return None;
         }
         let total = self.total_us.load(Relaxed);
+        let max_us = self.max_us.load(Relaxed);
         let mut v = json!({
             "route": &*self.label,
             "requests": count,
@@ -154,9 +161,9 @@ impl Slot {
                 "5xx": self.by_class[4].load(Relaxed),
             },
             "mean_ms": round3(total as f64 / count as f64 / 1000.0),
-            "max_ms": round3(self.max_us.load(Relaxed) as f64 / 1000.0),
+            "max_ms": round3(max_us as f64 / 1000.0),
         });
-        if let (Value::Object(m), Value::Object(l)) = (&mut v, self.latency.summary()) {
+        if let (Value::Object(m), Value::Object(l)) = (&mut v, self.latency.summary(max_us)) {
             m.extend(l);
         }
         Some(v)
@@ -659,10 +666,27 @@ mod tests {
             h.record(100);
         }
         h.record(50_000);
-        let s = h.summary();
+        let s = h.summary(50_000);
         assert_eq!(s["p50_ms"], 0.128);
         assert!(s["p99_ms"].as_f64().unwrap() <= 0.128);
         assert!(s["p99_ms"].as_f64().unwrap() >= 0.1);
+    }
+
+    #[test]
+    fn no_percentile_exceeds_the_maximum() {
+        // 2.5.0 printed "p95 0.256ms  max 0.162ms": the bucket's upper bound
+        // was reported even when every sample sat well below it.
+        let slot = Slot::new("GET /".into());
+        slot.record(200, 162);
+        slot.record(200, 19);
+        let v = slot.describe().unwrap();
+        let max = v["max_ms"].as_f64().unwrap();
+        assert_eq!(max, 0.162);
+        for p in ["p50_ms", "p95_ms", "p99_ms"] {
+            assert!(v[p].as_f64().unwrap() <= max, "{p} {} > max {max}", v[p]);
+        }
+        assert_eq!(v["p95_ms"], 0.162);
+        assert_eq!(v["p50_ms"], 0.032);
     }
 
     #[test]

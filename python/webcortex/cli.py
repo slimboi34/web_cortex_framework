@@ -61,12 +61,17 @@ def _load_app(target: str) -> Any:
         inside = [str(Path(f.filename).resolve()).startswith(package) for f in frames]
         user = [f for f, mine in zip(frames, inside) if not mine]
         where = f" (at {user[-1].filename}:{user[-1].lineno})" if user else ""
+        if isinstance(e, SyntaxError) and e.filename:
+            # The traceback of a SyntaxError ends inside importlib; the error
+            # itself knows the file and line that failed to parse.
+            where = f" (at {e.filename}:{e.lineno})"
         detail = f"{type(e).__name__}: {e}{where}"
         # A ValueError raised by webcortex itself is a declaration it refused.
         declaration = isinstance(e, ValueError) and bool(inside) and inside[-1]
         code = "WC101" if declaration else "WC102"
         hint = ("A declaration in the app is invalid; the message names it and the location is the "
-                "line that declared it.") if declaration else None
+                "line that declared it.") if declaration else (
+                f"Importing {path} raised. Run `python {path}` to see the full traceback.")
         raise CLIError(code, f"loading {target} failed: {detail}", hint) from None
 
     if not hasattr(module, attr):
@@ -119,7 +124,9 @@ def _banner(app: Any) -> None:
     security = app.security_report()
     gil = "free-threaded" if free_threaded() else "GIL-enabled"
 
-    print(f"  webcortex {app.version}  ·  {app.name}")
+    from . import __version__
+
+    print(f"  webcortex {__version__}  ·  {app.name} {app.version}")
     print(f"  python {sys.version.split()[0]} ({gil})")
     print(f"  {report['routes']} routes, {report['native_routes']} served without touching Python")
 
@@ -314,6 +321,7 @@ def _cmd_new(args: argparse.Namespace) -> int:
         f"\nNext:\n"
         f"  cd {target}\n"
         f"  export WEBCORTEX_API_KEY=$(webcortex keygen)\n"
+        f"  webcortex doctor    # names anything else this starter needs\n"
         f"  webcortex dev\n"
     )
     return 0
@@ -323,7 +331,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        return _run(parser, args)
+        try:
+            return _run(parser, args)
+        except ValueError as e:
+            # The core refusing the manifest, from any command that reads it.
+            if str(e).startswith("invalid application"):
+                raise CLIError("WC101", str(e)) from None
+            raise
     except CLIError as e:
         if getattr(args, "json", False) or args.command == "check":
             print(json.dumps(e.as_json(), indent=2))
@@ -494,10 +508,14 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     app = _load_app(args.target)
 
     if args.command in ("dev", "run"):
+        # An explicit flag wins over WEBCORTEX_HOST/PORT, which the manifest
+        # (and every later command) reads; set both so they agree.
         if args.host:
             app.host = args.host
+            os.environ["WEBCORTEX_HOST"] = args.host
         if args.port:
             app.port = args.port
+            os.environ["WEBCORTEX_PORT"] = str(args.port)
         if args.workers:
             app.workers = args.workers
         if args.command == "dev":
@@ -506,7 +524,14 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             _banner(app)
         except ValueError as e:
             raise CLIError("WC101", str(e)) from None
-        app.run()
+        try:
+            app.run()
+        except RuntimeError as e:
+            msg = str(e)
+            if msg.startswith("bind") and any(t in msg for t in ("in use", "os error 48", "os error 98",
+                                                                  "os error 10048")):
+                raise CLIError("WC104", msg) from None
+            raise
         return 0
 
     if args.command == "halt":

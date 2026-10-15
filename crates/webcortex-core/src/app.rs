@@ -195,8 +195,14 @@ impl App {
             approvals: Mutex::new(HashMap::new()),
             self_ref: std::sync::OnceLock::new(),
             halt: Mutex::new(manifest_start_halted.then(|| {
+                // The boot time, not 0: a reader computing "halted for" from
+                // since_unix would otherwise see fifty years.
+                let since = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 serde_json::json!({"reason": "started halted; release to enable actuators",
-                                   "by": "boot", "since_unix": 0})
+                                   "by": "boot", "since_unix": since})
             })),
             devices,
             recorder,
@@ -1053,10 +1059,30 @@ impl App {
 
         let mut path_params = std::collections::BTreeMap::new();
         for seg in route.path.split('/') {
-            if let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
-                && let Some(v) = obj.get(name) {
-                    path_params.insert(name.to_string(), json_to_path_string(v));
+            let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+                continue;
+            };
+            let value = obj.get(name).filter(|v| !v.is_null()).map(json_to_path_string);
+            match value {
+                Some(v) if !v.is_empty() => {
+                    path_params.insert(name.to_string(), v);
                 }
+                // Without this, `/items/{id}` became `/items/` and the call
+                // failed as "no route" (WC201), which sends a model looking
+                // for a route that exists instead of the argument it left out.
+                _ => {
+                    let res = WebCortexResponse::coded(
+                        422,
+                        "WC206",
+                        format!("missing required argument {name:?} (a path parameter of {} {})", route.method, route.path),
+                    );
+                    return Err(format!(
+                        "tool {tool_name} failed with {}: {}",
+                        res.status,
+                        String::from_utf8_lossy(&res.body)
+                    ));
+                }
+            }
         }
 
         let concrete_path = substitute_path(&route.path, &path_params);
@@ -1128,7 +1154,18 @@ pub fn run_result_response(result: &RunResult) -> WebCortexResponse {
         _ => 200,
     };
     match serde_json::to_value(result) {
-        Ok(v) => WebCortexResponse::json(status, &v),
+        Ok(v) => {
+            let mut res = WebCortexResponse::json(status, &v);
+            // A failed run is an error response like any other: the header
+            // carries its code, so the request log and the status view record
+            // the run's own code (WC304, …) rather than the generic one for 502.
+            if status >= 400
+                && let Some(code) = result.code.as_deref()
+            {
+                res.headers.push(("x-webcortex-error".into(), code.to_string()));
+            }
+            res
+        }
         Err(e) => WebCortexResponse::coded(500, "WC001", e.to_string()),
     }
 }

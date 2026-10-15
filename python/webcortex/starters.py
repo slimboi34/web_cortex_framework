@@ -112,6 +112,7 @@ Built with [WebCortex](https://github.com/slimboi34/web_cortex_framework).
 
 ```bash
 export WEBCORTEX_API_KEY=$(webcortex keygen)
+webcortex doctor     # anything else to set first? other keys, model provider keys, the port
 webcortex dev
 ```
 
@@ -126,6 +127,7 @@ webcortex check      # routes, tools, and the public attack surface
 webcortex security   # what is reachable without a credential
 webcortex tools      # the agent tool manifest
 webcortex typegen    # generate client/api.ts
+webcortex status     # what the running app is doing (admin key)
 ```
 """
 

@@ -155,10 +155,12 @@ impl Ledger {
             }
         }
 
+        // `+ 0.0`: an empty f64 sum is -0.0, which serialises as "-0.0".
         let priced_cost: f64 = entries
             .iter()
             .filter_map(|(k, t)| price_for(&k.model).map(|p| t.cost_usd(&p)))
-            .sum();
+            .sum::<f64>()
+            + 0.0;
 
         serde_json::json!({
             "since_unix": self.started_unix,
@@ -196,6 +198,8 @@ mod tests {
         assert_eq!(snap["by_caller"]["agent:a"]["cache_read_tokens"], 3);
         assert!(snap["estimated_cost_usd"].is_null(), "unpriced must not be reported as free");
         assert_eq!(snap["unpriced_models"].as_array().unwrap().len(), 2);
+        // 2.5.0 reported "priced_cost_usd": -0.0 when nothing was priced.
+        assert_eq!(serde_json::to_string(&snap["priced_cost_usd"]).unwrap(), "0.0");
     }
 
     #[test]
