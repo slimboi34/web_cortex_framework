@@ -78,6 +78,8 @@ See [benchmarks/diagnostics/RESULTS.md](benchmarks/diagnostics/RESULTS.md).
 - Also from the open Dependabot group: tokio 1.53.3, hyper 1.12.0, hyper-util 0.1.21,
   http-body-util 0.1.5, jsonwebtoken 11.1.0, uuid 1.26.1, pyo3 0.29.3. (futures stays at
   0.3.33: the resolver keeps 0.3.34 back under the declared `rust-version`.)
+- `rust-version` is now 1.88, the minimum jsonwebtoken 11 already required; the old 1.85
+  declaration was wrong.
 
 ## [2.4.1] — 2026-10-07 (tagged, never published; shipped in 2.5.0)
 
