@@ -2,6 +2,9 @@
 `webcortex status` and `webcortex explain` — over a real server where it matters."""
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -22,6 +25,7 @@ from webcortex.cli import main
 ROOT = Path(__file__).resolve().parent.parent
 ADMIN_KEY = "diag-admin-key-0123456789abcdef"
 USER_KEY = "diag-user-key-0123456789abcdef"
+JWT_SECRET = "diag-jwt-signing-secret-at-least-32-bytes"
 
 APP = '''
 from webcortex import WebCortex, HTTPError
@@ -30,6 +34,7 @@ app = WebCortex("diag", port={port}, start_halted=True)
 app.api_key("DIAG_ADMIN_KEY", id="admin", scopes=["read", "write", "webcortex:admin"])
 app.api_key("DIAG_USER_KEY", id="user", scopes=["read"])
 app.cors("https://good.example")
+app.jwt(secret_env="DIAG_JWT_SECRET")
 
 app.static("GET", "/ping", {{"pong": True}}, tool=True, tool_name="ping", scopes=["read"])
 
@@ -48,6 +53,14 @@ def boom() -> dict:
 @app.get("/teapot", scopes=["read"])
 def teapot() -> dict:
     raise HTTPError(409, "the pot is full", code="WC214", hint="Empty the pot first.")
+
+@app.get("/login")
+def login() -> dict:
+    raise HTTPError(401, "wrong email or password")
+
+@app.get("/owner-only", scopes=["read"])
+def owner_only() -> dict:
+    raise HTTPError(403, "this camera belongs to another customer")
 
 app.camera("cam", read_scopes=["read"], ingest_scopes=["write"])
 app.agent("desk", tools=["ping", "add_note"], scopes=["read"], token_budget=100000)
@@ -84,7 +97,8 @@ def server():
     (workdir / "api.py").write_text(APP.format(port=port))
     log_path = workdir / "server.log"
     env = {**os.environ, "WEBCORTEX_LOG": "warn", "WEBCORTEX_FAKE_PROVIDER": "1",
-           "DIAG_ADMIN_KEY": ADMIN_KEY, "DIAG_USER_KEY": USER_KEY}
+           "DIAG_ADMIN_KEY": ADMIN_KEY, "DIAG_USER_KEY": USER_KEY,
+           "DIAG_JWT_SECRET": JWT_SECRET}
     with log_path.open("w") as log:
         proc = subprocess.Popen([sys.executable, "-m", "webcortex.cli", "run", "api.py"],
                                 cwd=workdir, stdout=log, stderr=subprocess.STDOUT, env=env)
@@ -274,6 +288,49 @@ def test_status_command_reads_the_running_app(server, capsys, monkeypatch):
     monkeypatch.delenv("WEBCORTEX_API_KEY")
     assert main(["status", "--json", "--url", base]) == 1
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "WC604"
+
+
+def test_an_app_raised_401_or_403_is_not_blamed_on_webcortex_auth(server):
+    # A login form's wrong password is the app's answer, not a missing API key.
+    base, _, _ = server
+    s, h, out = _request(base, "/login")
+    _assert_coded(out, 401, "WC609")
+    assert "x-api-key" not in out["error"]["hint"]
+    assert h.get("x-webcortex-error") == "WC609"
+    s, _, out = _request(base, "/owner-only", key=USER_KEY)
+    _assert_coded(out, 403, "WC610")
+    # WebCortex's own refusals keep their codes.
+    _assert_coded(_request(base, "/ping")[2], 401, "WC601")
+
+
+def _jwt(payload: dict) -> str:
+    def b64(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    body = b64(json.dumps(payload).encode())
+    sig = hmac.new(JWT_SECRET.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
+    return f"{head}.{body}.{b64(sig)}"
+
+
+def test_credential_headers_send_a_jwt_as_a_bearer_token():
+    from webcortex.diagnostics import credential_headers
+    assert credential_headers("wc_live_abc") == {"x-api-key": "wc_live_abc"}
+    token = _jwt({"sub": "ops", "exp": 1})
+    assert credential_headers(token) == {"authorization": f"Bearer {token}"}
+    assert credential_headers(f"Bearer {token}") == {"authorization": f"Bearer {token}"}
+    assert credential_headers(None) == {} and credential_headers("  ") == {}
+
+
+def test_status_command_accepts_a_jwt(server, capsys, monkeypatch):
+    base, workdir, _ = server
+    monkeypatch.chdir(workdir)
+    monkeypatch.delenv("WEBCORTEX_API_KEY", raising=False)
+    token = _jwt({"sub": "ops", "scope": "webcortex:admin", "exp": int(time.time()) + 300})
+    assert main(["status", "--json", "--url", base, "--key", token]) == 0
+    assert json.loads(capsys.readouterr().out)["app"] == "diag"
+    monkeypatch.setenv("WEBCORTEX_TOKEN", token)
+    assert main(["status", "--json", "--url", base]) == 0
+    assert json.loads(capsys.readouterr().out)["app"] == "diag"
 
 
 def test_status_command_when_nothing_is_running(tmp_path, capsys, monkeypatch):

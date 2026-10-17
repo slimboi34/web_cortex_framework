@@ -190,6 +190,10 @@ pub static CATALOGUE: &[ErrorInfo] = &[
        "Anonymous callers share one identity, so @principal-scoped data and agent sessions need a real credential."),
     e!("WC608", "auth", None, "No authentication configured",
        "Every route is public. Add app.api_key('WEBCORTEX_API_KEY', id='service', scopes=[...]) before exposing the app beyond localhost."),
+    e!("WC609", "auth", Some(401), "Unauthorized (raised by the app)",
+       "The app's own code answered 401 (for example a wrong password at login); its message says why. WebCortex's own credential checks answer WC601, WC603 or WC604 instead."),
+    e!("WC610", "auth", Some(403), "Forbidden (raised by the app)",
+       "The app's own code refused this caller with 403; its message says why. A missing WebCortex scope answers WC602 and a cross-origin refusal WC605 instead."),
 ];
 
 /// The entry for a code.
@@ -206,8 +210,8 @@ pub fn hint(code: &str) -> &'static str {
 pub fn code_for_status(status: u16) -> &'static str {
     match status {
         400 => "WC205",
-        401 => "WC601",
-        403 => "WC602",
+        401 => "WC609",
+        403 => "WC610",
         404 => "WC207",
         405 => "WC202",
         408 => "WC216",

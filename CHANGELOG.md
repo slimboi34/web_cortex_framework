@@ -3,6 +3,26 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.5.3] — 2026-10-17
+
+Two fixes found while upgrading an app (a camera-monitoring proof of concept) to 2.5.2.
+
+### Fixed
+
+- **A 401 or 403 raised by the app's own code is no longer coded as a WebCortex auth
+  failure.** `raise HTTPError(401, "wrong email or password")` in a login handler used to
+  answer `WC601` with a hint about sending an API key, which sent people (and agents)
+  looking for a credential problem that wasn't there. App-raised 401 and 403 errors that
+  don't name a code now get **`WC609` "Unauthorized (raised by the app)"** and **`WC610`
+  "Forbidden (raised by the app)"**, whose hints point at the handler's own message.
+  WebCortex's own refusals keep their codes (`WC601`–`WC607`). An `HTTPError` that names
+  its own `code=` is unchanged.
+- **`webcortex status`, `doctor`, `halt` and `release` accept a JWT.** `--key` used to
+  send whatever it was given as `x-api-key`, so an app that authenticates operators with
+  JWTs had no way to reach `/_webcortex/status` from the CLI. A value that is a JWT (or is
+  written `Bearer …`) is now sent as `Authorization: Bearer`, and `$WEBCORTEX_TOKEN` is
+  read when neither `--key` nor `$WEBCORTEX_API_KEY` is set.
+
 ## [2.5.2] — 2026-10-17
 
 Fixes from a second round of testing, aimed at what the first did not cover: the

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -46,10 +47,29 @@ def app_url(app: Any, url: str | None = None) -> str:
     return f"http://{host}:{port}"
 
 
+_JWT_RE = re.compile(r"^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$")
+
+
+def credential_headers(key: str | None) -> dict[str, str]:
+    """The header that carries ``key``: an API key goes in ``x-api-key``; a JWT
+    (or anything given as ``Bearer …``) goes in ``Authorization: Bearer``."""
+    key = (key or "").strip()
+    if not key:
+        return {}
+    if key[:7].lower() == "bearer ":
+        return {"authorization": "Bearer " + key[7:].strip()}
+    if _JWT_RE.match(key):
+        return {"authorization": "Bearer " + key}
+    return {"x-api-key": key}
+
+
+def operator_credential(key: str | None = None) -> str | None:
+    """``key``, else ``$WEBCORTEX_API_KEY``, else ``$WEBCORTEX_TOKEN`` (a JWT)."""
+    return key or os.environ.get("WEBCORTEX_API_KEY") or os.environ.get("WEBCORTEX_TOKEN")
+
+
 def _get_json(url: str, key: str | None, timeout: float) -> tuple[int, Any]:
-    req = urllib.request.Request(url, headers={"accept": "application/json"})
-    if key:
-        req.add_header("x-api-key", key)
+    req = urllib.request.Request(url, headers={"accept": "application/json", **credential_headers(key)})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
             try:
@@ -356,7 +376,7 @@ def fetch_status(app: Any = None, *, url: str | None = None, key: str | None = N
     """GET the running app's live status. Raises ``RuntimeError`` with a code on failure."""
     prefix = getattr(app, "control_prefix", "/_webcortex") if app is not None else "/_webcortex"
     base = app_url(app, url) if app is not None else (url or "http://127.0.0.1:8000").rstrip("/")
-    key = key or os.environ.get("WEBCORTEX_API_KEY")
+    key = operator_credential(key)
     target = f"{base}{prefix}/status"
     try:
         status, body = _get_json(target, key, timeout)

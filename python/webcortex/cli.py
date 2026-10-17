@@ -276,9 +276,10 @@ def _control(app: Any, method: str, path: str, body: dict | None = None,
     data = json.dumps(body or {}).encode() if method == "POST" else None
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"content-type": "application/json"})
-    key = key or os.environ.get("WEBCORTEX_API_KEY")
-    if key:
-        req.add_header("x-api-key", key)
+    from .diagnostics import credential_headers, operator_credential
+
+    for name, value in credential_headers(operator_credential(key)).items():
+        req.add_header(name, value)
     try:
         with urllib.request.urlopen(req, timeout=5) as res:
             return json.loads(res.read() or b"{}")
@@ -400,7 +401,7 @@ def _parser() -> argparse.ArgumentParser:
             p.add_argument("--json", action="store_true", help="emit the raw manifest instead")
         if name in ("halt", "release"):
             p.add_argument("--key", default=None,
-                           help="admin API key (default: $WEBCORTEX_API_KEY)")
+                           help="admin API key or JWT bearer token (default: $WEBCORTEX_API_KEY, then $WEBCORTEX_TOKEN)")
         if name == "halt":
             p.add_argument("--reason", "-r", default="", help="recorded in the audit log")
             p.add_argument("--status", action="store_true", help="only report whether it is halted")
@@ -408,7 +409,7 @@ def _parser() -> argparse.ArgumentParser:
             p.add_argument("--json", action="store_true", help="machine-readable output")
             p.add_argument("--url", default=None,
                            help="the running app's base URL (default: WEBCORTEX_HOST/PORT or the app's own)")
-            p.add_argument("--key", default=None, help="admin API key (default: $WEBCORTEX_API_KEY)")
+            p.add_argument("--key", default=None, help="admin API key or JWT bearer token (default: $WEBCORTEX_API_KEY, then $WEBCORTEX_TOKEN)")
         if name == "doctor":
             p.add_argument("--online", action="store_true",
                            help="also probe each model provider's endpoint (3 s timeout)")

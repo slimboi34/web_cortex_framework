@@ -415,3 +415,15 @@ Anonymous callers share one identity, so @principal-scoped data and agent sessio
 *auth*
 
 Every route is public. Add app.api_key('WEBCORTEX_API_KEY', id='service', scopes=[...]) before exposing the app beyond localhost.
+
+### WC609 — Unauthorized (raised by the app) {#wc609}
+
+*auth · HTTP 401*
+
+The app's own code answered 401 (for example a wrong password at login); its message says why. WebCortex's own credential checks answer WC601, WC603 or WC604 instead.
+
+### WC610 — Forbidden (raised by the app) {#wc610}
+
+*auth · HTTP 403*
+
+The app's own code refused this caller with 403; its message says why. A missing WebCortex scope answers WC602 and a cross-origin refusal WC605 instead.
