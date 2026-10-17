@@ -3,7 +3,7 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
-## [2.5.2] — 2026-10-15
+## [2.5.2] — 2026-10-17
 
 Fixes from a second round of testing, aimed at what the first did not cover: the
 2.5.1 changes themselves, WebSockets and the device hub under real clients (slow,
