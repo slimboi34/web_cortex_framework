@@ -760,8 +760,10 @@ mod tests {
             d.push_frame(Bytes::from_static(PNG)).unwrap();
             std::thread::sleep(Duration::from_millis(20));
         }
+        // Sleeps only ever overrun (a loaded CI runner measured 8.6), so bound
+        // it loosely: the point is that it is no longer 0.
         let fps = d.recent_fps();
-        assert!(fps > 10.0 && fps < 60.0, "fps {fps}");
+        assert!(fps > 1.0 && fps < 60.0, "fps {fps}");
     }
 
     #[test]
