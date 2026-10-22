@@ -47,20 +47,20 @@ export interface ClientOptions {{
         version = m.version
     );
 
+    let api: Vec<&Route> = m.routes.iter().filter(|r| !is_internal(r)).collect();
+    let names = method_names(&api);
+
     // Interfaces first, so operation signatures can reference them by name.
     // Every named type is emitted at top level rather than inlined: a
     // multi-line object type spliced into `Promise<...>` is not valid
     // TypeScript, and object schemas are routinely multi-line.
-    for r in &m.routes {
-        if is_internal(r) {
-            continue;
-        }
+    for (r, name) in api.iter().zip(&names) {
         if let Some(schema) = &r.input_schema
             && schema.get("properties").and_then(|p| p.as_object()).is_some_and(|p| !p.is_empty()) {
                 let _ = writeln!(
                     out,
                     "export interface {}Params {}\n",
-                    pascal(&r.tool_name()),
+                    upper_first(name),
                     ts_object(schema, 0)
                 );
             }
@@ -68,7 +68,7 @@ export interface ClientOptions {{
             let _ = writeln!(
                 out,
                 "export interface {}Result {}\n",
-                pascal(&r.tool_name()),
+                upper_first(name),
                 ts_object(shape, 0)
             );
         }
@@ -103,7 +103,7 @@ export interface ClientOptions {{
   private async request<T>(
     method: string,
     path: string,
-    params?: Record<string, unknown>,
+    params?: object,
     hasBody = false,
   ): Promise<T> {{
     let url = this.baseUrl + path;
@@ -113,8 +113,12 @@ export interface ClientOptions {{
     for (const [k, v] of Object.entries(params ?? {{}})) {{
       if (v === undefined) continue;
       const token = `{{${{k}}}}`;
+      const rest = `{{*${{k}}}}`;
       if (url.includes(token)) {{
         url = url.replace(token, encodeURIComponent(String(v)));
+      }} else if (url.includes(rest)) {{
+        // A wildcard spans segments: encode each one, keep the slashes.
+        url = url.replace(rest, String(v).split("/").map(encodeURIComponent).join("/"));
       }} else if (hasBody) {{
         body[k] = v;
       }} else {{
@@ -141,30 +145,34 @@ export interface ClientOptions {{
 "#
     );
 
-    for r in &m.routes {
-        if is_internal(r) {
-            continue;
-        }
-        let name = camel(&r.tool_name());
+    for (r, name) in api.iter().zip(&names) {
         let has_params = r
             .input_schema
             .as_ref()
             .and_then(|s| s.get("properties"))
             .and_then(|p| p.as_object())
             .is_some_and(|p| !p.is_empty());
+        // With nothing required, `client.listItems()` must compile too.
+        let any_required = r
+            .input_schema
+            .as_ref()
+            .and_then(|s| s.get("required"))
+            .and_then(|q| q.as_array())
+            .is_some_and(|q| !q.is_empty());
         let has_body = matches!(r.method.as_str(), "POST" | "PUT" | "PATCH");
-        let ret = result_type(r);
+        let ret = result_type(r, name);
 
         let doc = if r.description.is_empty() { &r.summary } else { &r.description };
         if !doc.is_empty() {
-            let _ = writeln!(out, "  /** {} */", doc.lines().next().unwrap_or("").trim());
+            let _ = writeln!(out, "  /** {} */", comment(doc.lines().next().unwrap_or("").trim()));
         }
 
         if has_params {
             let _ = writeln!(
                 out,
-                "  {name}(params: {p}Params): Promise<{ret}> {{\n    return this.request<{ret}>({m:?}, {path:?}, params as Record<string, unknown>, {body});\n  }}\n",
-                p = pascal(&r.tool_name()),
+                "  {name}(params: {p}Params{default}): Promise<{ret}> {{\n    return this.request<{ret}>({m:?}, {path:?}, params, {body});\n  }}\n",
+                p = upper_first(name),
+                default = if any_required { "" } else { " = {}" },
                 m = r.method,
                 path = r.path,
                 body = has_body,
@@ -209,10 +217,71 @@ fn result_object_schema(r: &Route) -> Option<&serde_json::Value> {
     has_props.then_some(inner)
 }
 
+/// Members of the generated client class that a route method must not shadow.
+const RESERVED_MEMBERS: &[&str] = &["constructor", "request", "headers", "baseUrl", "opts", "doFetch"];
+
+/// One method name per route: a valid TypeScript identifier, unique within
+/// the class, and never one of the client's own members.
+///
+/// Tool names are derived from method + path, so `PUT /items/{id}` and
+/// `PATCH /items/{id}` both derive `update_items_by_id`; two methods of one
+/// name are a compile error (and their `…Params` interfaces would merge).
+/// Later duplicates take the HTTP method as a suffix, then a number.
+fn method_names(routes: &[&Route]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    routes
+        .iter()
+        .map(|r| {
+            let mut base = camel(&sanitize(&r.tool_name()));
+            if base.is_empty() {
+                base = "call".into();
+            }
+            if base.starts_with(|c: char| c.is_ascii_digit()) {
+                base = format!("_{base}");
+            }
+            if RESERVED_MEMBERS.contains(&base.as_str()) {
+                base.push_str("Route");
+            }
+            let mut name = base.clone();
+            if seen.contains(&name) {
+                name = format!("{base}{}", pascal(&r.method.to_ascii_lowercase()));
+            }
+            let mut n = 2;
+            while seen.contains(&name) {
+                name = format!("{base}{n}");
+                n += 1;
+            }
+            seen.insert(name.clone());
+            name
+        })
+        .collect()
+}
+
+/// Every character that cannot be part of an identifier becomes a word break.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '$' { c } else { '_' })
+        .collect()
+}
+
+fn upper_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Text for a `/** … */` comment: a `*/` inside it would end the comment and
+/// leave the rest of the line as code.
+fn comment(text: &str) -> String {
+    text.replace("*/", "*\\/")
+}
+
 /// The return type written into a method signature. Always a single token, so
 /// it can never break the line it is spliced into.
-fn result_type(r: &Route) -> String {
-    let named = format!("{}Result", pascal(&r.tool_name()));
+fn result_type(r: &Route, name: &str) -> String {
+    let named = format!("{}Result", upper_first(name));
     match result_object_schema(r) {
         Some(_) => {
             let is_array = r
@@ -250,7 +319,7 @@ fn ts_object(schema: &serde_json::Value, depth: usize) -> String {
     for (name, spec) in props {
         let optional = if required.contains(&name.as_str()) { "" } else { "?" };
         if let Some(desc) = spec.get("description").and_then(|d| d.as_str()) {
-            let _ = writeln!(out, "{indent}/** {desc} */");
+            let _ = writeln!(out, "{indent}/** {} */", comment(&desc.replace(['\n', '\r'], " ")));
         }
         let _ = writeln!(out, "{indent}{}{}: {};", ident(name), optional, ts_type(spec, depth + 1));
     }
@@ -259,23 +328,52 @@ fn ts_object(schema: &serde_json::Value, depth: usize) -> String {
 }
 
 fn ts_type(schema: &serde_json::Value, depth: usize) -> String {
+    let nullable = schema.get("nullable").and_then(|n| n.as_bool()).unwrap_or(false);
+
     if let Some(values) = schema.get("enum").and_then(|e| e.as_array()) {
-        let variants: Vec<String> = values
+        let mut variants: Vec<String> = values
             .iter()
             .map(|v| match v {
                 serde_json::Value::String(s) => format!("{s:?}"),
                 other => other.to_string(),
             })
             .collect();
-        return variants.join(" | ");
+        if nullable && !values.iter().any(|v| v.is_null()) {
+            variants.push("null".into());
+        }
+        // `enum: []` admits nothing; an empty string here would be `x: ;`.
+        return if variants.is_empty() { "never".into() } else { variants.join(" | ") };
     }
 
-    let nullable = schema.get("nullable").and_then(|n| n.as_bool()).unwrap_or(false);
+    if let Some(options) = schema.get("anyOf").or_else(|| schema.get("oneOf")).and_then(|a| a.as_array()) {
+        let mut parts: Vec<String> = Vec::new();
+        for option in options {
+            let t = ts_type(option, depth);
+            if t == "Json" {
+                return "Json".into();
+            }
+            let t = if t.contains(' ') && !t.starts_with('{') { format!("({t})") } else { t };
+            if !parts.contains(&t) {
+                parts.push(t);
+            }
+        }
+        if nullable && !parts.iter().any(|p| p == "null") {
+            parts.push("null".into());
+        }
+        return if parts.is_empty() { "Json".into() } else { parts.join(" | ") };
+    }
+
     let base = match schema.get("type").and_then(|t| t.as_str()) {
         Some("string") => "string".to_string(),
         Some("integer") | Some("number") => "number".to_string(),
         Some("boolean") => "boolean".to_string(),
         Some("null") => "null".to_string(),
+        Some("array") if schema.get("prefixItems").and_then(|p| p.as_array()).is_some() => {
+            // A fixed-length tuple, `tuple[int, str]` in Python.
+            let items = schema["prefixItems"].as_array().map(Vec::as_slice).unwrap_or_default();
+            let parts: Vec<String> = items.iter().map(|i| ts_type(i, depth)).collect();
+            format!("[{}]", parts.join(", "))
+        }
         Some("array") => {
             let item = schema
                 .get("items")
@@ -422,7 +520,7 @@ mod tests {
             "input_schema": {"type": "object", "properties": {"title": {"type": "string"}}}
         }]));
         let ts = generate(&m);
-        assert!(ts.contains("\"POST\", \"/books\", params as Record<string, unknown>, true"));
+        assert!(ts.contains("\"POST\", \"/books\", params, true"));
     }
 
     #[test]
@@ -474,6 +572,92 @@ mod tests {
             "output_schema": {"type": "integer"}
         }]));
         assert!(generate(&m).contains("Promise<number>"));
+    }
+
+    fn methods(ts: &str) -> Vec<String> {
+        ts.lines()
+            .filter(|l| l.starts_with("  ") && !l.starts_with("   ") && l.contains("): Promise<"))
+            .filter(|l| l.trim_start().starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|l| !l.trim_start().starts_with("private"))
+            .map(|l| l.trim_start().split('(').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn put_and_patch_on_one_path_get_distinct_methods() {
+        // Both derive `update_items_by_id`; two methods of one name do not compile.
+        let m = manifest(json!([
+            {"id": 0, "method": "PUT", "path": "/items/{id}", "op": {"kind": "static", "body": {}},
+             "input_schema": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}},
+            {"id": 1, "method": "PATCH", "path": "/items/{id}", "op": {"kind": "static", "body": {}},
+             "input_schema": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}}
+        ]));
+        let ts = generate(&m);
+        assert_eq!(methods(&ts), ["updateItemsById", "updateItemsByIdPatch"], "{ts}");
+        assert!(ts.contains("export interface UpdateItemsByIdParams"));
+        assert!(ts.contains("export interface UpdateItemsByIdPatchParams"));
+    }
+
+    #[test]
+    fn method_names_are_identifiers_that_do_not_shadow_the_client() {
+        let m = manifest(json!([
+            {"id": 0, "method": "GET", "path": "/v1.0/x", "op": {"kind": "static", "body": {}}},
+            {"id": 1, "method": "GET", "path": "/a", "op": {"kind": "static", "body": {}},
+             "tool": {"expose": true, "name": "request"}},
+            {"id": 2, "method": "GET", "path": "/b", "op": {"kind": "static", "body": {}},
+             "tool": {"expose": true, "name": "2fa"}},
+            {"id": 3, "method": "GET", "path": "/c", "op": {"kind": "static", "body": {}},
+             "tool": {"expose": true, "name": "constructor"}}
+        ]));
+        let names = methods(&generate(&m));
+        assert_eq!(names, ["getV10X", "requestRoute", "_2fa", "constructorRoute"]);
+        for n in names {
+            assert!(n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'), "{n}");
+        }
+    }
+
+    #[test]
+    fn a_description_cannot_close_its_doc_comment() {
+        let m = manifest(json!([{
+            "id": 0, "method": "GET", "path": "/x", "op": {"kind": "static", "body": {}},
+            "description": "Matches a/*/b globs */ and more",
+            "input_schema": {"type": "object", "properties": {
+                "g": {"type": "string", "description": "a */ b\nsecond line"}}}
+        }]));
+        let ts = generate(&m);
+        for line in ts.lines().filter(|l| l.trim_start().starts_with("/**")) {
+            assert_eq!(line.matches("*/").count(), 1, "comment closed early: {line}");
+        }
+    }
+
+    #[test]
+    fn unions_tuples_and_nullable_enums_render() {
+        assert_eq!(ts_type(&json!({"anyOf": [{"type": "integer"}, {"type": "string"}]}), 0), "number | string");
+        assert_eq!(ts_type(&json!({"anyOf": [{"type": "integer"}, {}]}), 0), "Json");
+        assert_eq!(
+            ts_type(&json!({"type": "array", "prefixItems": [{"type": "integer"}, {"type": "string"}]}), 0),
+            "[number, string]"
+        );
+        assert_eq!(ts_type(&json!({"enum": ["a"], "nullable": true}), 0), "\"a\" | null");
+        assert_eq!(ts_type(&json!({"enum": ["a", null], "nullable": true}), 0), "\"a\" | null");
+        assert_eq!(ts_type(&json!({"enum": []}), 0), "never");
+    }
+
+    #[test]
+    fn params_with_nothing_required_are_optional() {
+        let m = manifest(json!([{
+            "id": 0, "method": "GET", "path": "/books", "op": {"kind": "static", "body": []},
+            "tool": {"expose": true, "name": "list_books"},
+            "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}}
+        }]));
+        assert!(generate(&m).contains("listBooks(params: ListBooksParams = {}): Promise<"));
+    }
+
+    #[test]
+    fn wildcard_path_parameters_are_substituted() {
+        let ts = generate(&manifest(json!([])));
+        assert!(ts.contains("const rest = `{*${k}}`;"), "{ts}");
+        assert!(!ts.contains("as Record<string, unknown>"), "an interface does not cast to a Record (TS2352)");
     }
 
     #[test]

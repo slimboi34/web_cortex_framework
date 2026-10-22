@@ -153,8 +153,18 @@ Binding rules, exactly:
   whole `Request` and is excluded from the schema.
 - Every other parameter is resolved **path → query string → JSON body**, in that
   order, and coerced to its annotation.
-- Path parameters are taken from `{name}` segments in `path`.
+- Path parameters are taken from `{name}` segments in `path` (`{*rest}`, a
+  wildcard, binds `rest`).
 - Parameters with defaults are optional; parameters without are required.
+  A default with no JSON spelling (a sentinel `object()`) is left out of the
+  schema.
+- A body that is not JSON answers 400 (`WC205`): `req.json()` raises
+  `webcortex._bridge.InvalidJSON`, an `HTTPError(400)` that is also a
+  `ValueError`.
+- `async def` handlers, objects with `async def __call__`, and async
+  generators (collected into a list) run on the event loops; a sync handler
+  that returns a coroutine has it awaited. `sys.exit()` in a handler fails
+  that request only.
 - The return annotation becomes the output schema.
 - `inspect.getdoc(fn)` becomes the route description; its first line becomes the
   summary unless `summary=` is passed.
@@ -683,11 +693,23 @@ missing — which is exactly the failure described in §11.
 `webcortex.schema.json_schema_for` handles: `str`, `int`, `float`, `bool`,
 `bytes` (base64), `datetime.date`, `datetime.datetime`, `None`, `Any`,
 `Optional[X]` / `X | None` (as `nullable`), `Union` (as `anyOf`), `list`, `set`,
-`frozenset`, `tuple`, `dict`, `Literal` (as `enum`), and dataclasses.
+`frozenset`, `tuple` (`tuple[int, str]` as `prefixItems`), `dict`, `Literal`
+and `Enum` (as `enum`), `TypedDict`, `Annotated`, `NewType`, `UUID`, `time`,
+`Decimal`, and dataclasses (a recursive one is described loosely at the point
+it recurs). `schema.coerce` converts inputs to the same types (dates, enums,
+UUIDs, base64 `bytes`, nested dataclasses, `list[Item]`) and passes through
+anything it cannot convert without losing information.
 
 **Unknown types degrade to `{}` — accept anything — rather than raising.** A
 handler with an exotic signature still serves traffic; it just advertises a less
 precise tool schema. Do not "fix" this by making it raise.
+
+Handler return values are encoded by `_bridge._fallback` / `jsonable`:
+dataclasses (slotted too) by field, enums by value, dates and times as ISO
+8601, `Decimal`/`UUID` as strings, bytes as base64, sets and generators as
+arrays, NaN/±inf as `null` (strict JSON has no spelling for them), and a
+reference cycle is a refused response rather than a crash. Behaviour results
+go through the same rules before they cross into Rust.
 
 ---
 

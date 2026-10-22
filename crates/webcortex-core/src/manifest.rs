@@ -1193,6 +1193,13 @@ impl Manifest {
         let mut tool_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for r in self.routes.iter().filter(|r| r.tool.expose) {
             let name = r.tool_name();
+            if let Some(problem) = tool_name_problem(&name) {
+                return Err(format!(
+                    "route {} {} exposes the tool name {name:?}, which {problem}: model \
+                     providers refuse a request whose tools include it",
+                    r.method, r.path
+                ));
+            }
             if !tool_names.insert(name.clone()) {
                 return Err(format!(
                     "two routes both expose the tool name {name:?}; set tool_name= on one of them"
@@ -1445,12 +1452,33 @@ pub fn derive_tool_name(method: &str, path: &str) -> String {
     for seg in path.split('/').filter(|s| !s.is_empty()) {
         if let Some(inner) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
             parts.push("by".into());
-            parts.push(inner.replace('-', "_"));
+            // `{*rest}` is a wildcard named `rest`.
+            parts.push(tool_word(inner.trim_start_matches('*')));
         } else {
-            parts.push(seg.replace('-', "_"));
+            parts.push(tool_word(seg));
         }
     }
     parts.join("_")
+}
+
+/// A path segment as part of a tool name. Model providers and MCP clients
+/// accept `[A-Za-z0-9_-]` in a tool name and refuse the whole tool list over
+/// anything else, so `/v1.0/{*rest}` must not derive `get_v1.0_by_*rest`.
+fn tool_word(seg: &str) -> String {
+    seg.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Why an explicit `tool_name=` cannot be offered to a model, if it cannot.
+fn tool_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("is empty");
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
+        return Some("may contain only ASCII letters, digits, '_' and '-'");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1459,6 +1487,26 @@ mod tests {
 
     fn set(names: &[&str]) -> std::collections::HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn derived_tool_names_only_use_characters_providers_accept() {
+        use super::derive_tool_name;
+        assert_eq!(derive_tool_name("GET", "/files/{*rest}"), "get_files_by_rest");
+        assert_eq!(derive_tool_name("GET", "/v1.0/items"), "get_v1_0_items");
+        assert_eq!(derive_tool_name("GET", "/a~b/{user-id}"), "get_a_b_by_user_id");
+        assert_eq!(derive_tool_name("POST", "/my-items"), "create_my_items");
+    }
+
+    #[test]
+    fn explicit_tool_names_are_checked() {
+        use super::tool_name_problem;
+        assert!(tool_name_problem("search_books").is_none());
+        assert!(tool_name_problem("books-search_v2").is_none());
+        assert!(tool_name_problem("books.search").is_some());
+        assert!(tool_name_problem("").is_some());
+        assert!(tool_name_problem("search books").is_some());
+        assert!(tool_name_problem("search/books").is_some());
     }
 
     #[test]
