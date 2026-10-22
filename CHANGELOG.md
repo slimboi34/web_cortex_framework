@@ -41,6 +41,10 @@ those changes is listed under **Changed**, and the old behaviour was a bug in ev
 - **A behaviour returning a self-referential dict crashed the server process** with a
   stack overflow. It now fails that run cleanly.
 
+- **Dependencies:** `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10, for RUSTSEC-2026-0382 and
+  RUSTSEC-2026-0381. Certificate verification could accept distrusted emSign intermediates
+  when calling model providers over HTTPS.
+
 ### Fixed — HTTP
 
 - **Graceful shutdown drains.** A request in flight at SIGTERM used to get an empty
