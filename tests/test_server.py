@@ -300,7 +300,8 @@ def test_mcp_tool_list_hides_tools_the_caller_cannot_use(server):
 
 
 def test_mcp_unknown_tool_and_method(server):
-    assert server.rpc("tools/call", {"name": "ghost", "arguments": {}})["result"]["isError"]
+    err = server.rpc("tools/call", {"name": "ghost", "arguments": {}})["error"]
+    assert err["code"] == -32602 and err["data"]["code"] == "WC314"
     assert server.rpc("no_such_method")["error"]["code"] == -32601
 
 
