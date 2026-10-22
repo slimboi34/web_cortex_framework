@@ -331,6 +331,9 @@ struct RunState {
     /// Resolved context blocks and handoff guidance, appended to the system
     /// prompt. Re-resolved for the new agent on a handoff.
     system_suffix: String,
+    /// This turn's input: what context providers are resolved against, at
+    /// the start and again on a handoff.
+    input: String,
     /// Input size of the last provider call: the real measure of context.
     last_input_tokens: u64,
     /// Consecutive failed compactions, and the step the next attempt waits
@@ -477,6 +480,7 @@ impl AgentRuntime {
             depth: opts.depth,
             budget,
             system_suffix,
+            input: input.to_string(),
             last_input_tokens: 0,
             compaction_failures: 0,
             compaction_retry_at: 0,
@@ -668,17 +672,23 @@ impl AgentRuntime {
             if !response.text.is_empty() {
                 st.output = response.text.clone();
             }
-            st.conversation.messages.push(Message {
-                role: "assistant".into(),
-                content: response.raw_content.clone(),
-            });
+            // Tool calls run only on a `tool_use` stop. Any others in the turn
+            // are never answered, and a `tool_use` with no `tool_result` after
+            // it makes every later request on the conversation — the next
+            // turn of a session — a 400 at the provider. They are left out of
+            // the history; so is a turn with nothing in it, which providers
+            // reject just the same.
+            let runs_tools = response.stop_reason == StopReason::ToolUse && !response.tool_calls.is_empty();
+            if let Some(content) = replayable(&response.raw_content, runs_tools) {
+                st.conversation.messages.push(Message { role: "assistant".into(), content });
+            }
 
             // A truncated response may hold a half-written tool call; running
             // it would act on arguments the model never finished.
             if response.stop_reason == StopReason::MaxTokens {
                 return self.finish(app, st, RunStatus::MaxTokens, None);
             }
-            if response.stop_reason != StopReason::ToolUse || response.tool_calls.is_empty() {
+            if !runs_tools {
                 return self.finish(app, st, RunStatus::Completed, None);
             }
 
@@ -747,7 +757,26 @@ impl AgentRuntime {
                 continue;
             }
 
-            // 2. Does it need a human?
+            // 2. Are its arguments an object? A cut-off or garbled argument
+            //    string used to become `{}`, running the tool with no
+            //    arguments at all — for a delete, the widest one there is.
+            if !call.arguments.is_object() {
+                let shown = bounded(&call.arguments, 200);
+                let msg = format!(
+                    "the arguments for {:?} were not a JSON object, so it was not run (WC317); \
+                     call it again with an object matching its input schema. Received: {}",
+                    call.name,
+                    match &shown { Value::String(s) => s.clone(), other => other.to_string() },
+                );
+                st.steps.push(refused(st.usage.steps, call, &msg, started));
+                app.recorder().record_failure("tool", &format!("tool {} (agent {})", call.name, st.def.name), "WC317", &st.run_id);
+                self.audit
+                    .record(AuditEvent::tool_refused(&st.run_id, &st.actor, &call.name, &msg));
+                results.push(tool_result(&call.id, &json!({"error": msg}), true));
+                continue;
+            }
+
+            // 3. Does it need a human?
             let route_approval = app
                 .route_for_tool(&call.name)
                 .map(|r| r.approval)
@@ -756,7 +785,7 @@ impl AgentRuntime {
                 return CallsOutcome::Suspended { gated: i, results };
             }
 
-            // 3. Dispatch in-process, under delegated authority and the shared
+            // 4. Dispatch in-process, under delegated authority and the shared
             //    budget. Scope enforcement happens inside `dispatch`, so an
             //    agent cannot reach a route its caller could not.
             results.push(self.dispatch_call(app, st, call).await);
@@ -835,13 +864,11 @@ impl AgentRuntime {
             .to_string();
         self.audit.record(AuditEvent::handoff(&st.run_id, &st.actor, &st.def.name, target, &reason));
 
-        let last_input = st
-            .conversation
-            .messages
-            .first()
-            .map(|m| message_text(&m.content))
-            .unwrap_or_default();
-        st.system_suffix = self.system_suffix(app, &next, &actor, &last_input).await?;
+        // Resolved against this turn's input, as at the start of the run. The
+        // conversation's first message was used here, which in a session is
+        // the first turn ever and after a compaction is the summary.
+        let input = st.input.clone();
+        st.system_suffix = self.system_suffix(app, &next, &actor, &input).await?;
         st.actor = actor;
         st.def = next;
         st.path.push(target.to_string());
@@ -1255,6 +1282,29 @@ pub fn tool_result_with_images(id: &str, content: &Value, is_error: bool, images
         result["content"] = Value::Array(blocks);
     }
     result
+}
+
+/// An assistant turn as it is kept in the conversation: without `tool_use`
+/// blocks when its calls will not be run, and `None` when nothing is left.
+fn replayable(content: &Value, keep_tool_use: bool) -> Option<Value> {
+    match content {
+        Value::Array(blocks) => {
+            let kept: Vec<Value> = blocks
+                .iter()
+                .filter(|b| keep_tool_use || b.get("type").and_then(|t| t.as_str()) != Some("tool_use"))
+                .filter(|b| {
+                    // An empty text block is rejected by the Messages API.
+                    b.get("type").and_then(|t| t.as_str()) != Some("text")
+                        || b.get("text").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty())
+                })
+                .cloned()
+                .collect();
+            (!kept.is_empty()).then_some(Value::Array(kept))
+        }
+        Value::String(s) if s.is_empty() => None,
+        Value::Null => None,
+        other => Some(other.clone()),
+    }
 }
 
 /// The text of a message, ignoring images and tool traffic.
@@ -1724,6 +1774,197 @@ mod tests {
         let usage = app.ledger().snapshot(|_| None);
         assert_eq!(usage["runs"], 1);
         assert_eq!(usage["by_caller"]["agent:a"]["calls"], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2.6 hardening: malformed provider output, session hygiene, approvals
+    // -----------------------------------------------------------------------
+
+    fn response(stop: StopReason, raw: Value, calls: Vec<ToolCall>, text: &str) -> ProviderResponse {
+        ProviderResponse {
+            text: text.into(),
+            tool_calls: calls,
+            stop_reason: stop,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            model: "test".into(),
+            raw_content: raw,
+        }
+    }
+
+    /// Every `tool_use` in an assistant message has a `tool_result` in the
+    /// message after it: what both providers require of a replayed history.
+    fn assert_no_dangling_tool_use(messages: &[Value]) {
+        for (i, m) in messages.iter().enumerate() {
+            if m["role"] != "assistant" {
+                continue;
+            }
+            assert!(
+                m["content"].as_array().is_none_or(|b| !b.is_empty()),
+                "an empty assistant turn was replayed: {messages:?}"
+            );
+            for block in m["content"].as_array().into_iter().flatten() {
+                if block["type"] == "tool_use" {
+                    let next = messages.get(i + 1).unwrap_or_else(|| panic!("dangling tool_use: {messages:?}"));
+                    let answered = next["content"].as_array().into_iter().flatten().any(|r| r["tool_use_id"] == block["id"]);
+                    assert!(answered, "tool_use {} has no tool_result: {messages:?}", block["id"]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn arguments_that_are_not_an_object_are_refused_not_run_with_nothing() {
+        // 2.5.3: an OpenAI argument string cut off mid-way parsed as `{}`, and
+        // a bare value was coerced to `{}` at dispatch, so the tool ran with
+        // no arguments at all. Now neither is dispatched; the model is told.
+        for bad in [json!("{\"id\": 5, \"conf"), json!([1, 2]), json!(7)] {
+            let (app, audit, provider) = app_with(ScriptedProvider::tool_then_text("safe", bad.clone(), "ok")).await;
+            let out = run(&app, "a", &caller(&[]), "go").await;
+            assert_eq!(out.status, RunStatus::Completed);
+            assert_eq!(out.usage.tool_calls, 0, "{bad}: must not dispatch");
+            let refused = out.steps.iter().find(|s| s.kind == StepKind::ToolRefused).expect("refused");
+            assert_eq!(refused.code.as_deref(), Some("WC317"));
+            assert!(audit.contains("tool_refused"));
+            let last = provider.snapshots().last().unwrap().messages.last().unwrap().clone();
+            assert_eq!(last["content"][0]["is_error"], true);
+            assert!(last["content"][0]["content"].as_str().unwrap().contains("not a JSON object"));
+        }
+        // A gated tool with garbled arguments is refused, not parked for a human.
+        let (app, _, _) = app_with(ScriptedProvider::tool_then_text("danger", json!("{"), "ok")).await;
+        let out = run(&app, "a", &caller(&["*"]), "go").await;
+        assert_eq!(out.status, RunStatus::Completed);
+        assert!(app.pending_approvals().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_cut_off_at_max_tokens_does_not_poison_the_session() {
+        // 2.5.3 saved the half-written tool_use with no tool_result after it,
+        // and the provider refused every later turn of the session.
+        let call = ToolCall { id: "t1".into(), name: "safe".into(), arguments: json!({}) };
+        let (app, _, provider) = app_with(ScriptedProvider::responses(vec![
+            response(
+                StopReason::MaxTokens,
+                json!([{"type": "text", "text": "let me"}, {"type": "tool_use", "id": "t1", "name": "safe", "input": {}}]),
+                vec![call],
+                "let me",
+            ),
+            response(StopReason::EndTurn, json!([{"type": "text", "text": "two"}]), vec![], "two"),
+        ]))
+        .await;
+        let opts = RunOptions { session_id: Some("s".into()), ..Default::default() };
+        let first = app.invoke_agent("a", "first", &caller(&[]), opts.clone()).await.unwrap();
+        assert_eq!(first.status, RunStatus::MaxTokens);
+        assert_eq!(first.usage.tool_calls, 0);
+        let second = app.invoke_agent("a", "second", &caller(&[]), opts).await.unwrap();
+        assert_eq!(second.status, RunStatus::Completed);
+        let sent = &provider.snapshots()[1].messages;
+        assert_no_dangling_tool_use(sent);
+        assert_eq!(sent[1]["content"], json!([{"type": "text", "text": "let me"}]), "the text survives");
+    }
+
+    #[tokio::test]
+    async fn tool_calls_without_a_tool_use_stop_and_empty_turns_are_not_replayed() {
+        let call = ToolCall { id: "t1".into(), name: "safe".into(), arguments: json!({}) };
+        let (app, _, provider) = app_with(ScriptedProvider::responses(vec![
+            // A provider that stops with calls it does not want run.
+            response(StopReason::EndTurn, json!([{"type": "tool_use", "id": "t1", "name": "safe", "input": {}}]), vec![call], ""),
+            // An answer with nothing in it; the Messages API rejects it replayed.
+            response(StopReason::EndTurn, json!([]), vec![], ""),
+            response(StopReason::EndTurn, json!([{"type": "text", "text": ""}]), vec![], ""),
+            response(StopReason::EndTurn, json!([{"type": "text", "text": "fine"}]), vec![], "fine"),
+        ]))
+        .await;
+        let opts = RunOptions { session_id: Some("s".into()), ..Default::default() };
+        for input in ["one", "two", "three", "four"] {
+            app.invoke_agent("a", input, &caller(&[]), opts.clone()).await.unwrap();
+        }
+        let sent = &provider.snapshots()[3].messages;
+        assert_no_dangling_tool_use(sent);
+        assert_eq!(sent.len(), 4, "four user turns, no empty assistant ones: {sent:?}");
+    }
+
+    #[tokio::test]
+    async fn an_expired_approval_cannot_be_resolved() {
+        // 2.5.3 swept expired approvals only when another run suspended or the
+        // list was read, so a late decision still resumed the run.
+        let mut m = manifest();
+        m.server.approval_ttl_secs = 1;
+        let app = App::build_without_python(m).await.expect("app builds");
+        let provider = Arc::new(ScriptedProvider::always_tool("danger", json!({})));
+        let app = app.with_agent_runtime(AgentRuntime::new(provider, Arc::new(MemoryAudit::default()))).into_arc();
+        let out = run(&app, "a", &caller(&["*"]), "go").await;
+        let pending = out.pending_approval.expect("suspended");
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        let err = app.resolve_approval(&pending.approval_id, true, "", &caller(&["*"])).await.unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        // And a decision is consumed: the same id twice is refused.
+        let out = run(&app, "a", &caller(&["*"]), "go").await;
+        let id = out.pending_approval.expect("suspended").approval_id;
+        assert!(app.resolve_approval(&id, true, "", &caller(&["*"])).await.is_ok());
+        assert!(app.resolve_approval(&id, true, "", &caller(&["*"])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_decisions_on_one_approval_resume_it_exactly_once() {
+        let (app, _, _) = app_with(ScriptedProvider::tool_then_text("danger", json!({}), "done")).await;
+        let out = run(&app, "a", &caller(&["*"]), "go").await;
+        let id = out.pending_approval.expect("suspended").approval_id;
+        let who = caller(&["*"]);
+        let attempts = (0..16).map(|_| app.resolve_approval(&id, true, "", &who));
+        let results = futures::future::join_all(attempts).await;
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_handoff_resolves_context_against_this_turns_input() {
+        // 2.5.3 resolved the new agent's context against the conversation's
+        // first message: in a session, the first turn ever asked.
+        let m: Manifest = serde_json::from_value(json!({
+            "name": "t",
+            "database": {"url": "sqlite://:memory:"},
+            "contexts": [{"name": "asked", "source": {"kind": "query", "sql": "SELECT ? AS asked",
+                                                       "params": ["input"], "returns": "one"}}],
+            "agents": [
+                {"name": "desk", "model": "test", "handoffs": ["spec"]},
+                {"name": "spec", "model": "test", "context": ["asked"]}
+            ]
+        }))
+        .unwrap();
+        let app = App::build_without_python(m).await.expect("app builds");
+        let provider = Arc::new(ScriptedProvider::sequence(vec![
+            ("text", "hello", json!(null)),
+            ("tool", "transfer_to_spec", json!({"reason": "r"})),
+            ("text", "done", json!(null)),
+        ]));
+        let app = app.with_agent_runtime(AgentRuntime::new(provider.clone(), Arc::new(MemoryAudit::default()))).into_arc();
+        let opts = RunOptions { session_id: Some("s".into()), ..Default::default() };
+        app.invoke_agent("desk", "the first question", &caller(&[]), opts.clone()).await.unwrap();
+        let out = app.invoke_agent("desk", "the second question", &caller(&[]), opts).await.unwrap();
+        assert_eq!(out.path, vec!["desk", "spec"]);
+        let suffix = &provider.snapshots()[2].system_suffix;
+        assert!(suffix.contains("the second question"), "{suffix}");
+        assert!(!suffix.contains("the first question"), "{suffix}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_runs_on_one_shared_budget_charge_every_token_exactly() {
+        let (app, _, _) = app_with(ScriptedProvider::always_tool("safe", json!({})).with_tokens(7, 3)).await;
+        let budget = SharedBudget::new("tree", None);
+        let who = caller(&[]);
+        let runs = (0..24).map(|_| {
+            app.invoke_agent("a", "go", &who, RunOptions { budget: Some(budget.clone()), ..Default::default() })
+        });
+        let results = futures::future::join_all(runs).await;
+        let total: u64 = results.iter().map(|r| r.as_ref().unwrap().usage.total_tokens()).sum();
+        assert_eq!(total, 24 * 5 * 10, "every run took its five steps of ten tokens");
+        assert_eq!(budget.used(), total, "the shared counter saw every token once");
+        let usage = app.ledger().snapshot(|_| None);
+        assert_eq!(usage["total_tokens"], total);
+        assert_eq!(usage["totals"]["calls"], 24 * 5);
     }
 
     #[test]

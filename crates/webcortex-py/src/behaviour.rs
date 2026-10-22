@@ -180,6 +180,53 @@ impl BehaviourContext {
         Ok(())
     }
 
+    /// Refuse a model call once there is nothing left to spend. Charging
+    /// after the call raises once, but a behaviour that catches that and asks
+    /// again was making — and paying for — every further call regardless.
+    fn ensure_budget(&self) -> PyResult<()> {
+        if self.budget.exhausted() {
+            return Err(BehaviourHalted::new_err(format!(
+                "the request tree rooted at {:?} has spent its shared token budget of {} ({} spent)",
+                self.budget.label,
+                self.budget.max_tokens.unwrap_or_default(),
+                self.budget.used()
+            )));
+        }
+        if let Some(budget) = self.token_budget {
+            let spent = self
+                .input_tokens
+                .load(Ordering::SeqCst)
+                .saturating_add(self.output_tokens.load(Ordering::SeqCst))
+                .saturating_add(self.cache_tokens.load(Ordering::SeqCst));
+            if spent >= budget {
+                return Err(BehaviourHalted::new_err(format!(
+                    "behaviour {:?} exhausted its token budget of {budget}",
+                    self.behaviour
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Charge a response to the ledger and to both budgets, without deciding
+    /// yet whether the behaviour may continue.
+    fn account(&self, response: &webcortex_core::agent::ProviderResponse) -> PyResult<()> {
+        self.app.ledger().charge(
+            "behaviour",
+            &self.behaviour,
+            &response.model,
+            response.input_tokens,
+            response.output_tokens,
+            response.cache_read_tokens,
+            response.cache_write_tokens,
+        );
+        self.charge_tokens(
+            response.input_tokens,
+            response.output_tokens,
+            response.cache_read_tokens.saturating_add(response.cache_write_tokens),
+        )
+    }
+
     fn record(&self, kind: &str, label: &str, detail: serde_json::Value, duration_ms: u64) {
         if let Ok(mut trace) = self.trace.lock() {
             trace.push(TraceEntry {
@@ -257,21 +304,12 @@ impl BehaviourContext {
     /// when a schema was given (recovered from prose if a local model answered
     /// in text), otherwise the text.
     fn settle_ask(&self, py: Python<'_>, response: webcortex_core::agent::ProviderResponse, structured: bool, elapsed: u64) -> PyResult<Py<PyAny>> {
-        self.app.ledger().charge(
-            "behaviour",
-            &self.behaviour,
-            &response.model,
-            response.input_tokens,
-            response.output_tokens,
-            response.cache_read_tokens,
-            response.cache_write_tokens,
-        );
-        self.charge_tokens(
-            response.input_tokens,
-            response.output_tokens,
-            response.cache_read_tokens.saturating_add(response.cache_write_tokens),
-        )?;
+        self.account(&response)?;
+        self.answer(py, response, structured, elapsed)
+    }
 
+    /// What `ask` returns for a response that has already been charged.
+    fn answer(&self, py: Python<'_>, response: webcortex_core::agent::ProviderResponse, structured: bool, elapsed: u64) -> PyResult<Py<PyAny>> {
         if structured {
             let value = response
                 .tool_calls
@@ -465,6 +503,7 @@ impl BehaviourContext {
         max_tokens: Option<u32>,
         temperature: Option<f32>,
     ) -> PyResult<Py<PyAny>> {
+        self.ensure_budget()?;
         self.charge_step()?;
 
         let schema_json = match schema {
@@ -532,6 +571,7 @@ impl BehaviourContext {
         temperature: Option<f32>,
         concurrency: usize,
     ) -> PyResult<Py<PyAny>> {
+        self.ensure_budget()?;
         for _ in &prompts {
             self.charge_step()?;
         }
@@ -585,13 +625,28 @@ impl BehaviourContext {
         });
         let elapsed = started.elapsed().as_millis() as u64;
 
+        // Every answer that came back was paid for, so every one is charged
+        // before anything is raised. Settling in order and stopping at the
+        // first failure (or the first answer over budget) left the rest of
+        // the batch out of the ledger and the shared budget.
+        let mut halted: Option<PyErr> = None;
+        for response in responses.iter().flatten() {
+            if let Err(e) = self.account(response)
+                && halted.is_none()
+            {
+                halted = Some(e);
+            }
+        }
+        if let Some(e) = halted {
+            return Err(e);
+        }
         let list = PyList::empty(py);
         for response in responses {
             let response = response.map_err(|e| {
                 self.record("ask_failed", "model", serde_json::json!({"error": &e}), elapsed);
                 PyRuntimeError::new_err(e)
             })?;
-            list.append(self.settle_ask(py, response, structured, elapsed)?)?;
+            list.append(self.answer(py, response, structured, elapsed)?)?;
         }
         Ok(list.into_any().unbind())
     }
@@ -773,7 +828,18 @@ pub fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         return Ok(serde_json::Value::String(s.to_str()?.to_string()));
     }
     if let Ok(i) = value.cast::<PyInt>() {
-        return Ok(serde_json::Value::from(i.extract::<i64>()?));
+        // JSON has one number type; every integer that fits 64 bits either
+        // way round is kept exact. `2**63` used to raise OverflowError.
+        if let Ok(n) = i.extract::<i64>() {
+            return Ok(serde_json::Value::from(n));
+        }
+        if let Ok(n) = i.extract::<u64>() {
+            return Ok(serde_json::Value::from(n));
+        }
+        return Err(PyValueError::new_err(format!(
+            "integer {} does not fit in 64 bits, which is as large as a JSON number is kept exactly; pass it as a string",
+            i.str()?
+        )));
     }
     if let Ok(f) = value.cast::<PyFloat>() {
         return Ok(serde_json::Value::from(f.extract::<f64>()?));
@@ -825,6 +891,9 @@ pub fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAn
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 i.into_pyobject(py)?.into_any().unbind()
+            } else if let Some(u) = n.as_u64() {
+                // Above i64::MAX: an int, not a float that has lost the low bits.
+                u.into_pyobject(py)?.into_any().unbind()
             } else {
                 n.as_f64().unwrap_or(0.0).into_pyobject(py)?.into_any().unbind()
             }

@@ -14,6 +14,22 @@ use serde_json::{Value, json};
 /// The MCP revision this server implements.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Revisions a client may ask for and get back unchanged. Everything this
+/// server does — tools, resources, `structuredContent` aside, which older
+/// clients ignore — reads the same in each. Answering every client with the
+/// newest revision told a 2024-11-05 client the server spoke something it did
+/// not, and the spec has a client disconnect when that happens.
+pub const SUPPORTED_VERSIONS: [&str; 3] = [PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
+
+/// The revision to answer `initialize` with: the client's, when this server
+/// supports it, otherwise the newest this server has.
+pub fn negotiate_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| SUPPORTED_VERSIONS.iter().find(|v| **v == r))
+        .copied()
+        .unwrap_or(PROTOCOL_VERSION)
+}
+
 /// Most messages one JSON-RPC batch may carry. Each one can be a tool call, and
 /// the rate limiter sees a batch as a single request, so an unbounded batch
 /// turned one admitted request into any number of tool runs. (MCP 2025-06-18
@@ -45,6 +61,10 @@ pub async fn handle_request(app: &App, body: &[u8], caller: &Principal, request_
     match parsed {
         // JSON-RPC batch.
         Value::Array(items) => {
+            // An empty batch is itself an invalid request (JSON-RPC 2.0 §6).
+            if items.is_empty() {
+                return jsonrpc_response(error_obj(Value::Null, -32600, "an empty batch is not a request".into(), "WC205"));
+            }
             if items.len() > MAX_BATCH {
                 return jsonrpc_response(error_obj(
                     Value::Null,
@@ -74,20 +94,51 @@ pub async fn handle_request(app: &App, body: &[u8], caller: &Principal, request_
 
 /// Returns `None` for notifications, which must not receive a response.
 async fn handle_one(app: &App, req: Value, caller: &Principal, request_id: &str) -> Option<Value> {
-    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let id = req.get("id").cloned();
-    let params = req.get("params").cloned().unwrap_or(Value::Null);
+    // Something that is not a request object at all — `[1, 2]`, `"x"` — was
+    // read as a notification and dropped without a word. JSON-RPC answers it
+    // with an Invalid Request error, id null.
+    let Some(obj) = req.as_object() else {
+        return Some(error_obj(Value::Null, -32600, "a JSON-RPC message must be an object".into(), "WC205"));
+    };
+    let method = obj.get("method").and_then(|m| m.as_str());
+    let id = obj.get("id").cloned();
 
-    if id.is_none() {
+    let Some(method) = method else {
+        // A response to a request: this server sends none, so there is nothing
+        // to match it to, and a response must never be answered.
+        if id.is_some() && (obj.contains_key("result") || obj.contains_key("error")) {
+            tracing::debug!("mcp: ignored a JSON-RPC response from the client");
+            return None;
+        }
+        let message = if obj.contains_key("method") { "'method' must be a string" } else { "a request needs a 'method'" };
+        return Some(error_obj(valid_id(id.as_ref()), -32600, message.into(), "WC205"));
+    };
+
+    let Some(id) = id else {
         // A notification. Nothing we currently track needs to react.
         tracing::debug!(method, "mcp notification");
         return None;
+    };
+    // MCP ids are strings or integers, never null; JSON-RPC allows numbers.
+    // An object, array, bool or null id was echoed back as if it were fine.
+    if !(id.is_string() || id.is_number()) {
+        return Some(error_obj(Value::Null, -32600, "'id' must be a string or a number".into(), "WC205"));
     }
-    let id = id.unwrap();
+    // MCP params are always an object. An empty list is read as "no params",
+    // which is what a client that sends `[]` means; anything else is refused
+    // rather than silently replaced with nothing.
+    let params = match obj.get("params") {
+        None | Some(Value::Null) => json!({}),
+        Some(Value::Array(a)) if a.is_empty() => json!({}),
+        Some(p @ Value::Object(_)) => p.clone(),
+        Some(_) => {
+            return Some(error_obj(id, -32602, "'params' must be an object".into(), "WC206"));
+        }
+    };
 
     let result = match method {
         "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": negotiate_version(params.get("protocolVersion").and_then(|v| v.as_str())),
             "capabilities": {
                 "tools": { "listChanged": false },
                 "resources": { "listChanged": false, "subscribe": false },
@@ -124,7 +175,11 @@ async fn handle_one(app: &App, req: Value, caller: &Principal, request_id: &str)
     Some(match result {
         Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
         Err((code, message)) => {
-            let wc = if code == -32601 { "WC212" } else { "WC205" };
+            let wc = match code {
+                -32601 => "WC212",
+                -32602 => "WC206",
+                _ => "WC205",
+            };
             let mut obj = error_obj(id, code, message, wc);
             if code == -32601 {
                 // WC212's own hint lists control-plane GET paths, which is no
@@ -335,7 +390,13 @@ async fn call_tool(app: &App, params: &Value, caller: &Principal, request_id: &s
         .get("name")
         .and_then(|n| n.as_str())
         .ok_or((-32602, "tools/call requires a 'name'".to_string()))?;
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    // An argument list or a bare value was coerced to `{}`, and the tool ran
+    // with none of what the client meant to pass.
+    let args = match params.get("arguments") {
+        None | Some(Value::Null) => json!({}),
+        Some(a @ Value::Object(_)) => a.clone(),
+        Some(_) => return Err((-32602, "tools/call 'arguments' must be an object".to_string())),
+    };
 
     if may_observe(app, caller)
         && let Some(result) = call_builtin(app, name, &args) {
@@ -411,6 +472,15 @@ fn mcp_image(block: &Value) -> Option<Value> {
     }))
 }
 
+/// The id to answer an invalid request with: its own when that is usable,
+/// otherwise null.
+fn valid_id(id: Option<&Value>) -> Value {
+    match id {
+        Some(v) if v.is_string() || v.is_number() => v.clone(),
+        _ => Value::Null,
+    }
+}
+
 fn error_obj(id: Value, code: i64, message: String, wc: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {
         "code": code,
@@ -428,5 +498,135 @@ fn accepted() -> WebCortexResponse {
         status: 202,
         headers: vec![],
         body: bytes::Bytes::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::Manifest;
+
+    async fn app() -> std::sync::Arc<App> {
+        let m: Manifest = serde_json::from_value(json!({
+            "name": "m",
+            "routes": [
+                {"id": 0, "method": "POST", "path": "/echo", "op": {"kind": "static", "body": {"ok": true}},
+                 "tool": {"expose": true, "name": "echo"}},
+                {"id": 1, "method": "GET", "path": "/list", "op": {"kind": "static", "body": [1, 2, 3]},
+                 "tool": {"expose": true, "name": "list"}}
+            ]
+        }))
+        .unwrap();
+        App::build_without_python(m).await.expect("app").into_arc()
+    }
+
+    fn who() -> Principal {
+        Principal::anonymous()
+    }
+
+    async fn send(app: &App, body: Value) -> (u16, Value) {
+        let res = handle(app, &serde_json::to_vec(&body).unwrap(), &who()).await;
+        let status = res.status;
+        (status, if res.body.is_empty() { Value::Null } else { res.json_value() })
+    }
+
+    #[tokio::test]
+    async fn initialize_answers_with_the_clients_revision_when_supported() {
+        let app = app().await;
+        for (asked, answered) in [
+            (json!("2024-11-05"), "2024-11-05"),
+            (json!("2025-03-26"), "2025-03-26"),
+            (json!("2025-06-18"), "2025-06-18"),
+            (json!("2099-01-01"), PROTOCOL_VERSION),
+            (json!(7), PROTOCOL_VERSION),
+            (Value::Null, PROTOCOL_VERSION),
+        ] {
+            let (_, out) = send(&app, json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                            "params": {"protocolVersion": asked}})).await;
+            assert_eq!(out["result"]["protocolVersion"], answered, "asked {asked}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_messages_get_an_invalid_request_error_not_silence() {
+        let app = app().await;
+        // 2.5.3 read each of these as a notification and answered 202, empty.
+        let (status, out) = send(&app, json!([1, "x"])).await;
+        assert_eq!(status, 200);
+        let errors = out.as_array().expect("one error per item");
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().all(|e| e["error"]["code"] == -32600 && e["id"].is_null()));
+
+        let (_, out) = send(&app, json!(5)).await;
+        assert_eq!(out["error"]["code"], -32600);
+        let (_, out) = send(&app, json!([])).await;
+        assert_eq!(out["error"]["code"], -32600, "an empty batch is invalid");
+
+        let (_, out) = send(&app, json!({"jsonrpc": "2.0", "id": 3})).await;
+        assert_eq!((out["error"]["code"].clone(), out["id"].clone()), (json!(-32600), json!(3)));
+        let (_, out) = send(&app, json!({"jsonrpc": "2.0", "id": 3, "method": 9})).await;
+        assert_eq!(out["error"]["code"], -32600);
+
+        for bad in [json!({"a": 1}), json!([1]), json!(true), Value::Null] {
+            let (_, out) = send(&app, json!({"jsonrpc": "2.0", "id": bad, "method": "ping"})).await;
+            assert_eq!(out["error"]["code"], -32600, "id {bad}");
+            assert!(out["id"].is_null());
+        }
+        // Numbers and strings are fine, and are echoed exactly.
+        for good in [json!(0), json!(-4), json!(1.5), json!("abc"), json!("")] {
+            let (_, out) = send(&app, json!({"jsonrpc": "2.0", "id": good, "method": "ping"})).await;
+            assert_eq!(out["id"], good);
+            assert!(out.get("result").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_response_from_the_client_is_not_answered() {
+        let app = app().await;
+        let (status, out) = send(&app, json!({"jsonrpc": "2.0", "id": 4, "result": {}})).await;
+        assert_eq!((status, out), (202, Value::Null));
+        let (status, _) = send(&app, json!({"jsonrpc": "2.0", "id": 5, "error": {"code": 1, "message": "x"}})).await;
+        assert_eq!(status, 202);
+        // In a batch beside a request, only the request is answered.
+        let (_, out) = send(&app, json!([{"jsonrpc": "2.0", "id": 4, "result": {}},
+                                         {"jsonrpc": "2.0", "id": 6, "method": "ping"},
+                                         {"jsonrpc": "2.0", "method": "notifications/initialized"}])).await;
+        assert_eq!(out.as_array().unwrap().len(), 1);
+        assert_eq!(out[0]["id"], 6);
+    }
+
+    #[tokio::test]
+    async fn tool_arguments_that_are_not_an_object_are_refused() {
+        let app = app().await;
+        for bad in [json!([1]), json!("n=3"), json!(4)] {
+            let (_, out) = send(&app, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                            "params": {"name": "echo", "arguments": bad}})).await;
+            assert_eq!(out["error"]["code"], -32602, "{bad}");
+            assert_eq!(out["error"]["data"]["code"], "WC206");
+        }
+        let (_, out) = send(&app, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                        "params": {"name": "echo", "arguments": null}})).await;
+        assert_eq!(out["result"]["isError"], false, "null is no arguments");
+        let (_, out) = send(&app, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": [1]})).await;
+        assert_eq!(out["error"]["code"], -32602);
+        let (_, out) = send(&app, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": []})).await;
+        assert!(out["result"]["tools"].is_array(), "an empty params list is no params");
+    }
+
+    #[tokio::test]
+    async fn structured_content_is_always_an_object_and_a_full_batch_is_answered_in_order() {
+        let app = app().await;
+        let calls: Vec<Value> = (0..MAX_BATCH)
+            .map(|i| json!({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                            "params": {"name": if i % 2 == 0 { "echo" } else { "list" }}}))
+            .collect();
+        let (_, out) = send(&app, Value::Array(calls)).await;
+        let out = out.as_array().unwrap();
+        assert_eq!(out.len(), MAX_BATCH);
+        for (i, r) in out.iter().enumerate() {
+            assert_eq!(r["id"], i);
+            assert!(r["result"]["structuredContent"].is_object());
+        }
+        assert_eq!(out[1]["result"]["structuredContent"], json!({"result": [1, 2, 3]}));
     }
 }

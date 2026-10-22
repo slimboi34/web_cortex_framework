@@ -146,6 +146,8 @@ pub static CATALOGUE: &[ErrorInfo] = &[
        "A step of the flow failed or was refused; the message names the step. Run that tool alone to see its error."),
     e!("WC316", "agent", None, "Watcher run failed",
        "A watcher's agent run failed; the insight carries the error. GET /_webcortex/status shows the watcher's recent runs."),
+    e!("WC317", "agent", None, "Malformed tool call",
+       "The model asked for a tool with arguments that are not a JSON object (cut off, garbled, or a bare value), so the tool was not run. The model is told and may retry; a small local model that keeps doing it needs a larger max_tokens or a simpler input schema."),
 
     // ---- WC4xx budgets and limits ---------------------------------------
     e!("WC401", "limits", Some(429), "Rate limited",
@@ -253,7 +255,7 @@ pub fn classify_run_error(message: &str) -> &'static str {
         "WC311"
     } else if m.contains("token budget") {
         "WC402"
-    } else if names_a_status(m) {
+    } else if names_a_status(m) || m.contains("returned an error") {
         "WC304"
     } else {
         "WC300"

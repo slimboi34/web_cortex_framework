@@ -281,10 +281,15 @@ impl App {
         note: &str,
         approver: &Principal,
     ) -> Result<RunResult, String> {
+        // An expired approval is only swept when another run suspends or the
+        // list is read, so the age is checked here too: without it a decision
+        // could still resume a run hours past `approval_ttl_secs`.
+        let ttl = Duration::from_secs(self.manifest.server.approval_ttl_secs);
         let run = {
             let mut map = self.approvals.lock().unwrap_or_else(|p| p.into_inner());
             map.remove(approval_id)
         }
+        .filter(|r| r.created.elapsed() <= ttl)
         .ok_or_else(|| format!("no pending approval {approval_id:?}; it may have expired or already been decided"))?;
         let runtime = self
             .agent_runtime

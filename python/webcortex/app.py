@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
@@ -724,6 +725,12 @@ class WebCortex:
         none. With prices declared, `GET /_webcortex/usage` reports an
         estimated cost alongside the token counts it always reports.
         """
+        rates = {"input_per_mtok": input_per_mtok, "output_per_mtok": output_per_mtok,
+                 "cache_read_per_mtok": cache_read_per_mtok, "cache_write_per_mtok": cache_write_per_mtok}
+        for field, rate in rates.items():
+            # NaN broke the manifest at boot; a negative price reported spend as savings.
+            if not math.isfinite(float(rate)) or float(rate) < 0:
+                raise ValueError(f"pricing({model!r}): {field} must be a finite number >= 0, got {rate!r}")
         self._models["pricing"][model] = {
             "input_per_mtok": float(input_per_mtok),
             "output_per_mtok": float(output_per_mtok),
@@ -1113,6 +1120,15 @@ class WebCortex:
 
         def decorator(fn: Callable) -> Callable:
             behaviour_name = name or fn.__name__
+            # A behaviour runs on a worker thread and blocks in ctx.call/ask;
+            # an `async def` one returned an un-awaited coroutine, which failed
+            # every run as "could not be serialised".
+            if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
+                raise TypeError(
+                    f"behaviour {behaviour_name!r} is async; behaviours are plain `def` "
+                    "functions — ctx.call and ctx.ask block, and gather/ask_many run "
+                    "their leaves concurrently"
+                )
             doc = inspect.getdoc(fn) or ""
             handler_index = len(self._handlers)
             self._handlers.append(fn)
@@ -1246,6 +1262,9 @@ class WebCortex:
         if keep_recent < 1:
 
             raise ValueError("agent(): keep_recent must be at least 1")
+        if context_window is not None and context_window < 1:
+            # 0 compacted — and paid for a summary — on every single step.
+            raise ValueError("agent(): context_window must be at least 1 token (or None for no compaction)")
 
         tool_list = list(tools)
         system_text = system

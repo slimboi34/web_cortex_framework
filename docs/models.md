@@ -67,6 +67,12 @@ directions. Sessions, the audit trail and compaction never see a
 provider-specific structure, and a session started on one model can continue
 on another.
 
+A transient failure — a refused connection, or 408, 409, 429, 500, 502, 503,
+504 or 529 — is retried twice, after 0.25 s and 0.5 s (or the provider's
+`retry-after`, when it is 10 s or less), as the official SDKs do. A timeout
+is not retried. What fails after that is reported with the provider's status
+and its own words, even when the body is HTML from a proxy (WC304).
+
 ### Local models
 
 ```bash

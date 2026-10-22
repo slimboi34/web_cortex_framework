@@ -1180,6 +1180,11 @@ impl Manifest {
                     b.name
                 ));
             }
+            // Every provider refuses a request for zero tokens, so this used to
+            // surface only as a provider error on the first ctx.ask.
+            if b.max_tokens == 0 {
+                return Err(format!("behaviour {:?} has max_tokens=0 and could never get an answer", b.name));
+            }
         }
 
         // Two routes answering to one tool name would make a model's tool call
@@ -1269,6 +1274,9 @@ impl Manifest {
             }
             if a.max_steps == Some(0) {
                 return Err(format!("agent {:?} has max_steps=0 and could never act", a.name));
+            }
+            if a.max_tokens == 0 {
+                return Err(format!("agent {:?} has max_tokens=0 and could never get an answer", a.name));
             }
             check_contexts(&a.name, "agent", &a.context)?;
             for h in &a.handoffs {
