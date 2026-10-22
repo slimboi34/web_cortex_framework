@@ -321,6 +321,45 @@ could disclose:
 - Dependencies: the nine advisories that blocked the 2.4.1 release (quinn-proto,
   rustls) are resolved; `cargo audit` and `pip-audit` (docs toolchain) are clean.
 
+## Review — 2.6.0 (hardening pass)
+
+2.6.0 came from probing every layer with hostile and malformed input. These are the
+fixes with a security impact; `tests/test_stress_*.py` holds a regression test for each.
+
+- **Identity:**
+  - A signed JWT's `root`, `root_anonymous`, `agent` or `on_behalf_of` claim used to
+    choose the `@principal` a query bound to. These claims are now stripped at the
+    edge; only the runtime sets them, for delegated calls.
+  - Tokens without a `sub` no longer share one identity.
+  - A non-ASCII credential is refused rather than treated as anonymous.
+- **Response integrity:**
+  - A handler can no longer set `Content-Length`, `Transfer-Encoding` or hop-by-hop
+    headers. A short `Content-Length` used to split responses on a keep-alive
+    connection.
+  - Every response to a CORS-enabled app carries `Vary: Origin`.
+- **XSS:** templates with Jinja suffixes (`.html.j2`), `.svg`, `.xhtml` or an
+  upper-case extension are now autoescaped.
+- **Tool safety:** a model's tool call whose arguments are not a JSON object is
+  refused (`WC317`) instead of running with `{}`.
+- **E-stop:**
+  - An actuator call queued behind busy workers is checked against the halt as it
+    starts (423).
+  - An actuator call whose caller has already timed out is not started.
+  - A handler that is already running is still not interrupted; see `docs/device-hub.md`.
+- **Denial of service:**
+  - Fixed:
+    - a silent HTTP/2 connection is cut at the header timeout;
+    - a declared over-limit body is no longer buffered;
+    - the rate limiter no longer costs O(keys) per request;
+    - a device that never reads its replies, or a subscriber that stops reading, can
+      no longer pin a task;
+    - a behaviour returning a self-referential value no longer overflows the server's
+      stack.
+  - Still open: there is no global connection cap, and the proxy buffers upstream
+    responses without a size cap.
+- **Disclosure:** a response that fails to serialise no longer sends its traceback to
+  the client.
+
 ## Reporting
 
 Report a vulnerability privately through

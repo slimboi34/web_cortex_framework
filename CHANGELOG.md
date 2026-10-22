@@ -3,6 +3,225 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.6.0] — 2026-10-22
+
+A hardening pass over the whole framework: the HTTP layer, the agent runtime and MCP,
+WebSockets and the device hub, and the Python API. Every bug below was reproduced
+against a running app before it was fixed. About 80 fixes and 250 new tests (4 new
+stress suites). A regression notebook in `benchmarks/user_workflows/` runs real-use
+scenarios against the published 2.5.3 and this release side by side.
+
+This is a minor release because some fixes change behaviour users can observe. Each of
+those changes is listed under **Changed**, and the old behaviour was a bug in every case.
+
+### Security
+
+- **A signed JWT could choose whose data it read.** A token carrying
+  `{"sub": "mallory", "root": "alice"}` bound `@principal` to `alice`. The delegation
+  claims `root`, `root_anonymous`, `agent` and `on_behalf_of` are now stripped from
+  tokens at the edge.
+- **Tokens without a `sub` shared one identity**, and with it their `@principal` data and
+  agent sessions. They are now treated like anonymous callers for those features
+  (`WC607`).
+- **A non-ASCII `Authorization` or `x-api-key` made the caller anonymous** instead of
+  refused. It is now a 401.
+- **Templates named `.html.j2`, `.html.jinja`, `.svg`, `.xhtml` or `.HTML` were not
+  autoescaped**, which allowed XSS. They are now escaped.
+- **A handler's `Content-Length` could split responses.** A short one turned the rest of
+  the body into the next response on a keep-alive connection. Framing headers
+  (`content-length`, `transfer-encoding` and the hop-by-hop headers) set by handlers are
+  now dropped.
+- **A tool call whose arguments were garbled or not an object ran the tool with `{}`.**
+  It is now refused before any approval gate, with the new code **`WC317`**.
+- **Actuator calls queued behind a busy worker still ran after the e-stop.** They now get
+  423 `WC502` when they reach the handler. An actuator whose caller has already timed
+  out is not started (`WC203`).
+- **A value that couldn't be serialised sent its traceback, with server paths, to the
+  client.** The traceback is now logged only.
+- **A behaviour returning a self-referential dict crashed the server process** with a
+  stack overflow. It now fails that run cleanly.
+
+### Fixed — HTTP
+
+- **Graceful shutdown drains.** A request in flight at SIGTERM used to get an empty
+  reply, and idle keep-alive connections were never closed.
+- **Slow clients over HTTP/2:** an h2c connection that went silent was held forever. It
+  now hits the same header timeout as HTTP/1.
+- **HEAD works on every GET route**, so `curl -I` and load-balancer health checks no
+  longer get 405. OPTIONS on a path answers 204 with `Allow`. With CORS on, an OPTIONS
+  without an Origin is no longer refused as a failed preflight.
+- **CORS responses always carry `Vary: Origin`**, so a shared cache cannot replay a
+  response that lacks CORS headers to a trusted origin.
+- **Static files:**
+  - a mount point now serves its `index` (`/docs` and `/docs/`);
+  - a directory requested without its trailing slash redirects instead of breaking
+    relative links;
+  - `If-None-Match` uses weak comparison, so lists, the strong form and `*` work.
+- **Oversized bodies:** a body declared over the limit is no longer buffered before the
+  413, and `Expect: 100-continue` gets the 413 straight away.
+- **Duplicate response headers:** a handler's own `Content-Type` or `X-Frame-Options`
+  used to be sent next to the default. It now replaces the default.
+- **Repeated request headers** are joined (cookies with `; `) instead of keeping only
+  the last value.
+- **Unsendable responses:** a handler status such as 42, or a header containing CR/LF,
+  is now a coded JSON 500 (`WC002` from Python handlers, `WC001` otherwise) instead of a
+  bare text 500.
+- **Query and SQL parameters:**
+  - `007`, `nan`, `inf`, `1e999` and 20-digit integers are no longer coerced to numbers,
+    so ZIP codes keep their leading zero and NULLs no longer appear;
+  - a malformed or non-object JSON body on a query route is a 400 `WC205` instead of
+    inserting a row of NULLs.
+- **Control plane:** `/_webcortexfoo` no longer matches it, a trailing slash works on
+  control routes, and HEAD works on them.
+- **Rate limiter:** each check no longer walks every key, which used to be O(keys)
+  during a flood.
+- **OpenAPI:**
+  - query parameters of GET/DELETE routes are now documented;
+  - `{*rest}` paths are valid;
+  - `requestBody` is required only when the schema requires something.
+
+### Fixed — agents, behaviours, flows and MCP
+
+- **Provider calls retry:** twice, on connection refused and on
+  408/409/429/500/502/503/504/529, honouring `retry-after` up to 10 s.
+- **Provider errors:** an error with a text or HTML body is reported with its status
+  (`WC304`) rather than as an unreadable body.
+- **OpenAI-compatible tool calls:** a `finish_reason: "stop"` that carries tool calls
+  (Ollama and vLLM send this) now runs the tools. It used to end the run with empty
+  output.
+- **Tool-call ids:** missing, empty or duplicate ids are made unique, so tool results
+  pair with their calls.
+- **Usage counts:** float counts are now charged instead of being counted as 0.
+- **Sessions:**
+  - a truncated tool call or an empty assistant turn no longer poisons the session,
+    which used to make every later turn a provider 400;
+  - sessions are bounded at 400 messages or 8 MB, dropping the oldest whole turns.
+- **Approvals:** a decision after an approval's TTL no longer resumes the run.
+- **Handoffs:** a handed-off agent resolves its context against this turn's input, not
+  the session's first message.
+- **Behaviours:**
+  - one that caught `BehaviourHalted` could keep calling `ask` past its budget; it now
+    cannot;
+  - `ask_many` charges every answer it paid for;
+  - integers beyond 64 bits survive the boundary in both directions.
+- **Flows:** a failed pipeline records `flow_finished`, and a flow started on a spent
+  budget runs nothing.
+- **Ledger:** spend beyond 10,000 keys goes to an `(overflow)` line instead of being
+  dropped.
+- **MCP:**
+  - `initialize` echoes the protocol versions 2024-11-05 and 2025-03-26;
+  - invalid batch items, scalar messages, empty batches and object/array/bool/null ids
+    get -32600 instead of a silent 202 or an echo;
+  - responses sent by the client are ignored;
+  - `tools/call` arguments that are not an object get -32602.
+- **Declaration errors** for `max_tokens=0`, `context_window < 1` and NaN or negative
+  `pricing`.
+
+### Fixed — WebSockets and the device hub
+
+- **A camera that never read its replies deadlocked the hub** after about 2,000 bad
+  frames. Replies now go through a bounded queue.
+- **A subscriber that stopped reading was held forever.** Sends now give up after a
+  30 s stall, and quiet streams get a ping every 30 s.
+- **RFC 6455 close codes:** protocol violations close with 1002, 1007 or 1009 instead of
+  a bare TCP drop, and a client's close is echoed.
+- **`max_fps` dropped on-rate frames:** a 10 fps camera with ±10 ms jitter lost 18 of 50
+  frames. Admission now allows half an interval of tolerance (GCRA), and a flood is
+  still capped.
+- **Frame order:** frame `seq` order is consistent under concurrent pushes and pulls.
+- **IP cameras:** concurrent snapshots of a pulled camera share one upstream fetch;
+  40 snapshots used to mean 40 fetches.
+- **Frame accounting:** oversized socket frames are now counted in `frames_rejected`.
+- **Agent sockets:** a binary message on one gets `WC306` instead of hanging the client.
+- **Watchers:** an `every` of `1e30` is refused at declaration instead of panicking the
+  watcher.
+- **`webcortex.client`** handles a hostile or broken server:
+  - masked frames, reserved bits and opcodes, interleaved messages and bad control
+    frames now raise `WebSocketError`;
+  - the handshake is capped at 64 KB, and closes are echoed;
+  - IPv6 `Host` headers are built correctly;
+  - large fragmented messages are buffered in linear time.
+
+  `DeviceConnection` reports the hub's replies and its close reason.
+- **`Image`:**
+  - refuses zero-size arrays;
+  - refuses bytes whose content doesn't match the label (for example `b"junk"` labelled
+    PNG, or JPEG labelled PNG);
+  - handles NumPy scalars in lists.
+
+### Fixed — the Python API
+
+- **Response encoding:**
+  - NaN and inf become `null`, so a NaN no longer produces invalid JSON;
+  - an Enum encodes as its value (it used to dump the class dict);
+  - datetimes are ISO 8601, bytes are base64, sets are sorted arrays, generators and
+    async generators are arrays, and slotted dataclasses encode by field;
+  - non-string dict keys are converted.
+- **Handlers:**
+  - `sys.exit()` or KeyboardInterrupt in an async handler no longer kills its event
+    loop, which made every second later request time out;
+  - callables that return coroutines are awaited: `async __call__`, sync wrappers of
+    async functions, and `async def` behaviours;
+  - positional-only parameters bind correctly;
+  - a non-JSON body is a 400 `WC205` instead of a 500.
+- **Responses:** headers may be a list of pairs (several `set-cookie`), a `content-type`
+  header replaces the default, and a `str` body with a non-JSON content type is sent as
+  written.
+- **Schemas:**
+  - recursive dataclasses, `tuple[...]`, Enum, TypedDict, Annotated and NewType are now
+    described correctly;
+  - one unresolvable forward reference no longer disables coercion for every parameter;
+  - a default that isn't JSON no longer crashes boot.
+- **Coercion** reaches date, datetime, UUID, Decimal, Enum, Literal, bytes, `list[Item]`
+  and nested dataclasses. A value it cannot convert without loss is passed through
+  unchanged, as before.
+- **`resource()`:**
+  - a non-INTEGER primary key is now required on create; every row used to get a NULL
+    key;
+  - `Optional[float]` columns are REAL;
+  - names that aren't SQL identifiers are refused at declaration.
+- **Tool names** derived from paths containing `.`, `*` or `~` are sanitised.
+- **CLI:**
+  - a bad `WEBCORTEX_PORT` or `--workers` is a `WC101` naming the setting instead of a
+    traceback;
+  - `mcp-config` honours `control_prefix`;
+  - Windows `C:\…:app` targets work, and `pkg.mod:app` targets import from the current
+    directory;
+  - `.env` handles `export` lines and inline comments;
+  - `new` refuses to overwrite with a clear message.
+- **Starters:** a name containing quotes no longer generates an `api.py` with a syntax
+  error.
+- **TypeScript client (`typegen`):**
+  - it now compiles under `tsc --strict` for every app; any route with a required
+    parameter used to fail;
+  - colliding or invalid method names are fixed;
+  - unions, tuples and nullable enums are typed correctly.
+
+### Changed
+
+- HEAD on a GET route returns 200 instead of 405, and OPTIONS returns 204 with `Allow`.
+- Query and path values that only look numeric (`007`, `+5`, `nan`, huge integers) bind
+  as strings in declared queries and pages.
+- A malformed JSON body is a 400 on query routes and on Python handlers.
+- A handler's `Content-Length`, `Transfer-Encoding` and hop-by-hop headers are dropped,
+  and its `X-Frame-Options`, CSP and `Content-Type` replace the defaults.
+- `static_files("/", index=...)` replaces the default `/` discovery route. A directory
+  requested without its slash redirects (301).
+- Tokens without a subject get 401 `WC607` on `@principal` routes and sessions.
+- MCP:
+  - invalid ids and invalid batch items now get -32600;
+  - non-object `params` or `arguments` get -32602;
+  - "tools/call requires a name" is now `WC206`.
+- Sessions keep at most 400 messages or 8 MB.
+- Responses encode NaN as `null`, Enums as their value, datetimes with a `T`, and plain
+  objects by their public attributes. A `str` parameter that receives an object, or an
+  `int` parameter that receives `3.7`, passes the value through instead of `repr()` or
+  truncating.
+- `Image` refuses bytes whose type doesn't match the label.
+- A WebSocket subscriber stalled for 30 s is disconnected.
+- A pushed frame up to half an interval early is admitted.
+- Explicit tool names with spaces, dots or slashes are refused at check time.
+
 ## [2.5.3] — 2026-10-17
 
 Two fixes found while upgrading an app (a camera-monitoring proof of concept) to 2.5.2.
