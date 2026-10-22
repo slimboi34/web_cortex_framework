@@ -296,6 +296,9 @@ fn request_to_py<'py>(py: Python<'py>, req: &WebCortexRequest) -> PyResult<Bound
         query.set_item(k, v)?;
     }
     d.set_item("query", query)?;
+    // Every pair, repeats included, for `Request.query_list` and list-typed params.
+    let pairs: Vec<(&str, &str)> = req.query_pairs();
+    d.set_item("query_all", pairs)?;
 
     let headers = PyDict::new(py);
     for (k, v) in &req.headers {

@@ -3,6 +3,35 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [Unreleased]
+
+### Added
+
+- `WebCortex(max_connections=10_000)`: a ceiling on open connections, WebSockets included.
+  Past it a new connection is answered `503` (`WC218`, `retry-after: 1`) and closed straight
+  from the accept loop, so a flood costs no task. `0` removes the cap.
+- `app.upstream(..., max_response_bytes=64 MiB)`, and error code `WC217`.
+- `Request.query_list(name)`: every value of a repeated query key, in order.
+
+### Fixed
+
+- **Connections had no global cap.** Each idle socket held a task and a descriptor for the
+  header timeout, with nothing bounding how many.
+- **The proxy buffered upstream responses without limit.** A body over `max_response_bytes`
+  is now a `502` `WC217`: refused on its declared length before it is read, or cut off once
+  an undeclared one passes the cap.
+- **HSTS was never sent.** WebCortex serves plain HTTP behind a TLS proxy, so the configured
+  `Strict-Transport-Security` header never went out. It is now sent when the proxy reports
+  `X-Forwarded-Proto: https` or `Forwarded: proto=https`.
+- **Repeated query keys kept only the last value.** A handler parameter typed `list[X]`,
+  `tuple`, `set` or `Sequence` now receives every value (`?tag=a&tag=b` → `["a", "b"]`, and
+  `?tag=a` → `["a"]`); scalar parameters and `req.query` still keep the last. Proxy routes
+  forward repeated keys to the upstream, and a list argument to a GET tool becomes repeated keys.
+- **WebSockets were not drained on shutdown.** They outlive the connection that upgraded
+  them, so the drain never waited for them and the process exit cut them with no close
+  frame. Each now sends a `1001` (going away) close, and the drain waits for them, within
+  `shutdown_timeout`. An agent turn in flight finishes first.
+
 ## [2.6.0] — 2026-10-22
 
 A hardening pass over the whole framework: the HTTP layer, the agent runtime and MCP,

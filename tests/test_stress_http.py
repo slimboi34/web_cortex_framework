@@ -60,6 +60,11 @@ def typed(n: int = 0) -> dict:
     return {{"n": n}}
 
 
+@app.get("/tags")
+def tags(req, tag: list[str] = [], n: list[int] = [], one: str = "") -> dict:
+    return {{"tag": tag, "n": n, "one": one, "map": req.query.get("tag"), "all": req.query_list("tag")}}
+
+
 @app.get("/content-type")
 def content_type():
     return Response("a,b", content_type="text/plain",
@@ -743,3 +748,179 @@ def test_a_static_root_with_an_index_takes_the_root_path(tmp_path):
     bare = WebCortex("t")
     bare.static_files("/", str(tmp_path))
     assert [r["op"]["kind"] for r in bare.manifest()["routes"] if r["path"] == "/"] == ["static"]
+
+
+# ================================================================= 2.6.1
+
+
+def test_hsts_is_sent_when_a_proxy_says_the_client_used_https(server):
+    # The server speaks plain HTTP behind a TLS proxy, so through 2.6.0 the
+    # configured Strict-Transport-Security header was never sent at all.
+    base, _, _ = server
+    _, _, plain = call(base, "/ping")
+    assert not header(plain, "strict-transport-security")
+    for hdr in ({"X-Forwarded-Proto": "https"}, {"Forwarded": "for=1.2.3.4;proto=https"}):
+        _, _, tls = call(base, "/ping", headers=hdr)
+        assert header(tls, "strict-transport-security") == ["max-age=31536000; includeSubDomains"], hdr
+    _, _, http = call(base, "/ping", headers={"X-Forwarded-Proto": "http"})
+    assert not header(http, "strict-transport-security")
+    # Errors carry it too.
+    _, _, missing = call(base, "/nope", headers={"X-Forwarded-Proto": "https"})
+    assert header(missing, "strict-transport-security")
+
+
+def test_repeated_query_keys_reach_list_parameters(server):
+    # Through 2.6.0 `?tag=a&tag=b` reached the handler as just "b".
+    base, _, _ = server
+    status, body, _ = call(base, "/tags?tag=a&tag=b&n=1&n=2&n=3&one=x&one=y")
+    assert status == 200, body
+    got = json.loads(body)
+    assert got["tag"] == ["a", "b"]
+    assert got["n"] == [1, 2, 3]
+    assert got["all"] == ["a", "b"]
+    # A scalar keeps the last value, as it always has.
+    assert got["one"] == "y" and got["map"] == "b"
+    assert json.loads(call(base, "/typed?n=1&n=2")[1]) == {"n": 2}
+    # One value is still a list of one; none is the default.
+    assert json.loads(call(base, "/tags?tag=solo")[1])["tag"] == ["solo"]
+    assert json.loads(call(base, "/tags")[1])["tag"] == []
+
+
+GATEWAY = """
+from webcortex import WebCortex
+
+app = WebCortex("gateway", port={port}, request_timeout=30, shutdown_timeout=10, max_connections=MAXCONN)
+app.api_key("ADMIN_KEY", id="admin", scopes=["devices:read", "devices:ingest"])
+app.upstream("up", "http://127.0.0.1:UPSTREAM", max_response_bytes=1_000_000)
+app.proxy("GET", "/up/{{slug}}", upstream="up", rewrite="/{{slug}}")
+app.static("GET", "/ping", {{"pong": True}})
+app.camera("cam", max_fps=100)
+"""
+
+
+class _Upstream(__import__("http.server").server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path == "/endless":
+            # No length: the body runs until the connection closes.
+            self.send_response(200)
+            self.send_header("content-type", "application/octet-stream")
+            self.send_header("connection", "close")
+            self.end_headers()
+            try:
+                for _ in range(64):
+                    self.wfile.write(b"x" * 65536)
+            except OSError:
+                pass
+            self.close_connection = True
+            return
+        body = (b"y" * 2_000_000 if path == "/big"
+                else json.dumps({"query": query}).encode())
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture(scope="module")
+def gateway():
+    import http.server
+    up = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    source = GATEWAY.replace("UPSTREAM", str(up.server_address[1])).replace("MAXCONN", "24")
+    proc, port, base, workdir, log_path = _start(source)
+    yield base, port, proc, log_path
+    if proc.poll() is None:
+        _stop(proc)
+    up.shutdown()
+    assert "panicked" not in log_path.read_text()
+
+
+def test_an_oversized_upstream_response_is_a_502_not_buffered(gateway):
+    # Through 2.6.0 the proxy buffered whatever the upstream sent.
+    base, _, _, _ = gateway
+    status, body, _ = call(base, "/up/small")
+    assert status == 200, body
+    for slug in ("big", "endless"):
+        status, body, hdrs = call(base, f"/up/{slug}")
+        assert status == 502, (slug, body[:200])
+        assert json.loads(body)["error"]["code"] == "WC217"
+        assert header(hdrs, "x-webcortex-error") == ["WC217"]
+    assert call(base, "/up/small")[0] == 200
+
+
+def test_the_proxy_forwards_every_repeated_query_key(gateway):
+    base, _, _, _ = gateway
+    status, body, _ = call(base, "/up/echo?tag=a&tag=b&x=1")
+    assert status == 200, body
+    assert json.loads(body)["query"] == "tag=a&tag=b&x=1"
+
+
+def test_max_response_bytes_and_max_connections_are_validated():
+    from webcortex import WebCortex
+    app = WebCortex("v")
+    with pytest.raises(ValueError, match="max_response_bytes"):
+        app.upstream("u", "http://x", max_response_bytes=0)
+    with pytest.raises(ValueError, match="max_connections"):
+        WebCortex("v", max_connections=-1)
+    assert WebCortex("v", max_connections=0).manifest()["server"]["max_connections"] == 0
+
+
+def test_connections_past_max_connections_get_a_503_and_close(gateway):
+    # Through 2.6.0 nothing bounded open connections: each idle socket cost a
+    # task and a descriptor for the header timeout, without limit.
+    base, port, _, _ = gateway
+    held = []
+    try:
+        for _ in range(24):
+            s = socket.create_connection(("127.0.0.1", port), timeout=10)
+            s.sendall(b"GET /ping HTTP/1.1\r\nHost: x\r\n")  # headers never finished
+            held.append(s)
+        time.sleep(0.3)
+        started = time.perf_counter()
+        reply = raw(port, b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", wait=10)
+        assert time.perf_counter() - started < 5, "the refusal was not prompt"
+        assert status_of(reply) == 503, reply[:200]
+        assert b"WC218" in reply and b"retry-after: 1" in reply.lower()
+        # A burst past the cap is refused just as cheaply.
+        with concurrent.futures.ThreadPoolExecutor(32) as pool:
+            replies = list(pool.map(lambda _: raw(port, b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", wait=10),
+                                    range(200)))
+        assert all(r == b"" or status_of(r) == 503 for r in replies)
+    finally:
+        for s in held:
+            s.close()
+    # Places are given back as connections close.
+    deadline = time.time() + 10
+    while time.time() < deadline and not healthy(base):
+        time.sleep(0.1)
+    assert healthy(base)
+    with concurrent.futures.ThreadPoolExecutor(16) as pool:
+        assert all(pool.map(lambda _: healthy(base), range(64)))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM is TerminateProcess on Windows")
+def test_shutdown_closes_websockets_with_going_away(gateway):
+    # Through 2.6.0 a deploy cut every WebSocket without a close frame.
+    from webcortex.client import WebSocket, WebSocketError
+    base, _, proc, log_path = gateway
+    ws_base = base.replace("http://", "ws://")
+    viewer = WebSocket(f"{ws_base}/devices/cam/stream", headers={"x-api-key": ADMIN_KEY}, timeout=15)
+    camera = WebSocket(f"{ws_base}/devices/cam/ws", headers={"x-api-key": ADMIN_KEY}, timeout=15)
+    assert json.loads(viewer.recv()[1])["type"] == "hello"
+    assert json.loads(camera.recv()[1])["type"] == "ready"
+    started = time.perf_counter()
+    proc.send_signal(signal.SIGTERM)
+    for sock in (viewer, camera):
+        with pytest.raises(WebSocketError, match=r"closed by server \(1001\)"):
+            while True:
+                sock.recv()
+    proc.wait(timeout=20)
+    assert time.perf_counter() - started < 10, "shutdown waited out its timeout"
+    assert "drain timed out" not in log_path.read_text()

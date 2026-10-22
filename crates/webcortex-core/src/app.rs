@@ -60,7 +60,15 @@ pub struct App {
     devices: crate::devices::DeviceHub,
     /// Request counters, recent failures and agent runs: the live view.
     recorder: crate::status::Recorder,
+    /// One permit per open connection or WebSocket; `None` when uncapped.
+    connections: Option<Arc<tokio::sync::Semaphore>>,
+    /// Flipped once at shutdown. Every WebSocket holds a receiver, so "no
+    /// receivers left" is "every socket has said goodbye".
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
+
+/// A connection's place under `max_connections`, released on drop.
+pub struct ConnectionSlot(#[allow(dead_code)] Option<tokio::sync::OwnedSemaphorePermit>);
 
 impl App {
     pub async fn build(manifest: Manifest, bridge: Arc<dyn PyBridge>) -> Result<Self, String> {
@@ -167,6 +175,7 @@ impl App {
             .build()
             .map_err(|e| format!("http client build failed: {e}"))?;
         let manifest_start_halted = manifest.server.start_halted;
+        let manifest_max_connections = manifest.server.max_connections;
         let devices = crate::devices::DeviceHub::new(&manifest.devices, client.clone());
         let recorder = crate::status::Recorder::new(&manifest);
 
@@ -204,9 +213,37 @@ impl App {
                 serde_json::json!({"reason": "started halted; release to enable actuators",
                                    "by": "boot", "since_unix": since})
             }))),
+            connections: (manifest_max_connections > 0)
+                .then(|| Arc::new(tokio::sync::Semaphore::new(manifest_max_connections))),
+            shutdown: tokio::sync::watch::Sender::new(false),
             devices,
             recorder,
         })
+    }
+
+    /// Claim a place for a new connection, or `None` when `max_connections`
+    /// are already open.
+    pub fn admit_connection(&self) -> Option<ConnectionSlot> {
+        match &self.connections {
+            None => Some(ConnectionSlot(None)),
+            Some(sem) => sem.clone().try_acquire_owned().ok().map(|p| ConnectionSlot(Some(p))),
+        }
+    }
+
+    /// Resolves once shutdown has begun. Held by each WebSocket.
+    pub fn shutdown_watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    /// Tell every WebSocket to close (1001), then wait until they all have.
+    pub async fn close_sockets(&self) {
+        self.shutdown.send_replace(true);
+        self.shutdown.closed().await;
+    }
+
+    /// How many WebSockets are open.
+    pub fn open_sockets(&self) -> usize {
+        self.shutdown.receiver_count()
     }
 
     /// Wrap in an `Arc` and record the self-reference behaviours need.
@@ -1010,8 +1047,9 @@ impl App {
                 builder = builder.header(k, v);
             }
         }
-        if !req.query.is_empty() {
-            builder = builder.query(&req.query.iter().collect::<Vec<_>>());
+        let pairs = req.query_pairs();
+        if !pairs.is_empty() {
+            builder = builder.query(&pairs);
         }
         if !req.body.is_empty() {
             builder = builder.body(req.body.clone());
@@ -1033,10 +1071,34 @@ impl App {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
-        let body = res
-            .bytes()
+        // Buffered, so bounded: a declared length over the cap is refused
+        // before reading, and an undeclared one is cut off once it passes it.
+        let cap = up.max_response_bytes;
+        let too_large = || {
+            tracing::warn!(upstream = %upstream_name, max_response_bytes = cap,
+                           "upstream response over max_response_bytes; not relayed");
+            Ok(WebCortexResponse::coded(
+                502,
+                "WC217",
+                format!("upstream {upstream_name} answered with more than {cap} bytes"),
+            ))
+        };
+        if res.content_length().is_some_and(|n| n > cap as u64) {
+            return too_large();
+        }
+        let mut res = res;
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = res
+            .chunk()
             .await
-            .map_err(|e| format!("upstream {upstream_name} body read failed: {}", e.without_url()))?;
+            .map_err(|e| format!("upstream {upstream_name} body read failed: {}", e.without_url()))?
+        {
+            if buf.len() + chunk.len() > cap {
+                return too_large();
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let body = buf.freeze();
 
         Ok(WebCortexResponse {
             status,
@@ -1146,10 +1208,18 @@ impl App {
         };
 
         let mut query = std::collections::BTreeMap::new();
+        let mut query_all = Vec::new();
         if body_less {
             for (k, v) in &obj {
                 if !path_params.contains_key(k) {
                     query.insert(k.clone(), json_to_path_string(v));
+                    // A list argument is the repeated key an HTTP caller would send.
+                    match v {
+                        serde_json::Value::Array(items) => {
+                            query_all.extend(items.iter().map(|i| (k.clone(), json_to_path_string(i))))
+                        }
+                        _ => query_all.push((k.clone(), json_to_path_string(v))),
+                    }
                 }
             }
         }
@@ -1159,6 +1229,7 @@ impl App {
             path: concrete_path,
             path_params,
             query,
+            query_all,
             headers: Default::default(),
             body,
             route_id: Some(route_id),

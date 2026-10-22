@@ -79,6 +79,7 @@ class WebCortex:
         agent_timeout: int = 600,
         shutdown_timeout: int = 25,
         start_halted: bool = False,
+        max_connections: int = 10_000,
     ) -> None:
         self.name = name
         self.description = description
@@ -92,6 +93,9 @@ class WebCortex:
         self.request_timeout = request_timeout
         self.agent_timeout = agent_timeout
         self.shutdown_timeout = shutdown_timeout
+        # Open connections (WebSockets included) past which new ones get a 503.
+        # 0 removes the cap.
+        self.max_connections = _positive_int("WebCortex", "max_connections", max_connections, allow_zero=True)
         # Boot with the emergency stop engaged: a machine that moves should
         # wait for an operator after a restart, not resume on its own.
         self.start_halted = bool(start_halted)
@@ -320,8 +324,12 @@ class WebCortex:
         headers: dict[str, str] | None = None,
         bearer_env: str | None = None,
         timeout_ms: int = 30_000,
+        max_response_bytes: int = 64 * 1024 * 1024,
     ) -> None:
         """Declare an external API this app may call or proxy to.
+
+        A proxy route buffers the upstream's answer; one larger than
+        `max_response_bytes` is refused with a 502 (`WC217`).
 
         Credentials are named, not embedded: `bearer_env` is resolved from the
         process environment at boot, so the manifest stays safe to log, diff,
@@ -332,6 +340,7 @@ class WebCortex:
             "headers": headers or {},
             "bearer_env": bearer_env,
             "timeout_ms": timeout_ms,
+            "max_response_bytes": _positive_int("upstream", "max_response_bytes", max_response_bytes),
         }
 
     def proxy(self, method: str, path: str, *, upstream: str, rewrite: str | None = None, **kw: Any) -> int:
@@ -1606,6 +1615,7 @@ class WebCortex:
                 "agent_timeout_secs": self.agent_timeout,
                 "shutdown_timeout_secs": self.shutdown_timeout,
                 "start_halted": self.start_halted,
+                "max_connections": self.max_connections,
             },
             "auth": self._auth,
             "cors": self._cors or {"enabled": False},
@@ -1836,6 +1846,13 @@ def resolve_port(default: Any) -> int:
     return port
 
 
+def _positive_int(who: str, name: str, value: Any, *, allow_zero: bool = False) -> int:
+    floor = 0 if allow_zero else 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+        raise ValueError(f"{who}: {name}={value!r} must be an int of at least {floor}")
+    return value
+
+
 def _check_workers(workers: Any) -> int | None:
     if workers is None:
         return None
@@ -1956,13 +1973,19 @@ def _make_binder(
         if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
     ]
 
+    sequence_params = {name for name, annotation, _ in params if _is_sequence_type(annotation)}
+
     def bind(req: Request) -> dict:
         kwargs: dict[str, Any] = {}
         for name, annotation, default in params:
             if name == request_param:
                 kwargs[name] = req
                 continue
-            raw = req.get(name, _MISSING)
+            if name in sequence_params and name not in req.params and name in req.query:
+                # `tags: list[str]` gets every `?tags=` value, not just the last.
+                raw = req.query_list(name)
+            else:
+                raw = req.get(name, _MISSING)
             if raw is _MISSING:
                 if default is inspect.Parameter.empty:
                     raise HTTPError(422, f"missing required parameter {name!r}")
@@ -1972,6 +1995,25 @@ def _make_binder(
         return kwargs
 
     return bind
+
+
+def _is_sequence_type(annotation: Any) -> bool:
+    """True for ``list[X]``, ``tuple[X, ...]``, ``set[X]`` and their bare and
+    optional forms: the annotations a repeated query key binds to."""
+    import collections.abc
+    import types
+    import typing as _t
+
+    origin = _t.get_origin(annotation)
+    if origin is _t.Annotated:
+        return _is_sequence_type(_t.get_args(annotation)[0])
+    if origin in (_t.Union, types.UnionType):
+        args = [a for a in _t.get_args(annotation) if a is not type(None)]
+        return len(args) == 1 and _is_sequence_type(args[0])
+    target = origin or annotation
+    return target in (list, tuple, set, frozenset) or target in (
+        collections.abc.Sequence, collections.abc.Set, collections.abc.MutableSequence,
+    )
 
 
 class _Missing:

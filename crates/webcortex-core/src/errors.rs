@@ -110,6 +110,10 @@ pub static CATALOGUE: &[ErrorInfo] = &[
        "A subsystem this route needs is not running in this process (for example the agent runtime). Check the server log at boot."),
     e!("WC216", "http", Some(408), "Request body too slow",
        "The client announced a body but did not finish sending it within request_timeout (agent_timeout on agent, behaviour and flow routes). Send the whole body promptly, or raise the limit on WebCortex(...)."),
+    e!("WC217", "http", Some(502), "Upstream response too large",
+       "A proxied upstream answered with a body over its max_response_bytes (64 MiB by default). Raise it on app.upstream(..., max_response_bytes=...) or page the upstream's response."),
+    e!("WC218", "http", Some(503), "Too many connections",
+       "The server already holds max_connections open connections (10,000 by default), WebSockets included. Retry shortly, close idle connections, or raise max_connections on WebCortex(...)."),
 
     // ---- WC3xx agents and providers -------------------------------------
     e!("WC300", "agent", Some(502), "Agent run failed",

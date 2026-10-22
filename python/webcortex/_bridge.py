@@ -219,7 +219,17 @@ class Request:
 
     @property
     def query(self) -> dict:
+        """One value per key; a key given twice keeps its last value."""
         return self._raw["query"]
+
+    def query_list(self, name: str) -> list[str]:
+        """Every value given for a query key, in order: ``?tag=a&tag=b`` is
+        ``["a", "b"]``. Empty when the key is absent."""
+        pairs = self._raw.get("query_all")
+        if pairs is None:
+            value = self._raw["query"].get(name)
+            return [] if value is None else [value]
+        return [v for k, v in pairs if k == name]
 
     @property
     def headers(self) -> dict:

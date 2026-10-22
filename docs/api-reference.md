@@ -20,6 +20,7 @@ app = WebCortex(
     request_timeout=30,
     agent_timeout=600,       # agent, flow and behaviour routes
     shutdown_timeout=25,
+    max_connections=10_000,  # open connections incl. WebSockets; past it 503 WC218; 0 = no cap
 )
 ```
 
@@ -91,7 +92,10 @@ Decorator. The function returns a dict used as template context.
 
 ### `app.static_files(path, directory, *, index=None, cache_secs=3600)`
 
-### `app.upstream(name, base_url, *, headers=None, bearer_env=None, timeout_ms=30000)`
+### `app.upstream(name, base_url, *, headers=None, bearer_env=None, timeout_ms=30000, max_response_bytes=67108864)`
+
+A proxy route buffers the upstream's answer; one over `max_response_bytes` (64 MiB) is a 502 `WC217`.
+Repeated query keys are forwarded as sent.
 
 ### `app.proxy(method, path, *, upstream, rewrite=None, **opts)`
 
@@ -298,7 +302,8 @@ Mounted under `control_prefix`. Everything but `/health` needs
 | `req.method` | `str` | |
 | `req.path` | `str` | |
 | `req.params` | `dict` | Path parameters |
-| `req.query` | `dict` | Query string |
+| `req.query` | `dict` | Query string; a repeated key keeps its last value |
+| `req.query_list(name)` | `list[str]` | Every value of a query key, in order (`?tag=a&tag=b`) |
 | `req.headers` | `dict` | Lower-cased keys |
 | `req.body` | `bytes` | Raw |
 | `req.json()` | `Any` | Parsed, cached |
