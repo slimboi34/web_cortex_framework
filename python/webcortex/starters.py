@@ -20,6 +20,9 @@ already on. A starter that generates an insecure app teaches an insecure habit.
 
 from __future__ import annotations
 
+import json
+import re
+
 BASE_GITIGNORE = """\
 __pycache__/
 *.db
@@ -139,7 +142,7 @@ from webcortex import HTTPError, WebCortex
 app = WebCortex(
     "{name}",
     description="{description}",
-    database="sqlite://./{name}.db",
+    database="sqlite://./{db}.db",
 )
 
 # --- Security -------------------------------------------------------------
@@ -184,7 +187,7 @@ from webcortex import HTTPError, WebCortex
 app = WebCortex(
     "{name}",
     description="{description}",
-    database="sqlite://./{name}.db",
+    database="sqlite://./{db}.db",
     templates="templates",
 )
 
@@ -244,7 +247,7 @@ from webcortex import HTTPError, WebCortex
 app = WebCortex(
     "{name}",
     description="{description}",
-    database="sqlite://./{name}.db",
+    database="sqlite://./{db}.db",
 )
 
 app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write", "webcortex:admin"])
@@ -384,44 +387,61 @@ pre {
 """
 
 
+def _py_literal(text: str) -> str:
+    """``text`` escaped for the inside of a double-quoted Python string (and
+    of a triple-quoted docstring): a quote, a backslash or a newline in a
+    project name or description must not turn api.py into a SyntaxError."""
+    return json.dumps(text, ensure_ascii=False)[1:-1]
+
+
+def _db_name(name: str) -> str:
+    """A file name for the starter's SQLite database: the project name with
+    anything that is not safe in a path or a URL replaced."""
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-")
+    return slug or "app"
+
+
 def files_for(template: str, name: str, description: str) -> dict[str, str]:
     """Return `{relative_path: contents}` for a starter."""
     if template not in TEMPLATES:
         raise ValueError(
             f"unknown starter {template!r}; choose one of: {', '.join(TEMPLATES)}"
         )
+    md_name = name
+    db = _db_name(name)
+    name, description = _py_literal(name), _py_literal(description)
 
     common = {
         ".gitignore": BASE_GITIGNORE,
         ".env.example": ENV_EXAMPLE,
-        "README.md": README.format(name=name),
+        "README.md": README.format(name=md_name),
         # The rules travel with the project: AGENTS.md is what Codex, Cursor and most agents
         # read; CLAUDE.md imports it with Claude Code's @file syntax.
-        "AGENTS.md": AGENTS_MD.format(name=name),
+        "AGENTS.md": AGENTS_MD.format(name=md_name),
         "CLAUDE.md": CLAUDE_MD,
     }
 
     if template == "api":
-        return {**common, "api.py": API.format(name=name, description=description)}
+        return {**common, "api.py": API.format(name=name, description=description, db=db)}
 
     if template == "agent":
-        return {**common, "api.py": AGENT_API.format(name=name, description=description)}
+        return {**common, "api.py": AGENT_API.format(name=name, description=description, db=db)}
 
     if template == "behaviour":
-        return {**common, "api.py": BEHAVIOUR_API.format(name=name, description=description)}
+        return {**common, "api.py": BEHAVIOUR_API.format(name=name, description=description, db=db)}
 
     if template == "orchestration":
-        return {**common, "api.py": ORCHESTRATION_API.format(name=name, description=description)}
+        return {**common, "api.py": ORCHESTRATION_API.format(name=name, description=description, db=db)}
 
     if template == "robotics":
-        return {**common, "api.py": ROBOTICS_API.format(name=name, description=description)}
+        return {**common, "api.py": ROBOTICS_API.format(name=name, description=description, db=db)}
 
     if template == "hub":
-        return {**common, "api.py": HUB_API.format(name=name, description=description)}
+        return {**common, "api.py": HUB_API.format(name=name, description=description, db=db)}
 
     return {
         **common,
-        "api.py": FULLSTACK_API.format(name=name, description=description),
+        "api.py": FULLSTACK_API.format(name=name, description=description, db=db),
         "templates/base.html": BASE_HTML,
         "templates/index.html": INDEX_HTML,
         "templates/about.html": ABOUT_HTML,
@@ -447,7 +467,7 @@ from webcortex import WebCortex
 app = WebCortex(
     "{name}",
     description="{description}",
-    database="sqlite://./{name}.db",
+    database="sqlite://./{db}.db",
 )
 
 app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write", "webcortex:admin"])
@@ -571,7 +591,7 @@ from webcortex import WebCortex
 app = WebCortex(
     "{name}",
     description="{description}",
-    database="sqlite://./{name}.db",
+    database="sqlite://./{db}.db",
 )
 
 app.api_key("WEBCORTEX_API_KEY", id="service", scopes=["read", "write", "webcortex:admin"])
@@ -769,7 +789,7 @@ from webcortex import HTTPError, Image, WebCortex
 app = WebCortex(
     "{name}",
     description="{description}",
-    database="sqlite://./{name}.db",
+    database="sqlite://./{db}.db",
     start_halted=True,
 )
 

@@ -282,19 +282,27 @@ def _args(schema: dict | None) -> str:
     return ", ".join(out)
 
 
-def _type_of(spec: Any) -> str:
-    if not isinstance(spec, dict):
+def _type_of(spec: Any, depth: int = 0) -> str:
+    if not isinstance(spec, dict) or depth > 6:
         return "any"
+    null = "|null" if spec.get("nullable") else ""
     if "enum" in spec:
-        return "|".join(json.dumps(v) for v in spec["enum"][:6])
+        values = spec["enum"]
+        shown = "|".join(json.dumps(v) for v in values[:6]) + ("|…" if len(values) > 6 else "")
+        return shown + (null if None not in values else "")
+    options = spec.get("anyOf") or spec.get("oneOf")
+    if isinstance(options, list) and options:
+        return "|".join(_type_of(o, depth + 1) for o in options) + null
     t = spec.get("type")
     if t == "array":
-        return f"{_type_of(spec.get('items'))}[]"
+        if isinstance(spec.get("prefixItems"), list):
+            return "[" + ", ".join(_type_of(i, depth + 1) for i in spec["prefixItems"]) + "]" + null
+        return f"{_type_of(spec.get('items'), depth + 1)}[]{null}"
     if t == "object" and spec.get("properties"):
-        return "{" + _args(spec) + "}"
+        return "{" + _args(spec) + "}" + null
     if isinstance(t, list):
         return "|".join(t)
-    return t or "any"
+    return (t or "any") + null
 
 
 def _short(text: str, n: int) -> str:
@@ -309,7 +317,12 @@ def _derive_tool_name(method: str, path: str) -> str:
         if not seg:
             continue
         if seg.startswith("{") and seg.endswith("}"):
-            parts += ["by", seg[1:-1].replace("-", "_")]
+            parts += ["by", _tool_word(seg[1:-1].lstrip("*"))]
         else:
-            parts.append(seg.replace("-", "_"))
+            parts.append(_tool_word(seg))
     return "_".join(parts)
+
+
+def _tool_word(seg: str) -> str:
+    """Mirrors `manifest::tool_word`: only characters every provider accepts."""
+    return "".join(c if (c.isascii() and c.isalnum()) or c == "_" else "_" for c in seg)

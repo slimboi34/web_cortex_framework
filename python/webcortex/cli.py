@@ -40,8 +40,7 @@ def _load_app(target: str) -> Any:
 
     Accepts `api.py`, `api`, or `pkg.mod:name`.
     """
-    module_part, _, attr = target.partition(":")
-    attr = attr or "app"
+    module_part, attr = _split_target(target)
 
     path = Path(module_part)
     if not path.suffix:
@@ -83,6 +82,19 @@ def _load_app(target: str) -> Any:
     return getattr(module, attr)
 
 
+def _split_target(target: str) -> tuple[str, str]:
+    """``module[:attr]`` → ``(module, attr)``.
+
+    Split at the *last* colon, and only when what follows is a Python name:
+    ``C:\\app\\api.py`` is a Windows path, not module ``C`` attribute
+    ``\\app\\api.py``.
+    """
+    module_part, sep, attr = target.rpartition(":")
+    if sep and attr.isidentifier() and module_part:
+        return module_part, attr
+    return target, "app"
+
+
 def _import_target(path: Path, module_part: str) -> Any:
     if path.exists():
         # Sibling modules must be importable: an app split across api.py and
@@ -100,21 +112,55 @@ def _import_target(path: Path, module_part: str) -> Any:
         if not path.exists() and module_part.endswith(".py"):
             raise CLIError("WC102", f"{path} does not exist",
                            "Run the command where api.py lives, or pass the module path.")
+        # `webcortex run pkg.api:app` names a module relative to where the
+        # command runs. The console script puts its own bin directory on
+        # sys.path, not the working directory, so add it.
+        cwd = os.getcwd()
+        if cwd not in sys.path:
+            sys.path.insert(0, cwd)
         module = importlib.import_module(module_part)
     return module
 
 
 def _load_dotenv() -> None:
-    """Load `.env` if present. Existing environment always wins."""
+    """Load `.env` if present. Existing environment always wins.
+
+    The common dotenv syntax: `KEY=value`, `export KEY=value`, values in
+    single or double quotes (kept verbatim, `#` included), and a trailing
+    ` # comment` after an unquoted value.
+    """
     path = Path(".env")
-    if not path.exists():
+    if not path.is_file():
         return
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return
+    for line in text.splitlines():
+        parsed = _dotenv_line(line)
+        if parsed:
+            os.environ.setdefault(*parsed)
+
+
+def _dotenv_line(line: str) -> tuple[str, str] | None:
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+    key, _, value = line.partition("=")
+    key = key.strip()
+    if key.startswith("export "):
+        key = key[len("export "):].strip()
+    if not key or not key.replace("_", "a").replace(".", "a").isalnum():
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] in "'\"" and value[0] in value[1:]:
+        value = value[1:value.index(value[0], 1)]
+    else:
+        # An unquoted value ends at a ` #` comment.
+        for marker in (" #", "\t#"):
+            if marker in value:
+                value = value[:value.index(marker)].rstrip()
+    return key, value
 
 
 def _banner(app: Any) -> None:
@@ -257,9 +303,12 @@ def mcp_config(app: Any, key: str | None = None) -> dict:
     `x-api-key` header the REST side uses, so the client gets exactly the scopes
     that key has and nothing more.
     """
+    from .app import resolve_port
+
     host = os.environ.get("WEBCORTEX_HOST", app.host)
-    port = int(os.environ.get("WEBCORTEX_PORT", app.port))
-    url = f"http://{host}:{port}/_webcortex/mcp"
+    port = resolve_port(app.port)
+    prefix = getattr(app, "control_prefix", "/_webcortex")
+    url = f"http://{host}:{port}{prefix}/mcp"
     name = getattr(app, "name", None) or "webcortex"
     return {"mcpServers": {name: {"type": "http", "url": url, "headers": {"x-api-key": key} if key else {}}}}
 
@@ -270,8 +319,10 @@ def _control(app: Any, method: str, path: str, body: dict | None = None,
     import urllib.error
     import urllib.request
 
+    from .app import resolve_port
+
     host = os.environ.get("WEBCORTEX_HOST", app.host)
-    port = int(os.environ.get("WEBCORTEX_PORT", app.port))
+    port = resolve_port(app.port)
     url = f"http://{host}:{port}{app.control_prefix}{path}"
     data = json.dumps(body or {}).encode() if method == "POST" else None
     req = urllib.request.Request(url, data=data, method=method,
@@ -302,8 +353,8 @@ def _cmd_new(args: argparse.Namespace) -> int:
 
     name = args.name
     target = Path(args.directory or name)
-    if target.exists() and any(target.iterdir()):
-        raise SystemExit(f"webcortex: {target}/ already exists and is not empty")
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
+        raise SystemExit(f"webcortex: {target} already exists and is not an empty directory")
 
     try:
         files = starters.files_for(args.template, name, args.description or f"A WebCortex app: {name}")
@@ -336,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
             return _run(parser, args)
         except ValueError as e:
             # The core refusing the manifest, from any command that reads it.
-            if str(e).startswith("invalid application"):
+            if str(e).startswith(("invalid application", "invalid manifest")):
                 raise CLIError("WC101", str(e)) from None
             raise
     except CLIError as e:

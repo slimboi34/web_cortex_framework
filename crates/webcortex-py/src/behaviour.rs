@@ -758,8 +758,24 @@ impl BehaviourContext {
 // JSON <-> Python conversion
 // ---------------------------------------------------------------------------
 
+/// How deep a Python value may nest on its way to JSON. A self-referential
+/// dict (`d["self"] = d`) or an object graph with a cycle would otherwise
+/// recurse until the native stack overflows, which aborts the whole server
+/// rather than failing one call.
+const MAX_JSON_DEPTH: usize = 256;
+
 pub fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    to_json(value, 0)
+}
+
+fn to_json(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<serde_json::Value> {
     use pyo3::types::{PyBool, PyFloat, PyInt, PyString};
+
+    if depth > MAX_JSON_DEPTH {
+        return Err(PyValueError::new_err(format!(
+            "value nests more than {MAX_JSON_DEPTH} levels deep (a reference cycle?); cannot convert it to JSON"
+        )));
+    }
 
     if value.is_none() {
         return Ok(serde_json::Value::Null);
@@ -781,21 +797,21 @@ pub fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     if let Ok(d) = value.cast::<PyDict>() {
         let mut map = serde_json::Map::new();
         for (k, v) in d.iter() {
-            map.insert(k.str()?.to_str()?.to_string(), py_to_json(&v)?);
+            map.insert(k.str()?.to_str()?.to_string(), to_json(&v, depth + 1)?);
         }
         return Ok(serde_json::Value::Object(map));
     }
     if let Ok(list) = value.cast::<PyList>() {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
-            out.push(py_to_json(&item)?);
+            out.push(to_json(&item, depth + 1)?);
         }
         return Ok(serde_json::Value::Array(out));
     }
     if let Ok(tuple) = value.cast::<pyo3::types::PyTuple>() {
         let mut out = Vec::with_capacity(tuple.len());
         for item in tuple.iter() {
-            out.push(py_to_json(&item)?);
+            out.push(to_json(&item, depth + 1)?);
         }
         return Ok(serde_json::Value::Array(out));
     }
@@ -804,12 +820,12 @@ pub fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     for attr in ["model_dump", "_asdict"] {
         if let Ok(method) = value.getattr(attr)
             && method.is_callable() {
-                return py_to_json(&method.call0()?);
+                return to_json(&method.call0()?, depth + 1);
             }
     }
     if let Ok(d) = value.getattr("__dict__")
         && d.cast::<PyDict>().is_ok() {
-            return py_to_json(&d);
+            return to_json(&d, depth + 1);
         }
 
     Err(PyValueError::new_err(format!(

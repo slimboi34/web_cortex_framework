@@ -32,9 +32,23 @@ impl Completer {
         content_type: String,
         headers: Option<Vec<(String, String)>>,
     ) -> PyResult<()> {
+        // Checked here as well as in `_bridge._encode`, because anything that
+        // reaches the HTTP layer invalid becomes a bare-text 500 with no code
+        // and no clue which handler produced it. Refusing here raises in the
+        // Python caller, which then fails the request with the reason.
+        if !(100..=599).contains(&status) {
+            return Err(PyValueError::new_err(format!(
+                "invalid HTTP status {status}: a response status is from 100 to 599"
+            )));
+        }
         let mut hs = vec![("content-type".to_string(), content_type)];
         if let Some(extra) = headers {
             hs.extend(extra);
+        }
+        for (name, value) in &hs {
+            if let Some(problem) = header_problem(name, value) {
+                return Err(PyValueError::new_err(format!("response header {name:?}: {problem}")));
+            }
         }
         self.send(Ok(WebCortexResponse {
             status,
@@ -49,6 +63,20 @@ impl Completer {
     fn fail(&self, message: String) -> PyResult<()> {
         self.send(Err(message))
     }
+}
+
+/// Why `name: value` cannot be sent as an HTTP header, if it cannot: an empty
+/// or non-token name, or a value with a control character (CR/LF would split
+/// the response).
+fn header_problem(name: &str, value: &str) -> Option<&'static str> {
+    let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    if name.is_empty() || !name.chars().all(token) {
+        return Some("the name is not a valid header name");
+    }
+    if value.chars().any(|c| c.is_control() && c != '\t' && (c as u32) < 0x80) {
+        return Some("the value contains a control character");
+    }
+    None
 }
 
 impl Completer {

@@ -40,8 +40,10 @@ def app_url(app: Any, url: str | None = None) -> str:
     """The base URL of the running app: ``--url``, else WEBCORTEX_HOST/PORT, else the app's own."""
     if url:
         return url.rstrip("/")
+    from .app import resolve_port
+
     host = os.environ.get("WEBCORTEX_HOST", getattr(app, "host", "127.0.0.1"))
-    port = int(os.environ.get("WEBCORTEX_PORT", getattr(app, "port", 8000)))
+    port = resolve_port(getattr(app, "port", 8000))
     if host in ("0.0.0.0", "::", ""):
         host = "127.0.0.1"
     return f"http://{host}:{port}"
