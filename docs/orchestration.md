@@ -210,7 +210,9 @@ never see each other's history. Anonymous callers share one identity, so a
 
 Sessions live in memory — bounded (`session_capacity`, default 1000) and
 expiring (`session_ttl_secs`, default 3600), both fixed for now rather than
-settable from `WebCortex(...)` — and do not survive a restart.
+settable from `WebCortex(...)` — and do not survive a restart. Each one
+keeps at most its newest 400 messages (8 MB): past that the oldest whole
+turns are dropped, never a tool call apart from its result.
 That is stated rather than hidden: durable conversation state is application
 data, and it belongs in a table you own. Combine sessions with a
 [context window](context.md#compaction) so a long conversation is compacted

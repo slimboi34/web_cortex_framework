@@ -518,6 +518,10 @@ step_limit | budget_exhausted | awaiting_approval | failed` (`max_tokens`: the
 last response was cut off, and no tool call in it was run). Step kinds: `model, tool_call,
 tool_refused, approval_requested, approval_denied, handoff, compaction`.
 HTTP status: 202 for `awaiting_approval`, 502 for `failed`, 200 otherwise.
+A tool call whose arguments are not a JSON object is refused (`tool_refused`,
+WC317) rather than run; tool calls that will not be run (a `max_tokens` cut, a
+non-`tool_use` stop) and empty turns are kept out of the conversation, so a
+session never replays a `tool_use` without its `tool_result`.
 Since 2.5 a run that did not complete also carries `code` and `hint` (§10a),
 and a failed step carries `code` and `hint`.
 
@@ -535,7 +539,8 @@ reset depth to zero on tool calls, which bypassed the nesting ceiling.
 
 Sessions: `SessionStore` keyed by `(agent, principal.id, session_id)`,
 in-memory, `server.session_capacity` (1000) / `session_ttl_secs` (3600),
-LRU-evicted. Those, `approval_ttl_secs` and `max_invocation_depth` are
+LRU-evicted; each keeps its newest 400 messages / 8 MB, cut at a turn boundary
+(`session::bound`). Those, `approval_ttl_secs` and `max_invocation_depth` are
 manifest defaults that `WebCortex(...)` does not set yet. Saved after any terminal status except `awaiting_approval`. A `session_id` from an anonymous root caller is a 401.
 
 Approvals: a gated call suspends the run into `App.approvals` with the whole
@@ -572,6 +577,9 @@ whose run is `awaiting_approval` or `failed` fails the flow. Templates:
 Route flows classify with a forced `choose` tool whose schema enumerates the
 labels; an unknown label falls to `default`, else the flow fails naming the
 label. The classifier is charged to the ledger as `flow:<name>`.
+
+A flow started on a spent budget runs nothing (not even the classifier) and
+reports `budget_exhausted`.
 
 Result: `{flow, run_id, status: completed|budget_exhausted, output, steps:
 [{tool, duration_ms, ok, error?, label?}], usage: {tree_tokens}, duration_ms}`.

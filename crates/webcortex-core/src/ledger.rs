@@ -66,6 +66,11 @@ pub struct LedgerKey {
     pub model: String,
 }
 
+/// Distinct (kind, name, model) lines kept before spend is pooled.
+pub const MAX_KEYS: usize = 10_000;
+/// The name and model of the line that pools spend past [`MAX_KEYS`].
+pub const OVERFLOW: &str = "(overflow)";
+
 pub struct Ledger {
     entries: Mutex<BTreeMap<LedgerKey, Totals>>,
     runs: Mutex<u64>,
@@ -101,15 +106,17 @@ impl Ledger {
         cache_read: u64,
         cache_write: u64,
     ) {
-        let key = LedgerKey { kind: kind.into(), name: name.into(), model: model.into() };
+        let mut key = LedgerKey { kind: kind.into(), name: name.into(), model: model.into() };
         let mut entries = match self.entries.lock() {
             Ok(e) => e,
             Err(p) => p.into_inner(),
         };
         // Bounded: a runaway of distinct (kind, name, model) keys cannot grow
-        // memory without limit. Real apps have a handful.
-        if entries.len() >= 10_000 && !entries.contains_key(&key) {
-            return;
+        // memory without limit. Real apps have a handful. Past the bound the
+        // spend lands on one overflow line rather than nowhere — dropping it
+        // made the totals, and every budget read from them, too low.
+        if entries.len() >= MAX_KEYS && !entries.contains_key(&key) {
+            key = LedgerKey { kind: "other".into(), name: OVERFLOW.into(), model: OVERFLOW.into() };
         }
         entries.entry(key).or_default().add(input, output, cache_read, cache_write);
     }
@@ -200,6 +207,44 @@ mod tests {
         assert_eq!(snap["unpriced_models"].as_array().unwrap().len(), 2);
         // 2.5.0 reported "priced_cost_usd": -0.0 when nothing was priced.
         assert_eq!(serde_json::to_string(&snap["priced_cost_usd"]).unwrap(), "0.0");
+    }
+
+    #[test]
+    fn spend_past_the_key_bound_is_pooled_not_dropped() {
+        let l = Ledger::default();
+        for i in 0..MAX_KEYS + 50 {
+            l.charge("behaviour", "b", &format!("model-{i}"), 1, 1, 0, 0);
+        }
+        let snap = l.snapshot(|_| None);
+        assert_eq!(snap["totals"]["calls"], (MAX_KEYS + 50) as u64, "every call is counted");
+        assert_eq!(snap["total_tokens"], 2 * (MAX_KEYS + 50) as u64);
+        assert_eq!(snap["by_model"][OVERFLOW]["calls"], 50);
+        assert!(snap["entries"].as_array().unwrap().len() <= MAX_KEYS + 1, "still bounded");
+    }
+
+    #[test]
+    fn concurrent_charges_are_all_counted() {
+        let l = std::sync::Arc::new(Ledger::default());
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let l = l.clone();
+                std::thread::spawn(move || {
+                    for i in 0..1000 {
+                        l.charge("agent", &format!("a{}", i % 3), &format!("m{t}"), 3, 2, 1, 0);
+                        if i % 10 == 0 {
+                            l.count_run();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let snap = l.snapshot(|_| None);
+        assert_eq!(snap["totals"]["calls"], 8000);
+        assert_eq!(snap["total_tokens"], 8000 * 6);
+        assert_eq!(snap["runs"], 800);
     }
 
     #[test]

@@ -51,15 +51,34 @@ pub async fn run(
         FlowKind::Pipeline { steps } => {
             let mut value = input.clone();
             for step in steps {
-                let (rec, result) = call_step(app, step, &value, &input, &actor, depth, &budget).await;
-                records.push(rec);
-                value = result?;
+                // Checked before each step, not only after: a flow nested in
+                // a tree that has already spent its budget must not start.
                 if budget.exhausted() {
                     status = "budget_exhausted";
                     break;
                 }
+                let (rec, result) = call_step(app, step, &value, &input, &actor, depth, &budget).await;
+                records.push(rec);
+                value = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Recorded like a failed parallel or route flow; a
+                        // failed pipeline used to leave no `flow_finished`.
+                        app.audit.record(AuditEvent::flow_finished(&run_id, &def.name, "failed", budget.used()));
+                        return Err(e);
+                    }
+                };
+            }
+            if budget.exhausted() {
+                status = "budget_exhausted";
             }
             value
+        }
+        // A flow started inside a tree that has already spent its budget does
+        // no work — the classifier is a model call too — and says why.
+        FlowKind::Parallel { .. } | FlowKind::Route { .. } if budget.exhausted() => {
+            status = "budget_exhausted";
+            Value::Null
         }
         FlowKind::Parallel { branches, merge } => {
             let futures = branches
@@ -365,6 +384,66 @@ async fn classify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::agent::{AgentRuntime, provider::ScriptedProvider};
+    use crate::manifest::Manifest;
+
+    async fn app(provider: ScriptedProvider) -> (Arc<App>, Arc<ScriptedProvider>) {
+        let m: Manifest = serde_json::from_value(json!({
+            "name": "f",
+            "routes": [
+                {"id": 0, "method": "POST", "path": "/ok", "op": {"kind": "static", "body": {"ok": true}},
+                 "tool": {"expose": true, "name": "ok"}},
+                {"id": 1, "method": "POST", "path": "/boom", "op": {"kind": "static", "status": 500, "body": {"boom": true}},
+                 "tool": {"expose": true, "name": "boom"}}
+            ],
+            "flows": [
+                {"name": "pipe", "kind": {"kind": "pipeline", "steps": [{"tool": "ok"}, {"tool": "boom"}, {"tool": "ok"}]}},
+                {"name": "fine", "kind": {"kind": "pipeline", "steps": [{"tool": "ok"}, {"tool": "ok"}]}},
+                {"name": "par", "kind": {"kind": "parallel", "branches": [{"tool": "ok"}, {"tool": "ok"}]}},
+                {"name": "routed", "kind": {"kind": "route", "routes": {"a": {"tool": "ok"}}}}
+            ]
+        }))
+        .unwrap();
+        let provider = Arc::new(provider);
+        let audit = Arc::new(crate::audit::MemoryAudit::default());
+        let app = App::build_without_python(m).await.expect("app");
+        (app.with_agent_runtime(AgentRuntime::new(provider.clone(), audit)).into_arc(), provider)
+    }
+
+    fn flow<'a>(app: &'a App, name: &str) -> &'a FlowDef {
+        app.manifest.flow(name).expect("declared")
+    }
+
+    #[tokio::test]
+    async fn a_failed_pipeline_step_is_audited_like_any_failed_flow() {
+        let (app, _) = app(ScriptedProvider::text("x")).await;
+        let who = Principal::anonymous();
+        let err = run(&app, flow(&app, "pipe"), json!({}), &who, 0, None).await.unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        let events = app.audit.recent(50);
+        let finished: Vec<_> = events.iter().filter(|e| e.kind == "flow_finished").collect();
+        assert_eq!(finished.len(), 1, "2.5.3 recorded no flow_finished for a failed pipeline");
+        assert_eq!(finished[0].detail["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn a_flow_on_a_spent_budget_does_no_work() {
+        let (app, provider) = app(ScriptedProvider::text("{\"label\": \"a\"}")).await;
+        let who = Principal::anonymous();
+        for name in ["fine", "par", "routed"] {
+            let spent = SharedBudget::new("outer", Some(10));
+            let _ = spent.charge(10);
+            let out = run(&app, flow(&app, name), json!({"input": "x"}), &who, 0, Some(spent)).await.unwrap();
+            assert_eq!(out["status"], "budget_exhausted", "{name}");
+            assert!(out["steps"].as_array().unwrap().is_empty(), "{name}: no step ran");
+        }
+        assert_eq!(provider.calls(), 0, "the classifier was not asked on a spent budget");
+        // With budget left, the same flows run.
+        let out = run(&app, flow(&app, "fine"), json!({}), &who, 0, Some(SharedBudget::new("o", Some(10)))).await.unwrap();
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["steps"].as_array().unwrap().len(), 2);
+    }
 
     #[test]
     fn templates_resolve_paths_against_incoming_and_original() {

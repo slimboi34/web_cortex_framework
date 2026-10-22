@@ -102,6 +102,159 @@ fn full_system(req: &CompletionRequest<'_>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The wire, shared by both formats
+// ---------------------------------------------------------------------------
+
+/// Extra attempts after a transient failure: a refused connection, or one of
+/// [`RETRY_STATUSES`]. The official SDKs retry the same set twice. A timeout
+/// is not retried — the client's timeout is ten minutes, and a third of an
+/// hour spent re-asking would outlast any request that is waiting on it.
+pub const PROVIDER_RETRIES: u32 = 2;
+
+/// Rate limited, overloaded (529 is Anthropic's), or a gateway that lost its
+/// upstream: an answer that is likely to be different a moment later.
+pub const RETRY_STATUSES: [u16; 8] = [408, 409, 429, 500, 502, 503, 504, 529];
+
+/// Longest `retry-after` honoured. A longer one is the provider saying "not
+/// soon", and the run is better told so now than after a minute of silence.
+const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait before attempt `attempt + 1`.
+fn retry_delay(attempt: u32, retry_after: Option<std::time::Duration>) -> std::time::Duration {
+    retry_after
+        .filter(|d| *d <= MAX_RETRY_AFTER)
+        .unwrap_or_else(|| std::time::Duration::from_millis(250u64 << attempt.min(6)))
+}
+
+/// Send one completion request and return its JSON body, retrying transient
+/// failures. Errors keep the shapes the error classifier reads:
+/// `"<label> request failed: …"` (WC303), `"<label> <status>: <detail>"`
+/// (WC304) and `"<label> returned an unreadable body: …"` (WC305).
+///
+/// The body is read as bytes before it is parsed, so an error status survives
+/// a body that is not JSON: a 429 or 502 from a proxy answers in text or HTML,
+/// and parsing first reported it as an unreadable body, losing the status.
+async fn send_with_retries(label: &str, request: reqwest::RequestBuilder) -> Result<Value, String> {
+    let mut attempt = 0u32;
+    loop {
+        let Some(this) = request.try_clone() else {
+            return Err(format!("{label} request failed: the request body could not be replayed"));
+        };
+        let res = match this.send().await {
+            Ok(res) => res,
+            Err(e) if e.is_connect() && attempt < PROVIDER_RETRIES => {
+                tokio::time::sleep(retry_delay(attempt, None)).await;
+                attempt += 1;
+                continue;
+            }
+            Err(e) => return Err(format!("{label} request failed: {e}")),
+        };
+        let status = res.status();
+        let retry_after = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s >= 0.0)
+            .map(std::time::Duration::from_secs_f64);
+        let body = res
+            .bytes()
+            .await
+            .map_err(|e| format!("{label} returned an unreadable body: {e}"))?;
+        if !status.is_success() {
+            if RETRY_STATUSES.contains(&status.as_u16()) && attempt < PROVIDER_RETRIES {
+                tracing::debug!(provider = label, %status, attempt, "retrying a transient provider failure");
+                tokio::time::sleep(retry_delay(attempt, retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+            return Err(format!("{label} {status}: {}", error_detail(&body)));
+        }
+        return serde_json::from_slice(&body).map_err(|e| {
+            format!("{label} returned an unreadable body: {e} (it began {:?})", snippet(&body))
+        });
+    }
+}
+
+/// What an error response says went wrong: `error.message` (both formats),
+/// a bare `error` string, or the start of a body that is not JSON at all.
+fn error_detail(body: &[u8]) -> String {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(payload) => match payload.get("error") {
+            Some(e) => e
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .or_else(|| e.as_str().map(str::to_string))
+                .unwrap_or_else(|| e.to_string()),
+            None => payload
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| "no detail".into()),
+        },
+        Err(_) => {
+            let text = snippet(body);
+            if text.is_empty() { "no detail".into() } else { text }
+        }
+    }
+}
+
+/// The first couple of hundred characters of a body, whitespace collapsed.
+fn snippet(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let mut out: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if out.chars().count() > 200 {
+        out = out.chars().take(200).collect::<String>() + "…";
+    }
+    out
+}
+
+/// A token count from a `usage` field. Some OpenAI-compatible servers report
+/// them as floats (`12.0`); reading only integers charged those calls nothing.
+fn token_count(v: Option<&Value>) -> u64 {
+    match v {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or_else(|| match n.as_f64() {
+            Some(f) if f.is_finite() && f > 0.0 => f.round().min(u64::MAX as f64) as u64,
+            _ => 0,
+        }),
+        _ => 0,
+    }
+}
+
+/// A tool-call id the rest of the turn can rely on: present, non-empty and
+/// unique within the turn. A server that omits ids, sends `""`, or repeats one
+/// left `tool_result`s that could not be matched to their calls.
+fn call_id(given: Option<&str>, seen: &mut std::collections::HashSet<String>) -> String {
+    let id = match given.map(str::trim) {
+        Some(id) if !id.is_empty() && !seen.contains(id) => id.to_string(),
+        _ => format!("call_{}", uuid::Uuid::new_v4().simple()),
+    };
+    seen.insert(id.clone());
+    id
+}
+
+/// What a tool call's arguments are taken to be. Anything that is not a JSON
+/// object is kept as it came — the runtime refuses such a call (WC317) rather
+/// than run the tool with no arguments, which is what a truncated or garbled
+/// argument string used to do.
+fn call_arguments(raw: Option<&Value>) -> Value {
+    match raw {
+        None | Some(Value::Null) => json!({}),
+        Some(Value::String(s)) if s.trim().is_empty() => json!({}),
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone())),
+        Some(v) => v.clone(),
+    }
+}
+
+/// The `input` a canonical `tool_use` block replays with. Anthropic accepts
+/// only an object there; a malformed call is replayed as `{}` and answered
+/// with an error result.
+fn replay_input(arguments: &Value) -> Value {
+    if arguments.is_object() { arguments.clone() } else { json!({}) }
+}
+
+// ---------------------------------------------------------------------------
 // Anthropic
 // ---------------------------------------------------------------------------
 
@@ -152,32 +305,14 @@ impl ModelProvider for AnthropicProvider {
             let agent = req.agent;
             let body = anthropic_body(req);
 
-            let res = self
+            let request = self
                 .client
                 .post(format!("{}/v1/messages", self.base_url.trim_end_matches('/')))
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", &self.version)
                 .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("anthropic request failed: {e}"))?;
-
-            let status = res.status();
-            let payload: Value = res
-                .json()
-                .await
-                .map_err(|e| format!("anthropic returned an unreadable body: {e}"))?;
-
-            if !status.is_success() {
-                let detail = payload
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("no detail");
-                return Err(format!("anthropic {status}: {detail}"));
-            }
-
+                .json(&body);
+            let payload = send_with_retries("anthropic", request).await?;
             parse_anthropic(&payload, &agent.model)
         })
     }
@@ -245,10 +380,12 @@ pub fn parse_anthropic(payload: &Value, model: &str) -> Result<ProviderResponse,
     let content = payload
         .get("content")
         .and_then(|c| c.as_array())
-        .ok_or("anthropic response had no content array")?;
+        .ok_or("anthropic returned an unreadable body: the response had no content array")?;
 
     let mut text = String::new();
     let mut tool_calls = Vec::new();
+    let mut raw = Vec::with_capacity(content.len());
+    let mut seen = std::collections::HashSet::new();
 
     for block in content {
         match block.get("type").and_then(|t| t.as_str()) {
@@ -256,21 +393,21 @@ pub fn parse_anthropic(payload: &Value, model: &str) -> Result<ProviderResponse,
                 if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
                     text.push_str(t);
                 }
+                raw.push(block.clone());
             }
-            Some("tool_use") => tool_calls.push(ToolCall {
-                id: block
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                name: block
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
-            }),
-            _ => {}
+            Some("tool_use") => {
+                let id = call_id(block.get("id").and_then(|i| i.as_str()), &mut seen);
+                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+                let arguments = call_arguments(block.get("input"));
+                // Replayed with the id and input the rest of the turn uses, so
+                // a repaired id still pairs with its result.
+                let mut replay = block.clone();
+                replay["id"] = json!(id);
+                replay["input"] = replay_input(&arguments);
+                raw.push(replay);
+                tool_calls.push(ToolCall { id, name, arguments });
+            }
+            _ => raw.push(block.clone()),
         }
     }
 
@@ -282,12 +419,7 @@ pub fn parse_anthropic(payload: &Value, model: &str) -> Result<ProviderResponse,
     };
 
     let usage = payload.get("usage");
-    let get = |k: &str| {
-        usage
-            .and_then(|u| u.get(k))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-    };
+    let get = |k: &str| token_count(usage.and_then(|u| u.get(k)));
     Ok(ProviderResponse {
         text,
         tool_calls,
@@ -301,7 +433,7 @@ pub fn parse_anthropic(payload: &Value, model: &str) -> Result<ProviderResponse,
             .and_then(|m| m.as_str())
             .unwrap_or(model)
             .to_string(),
-        raw_content: Value::Array(content.clone()),
+        raw_content: Value::Array(raw),
     })
 }
 
@@ -354,27 +486,7 @@ impl ModelProvider for OpenAiCompatProvider {
             if let Some(key) = &self.api_key {
                 builder = builder.bearer_auth(key);
             }
-            let res = builder
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("{} request failed: {e}", self.label))?;
-
-            let status = res.status();
-            let payload: Value = res
-                .json()
-                .await
-                .map_err(|e| format!("{} returned an unreadable body: {e}", self.label))?;
-
-            if !status.is_success() {
-                let detail = payload
-                    .get("error")
-                    .and_then(|e| e.get("message").or(Some(e)))
-                    .map(|m| m.as_str().map(str::to_string).unwrap_or_else(|| m.to_string()))
-                    .unwrap_or_else(|| "no detail".into());
-                return Err(format!("{} {status}: {detail}", self.label));
-            }
-
+            let payload = send_with_retries(self.label, builder.json(&body)).await?;
             parse_openai(&payload, &agent.model)
         })
     }
@@ -519,12 +631,21 @@ pub fn to_openai_messages(role: &str, content: &Value) -> Vec<Value> {
 }
 
 pub fn parse_openai(payload: &Value, model: &str) -> Result<ProviderResponse, String> {
+    // OpenRouter and some proxies report a failure in a 200 body.
+    if payload.get("choices").is_none()
+        && let Some(e) = payload.get("error")
+    {
+        return Err(format!("the provider returned an error: {}", error_detail(json!({"error": e}).to_string().as_bytes())));
+    }
     let choice = payload
         .get("choices")
         .and_then(|c| c.as_array())
         .and_then(|c| c.first())
-        .ok_or("chat completion had no choices")?;
-    let message = choice.get("message").ok_or("chat completion choice had no message")?;
+        .ok_or("the provider returned an unreadable body: the chat completion had no choices")?;
+    let message = choice
+        .get("message")
+        .filter(|m| m.is_object())
+        .ok_or("the provider returned an unreadable body: the chat completion choice had no message")?;
 
     let text = match message.get("content") {
         Some(Value::String(s)) => s.clone(),
@@ -542,54 +663,43 @@ pub fn parse_openai(payload: &Value, model: &str) -> Result<ProviderResponse, St
         raw.push(json!({"type": "text", "text": text}));
     }
     if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
-        for (i, c) in calls.iter().enumerate() {
-            let id = c
-                .get("id")
-                .and_then(|i| i.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("call_{i}"));
+        let mut seen = std::collections::HashSet::new();
+        for c in calls {
+            let id = call_id(c.get("id").and_then(|i| i.as_str()), &mut seen);
             let f = c.get("function").cloned().unwrap_or(Value::Null);
             let name = f
                 .get("name")
                 .and_then(|n| n.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let arguments = match f.get("arguments") {
-                Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
-                Some(v) => v.clone(),
-                None => json!({}),
-            };
-            raw.push(json!({"type": "tool_use", "id": id, "name": name, "input": arguments}));
+            let arguments = call_arguments(f.get("arguments"));
+            raw.push(json!({"type": "tool_use", "id": id, "name": name, "input": replay_input(&arguments)}));
             tool_calls.push(ToolCall { id, name, arguments });
         }
     }
 
     let stop_reason = match choice.get("finish_reason").and_then(|s| s.as_str()) {
         Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
-        Some("stop") => StopReason::EndTurn,
         Some("length") => StopReason::MaxTokens,
+        // Ollama, vLLM and others answer `stop` for a turn that holds tool
+        // calls. Read as the end of the turn, the calls were never run and the
+        // run "completed" with no output.
         _ if !tool_calls.is_empty() => StopReason::ToolUse,
+        Some("stop") => StopReason::EndTurn,
         _ => StopReason::Other,
     };
 
     let usage = payload.get("usage");
-    let get = |k: &str| {
-        usage
-            .and_then(|u| u.get(k))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-    };
+    let get = |k: &str| token_count(usage.and_then(|u| u.get(k)));
     Ok(ProviderResponse {
         text,
         tool_calls,
         stop_reason,
         input_tokens: get("prompt_tokens"),
         output_tokens: get("completion_tokens"),
-        cache_read_tokens: usage
-            .and_then(|u| u.get("prompt_tokens_details"))
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        cache_read_tokens: token_count(
+            usage.and_then(|u| u.get("prompt_tokens_details")).and_then(|d| d.get("cached_tokens")),
+        ),
         cache_write_tokens: 0,
         model: payload
             .get("model")
@@ -687,6 +797,8 @@ enum Turn {
     Error(String),
     /// Text cut off at `max_tokens`.
     Truncated(String),
+    /// A response exactly as given, for wire shapes the others cannot express.
+    Response(Box<ProviderResponse>),
 }
 
 impl ScriptedProvider {
@@ -747,6 +859,11 @@ impl ScriptedProvider {
         )
     }
 
+    /// Replay these responses verbatim, in order.
+    pub fn responses(responses: Vec<ProviderResponse>) -> Self {
+        Self::new(responses.into_iter().map(|r| Turn::Response(Box::new(r))).collect(), false)
+    }
+
     pub fn always_tool(tool: &str, arguments: Value) -> Self {
         Self::new(vec![Turn::Tool { name: tool.into(), arguments }], true)
     }
@@ -804,6 +921,7 @@ impl ModelProvider for ScriptedProvider {
             let model = req.agent.model.clone();
             match turn {
                 Turn::Error(e) => Err(e),
+                Turn::Response(r) => Ok(*r),
                 Turn::Truncated(text) => Ok(ProviderResponse {
                     raw_content: json!([{"type": "text", "text": text}]),
                     text,
@@ -1221,6 +1339,111 @@ mod tests {
         assert_eq!(out[0]["content"], "checking");
         assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "lookup");
         assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "{\"q\":1}");
+    }
+
+    #[test]
+    fn openai_tool_calls_under_a_stop_finish_are_still_tool_use() {
+        // Ollama and vLLM answer `finish_reason: "stop"` for a turn of calls.
+        let payload = json!({"choices": [{"finish_reason": "stop", "message": {"content": null,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}}]});
+        assert_eq!(parse_openai(&payload, "m").unwrap().stop_reason, StopReason::ToolUse);
+        let cut = json!({"choices": [{"finish_reason": "length", "message": {
+            "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{\"a\":"}}]}}]});
+        assert_eq!(parse_openai(&cut, "m").unwrap().stop_reason, StopReason::MaxTokens, "a cut-off turn is never run");
+    }
+
+    #[test]
+    fn tool_call_ids_are_present_and_unique_within_a_turn() {
+        let payload = json!({"choices": [{"finish_reason": "tool_calls", "message": {"tool_calls": [
+            {"function": {"name": "f", "arguments": "{}"}},
+            {"id": "", "function": {"name": "f", "arguments": "{}"}},
+            {"id": "dup", "function": {"name": "f", "arguments": "{}"}},
+            {"id": "dup", "function": {"name": "f", "arguments": "{}"}}
+        ]}}]});
+        let r = parse_openai(&payload, "m").unwrap();
+        let ids: std::collections::HashSet<_> = r.tool_calls.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids.len(), 4, "{:?}", r.tool_calls);
+        assert!(ids.iter().all(|i| !i.is_empty()));
+        assert_eq!(r.tool_calls[2].id, "dup", "a usable id is kept");
+        // The replayed turn carries the same ids, so results pair with calls.
+        let replayed: Vec<_> = r.raw_content.as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(replayed, r.tool_calls.iter().map(|c| c.id.clone()).collect::<Vec<_>>());
+
+        let anthropic = json!({"stop_reason": "tool_use", "content": [
+            {"type": "tool_use", "name": "f", "input": {}},
+            {"type": "tool_use", "id": "", "name": "f", "input": {}}]});
+        let r = parse_anthropic(&anthropic, "m").unwrap();
+        assert_ne!(r.tool_calls[0].id, r.tool_calls[1].id);
+        assert_eq!(r.raw_content[1]["id"], json!(r.tool_calls[1].id));
+    }
+
+    #[test]
+    fn garbled_arguments_are_kept_as_they_came_and_replayed_as_an_object() {
+        let payload = json!({"choices": [{"finish_reason": "tool_calls", "message": {"tool_calls": [
+            {"id": "a", "function": {"name": "f", "arguments": "{\"id\": 5, \"conf"}},
+            {"id": "b", "function": {"name": "f", "arguments": "[1,2]"}},
+            {"id": "c", "function": {"name": "f", "arguments": ""}},
+            {"id": "d", "function": {"name": "f", "arguments": {"x": 1}}}
+        ]}}]});
+        let r = parse_openai(&payload, "m").unwrap();
+        assert_eq!(r.tool_calls[0].arguments, json!("{\"id\": 5, \"conf"), "not silently {{}}");
+        assert_eq!(r.tool_calls[1].arguments, json!([1, 2]));
+        assert_eq!(r.tool_calls[2].arguments, json!({}), "no arguments at all is an empty object");
+        assert_eq!(r.tool_calls[3].arguments, json!({"x": 1}));
+        assert_eq!(r.raw_content[0]["input"], json!({}), "Anthropic replays only an object");
+        let anthropic = json!({"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "a", "name": "f", "input": "x"}]});
+        let r = parse_anthropic(&anthropic, "m").unwrap();
+        assert_eq!(r.tool_calls[0].arguments, json!("x"));
+        assert_eq!(r.raw_content[0]["input"], json!({}));
+    }
+
+    #[test]
+    fn usage_reported_as_floats_is_still_counted() {
+        let payload = json!({"choices": [{"finish_reason": "stop", "message": {"content": "x"}}],
+                             "usage": {"prompt_tokens": 12.0, "completion_tokens": 3.4,
+                                       "prompt_tokens_details": {"cached_tokens": -1}}});
+        let r = parse_openai(&payload, "m").unwrap();
+        assert_eq!((r.input_tokens, r.output_tokens, r.cache_read_tokens), (12, 3, 0));
+        let r = parse_anthropic(&json!({"content": [], "usage": {"input_tokens": 1e30, "output_tokens": "9"}}), "m").unwrap();
+        assert_eq!((r.input_tokens, r.output_tokens), (u64::MAX, 0), "huge saturates; a string is not a count");
+    }
+
+    #[test]
+    fn an_error_body_that_is_not_json_still_says_what_happened() {
+        assert_eq!(error_detail(br#"{"error": {"message": "overloaded"}}"#), "overloaded");
+        assert_eq!(error_detail(br#"{"error": "bad model"}"#), "bad model");
+        assert_eq!(error_detail(br#"{"error": {"code": 7}}"#), r#"{"code":7}"#);
+        assert_eq!(error_detail(b"<html>\n  <h1>502 Bad Gateway</h1>\n</html>"), "<html> <h1>502 Bad Gateway</h1> </html>");
+        assert_eq!(error_detail(b""), "no detail");
+        assert!(error_detail(&vec![b'x'; 5000]).chars().count() <= 201);
+        // The message keeps the shape the classifier reads as WC304.
+        let msg = format!("openai 429 Too Many Requests: {}", error_detail(b"slow down"));
+        assert_eq!(crate::errors::classify_run_error(&msg), "WC304");
+    }
+
+    #[test]
+    fn malformed_success_bodies_are_unreadable_responses_with_their_detail() {
+        use crate::errors::classify_run_error as code;
+        let e = parse_anthropic(&json!({"type": "message"}), "m").unwrap_err();
+        assert_eq!(code(&e), "WC305", "{e}");
+        let e = parse_openai(&json!({"choices": []}), "m").unwrap_err();
+        assert_eq!(code(&e), "WC305", "{e}");
+        let e = parse_openai(&json!({"choices": [{"message": null}]}), "m").unwrap_err();
+        assert_eq!(code(&e), "WC305", "{e}");
+        let e = parse_openai(&json!({"error": {"message": "credit exhausted"}}), "m").unwrap_err();
+        assert!(e.contains("credit exhausted") && code(&e) == "WC304", "{e}");
+        let e = parse_openai(&json!({"error": "nope"}), "m").unwrap_err();
+        assert!(e.contains("nope"), "{e}");
+    }
+
+    #[test]
+    fn retries_back_off_and_honour_a_short_retry_after() {
+        use std::time::Duration;
+        assert_eq!(retry_delay(0, None), Duration::from_millis(250));
+        assert_eq!(retry_delay(1, None), Duration::from_millis(500));
+        assert_eq!(retry_delay(0, Some(Duration::from_secs(2))), Duration::from_secs(2));
+        assert_eq!(retry_delay(0, Some(Duration::from_secs(3600))), Duration::from_millis(250), "a long wait is not honoured");
+        assert_eq!(retry_delay(u32::MAX, None), Duration::from_millis(250 << 6), "no shift overflow");
     }
 
     #[test]

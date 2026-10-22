@@ -296,6 +296,12 @@ A step of the flow failed or was refused; the message names the step. Run that t
 
 A watcher's agent run failed; the insight carries the error. GET /_webcortex/status shows the watcher's recent runs.
 
+### WC317 — Malformed tool call {#wc317}
+
+*agent*
+
+The model asked for a tool with arguments that are not a JSON object (cut off, garbled, or a bare value), so the tool was not run. The model is told and may retry; a small local model that keeps doing it needs a larger max_tokens or a simpler input schema.
+
 ## Budgets and limits (WC4xx)
 
 ### WC401 — Rate limited {#wc401}

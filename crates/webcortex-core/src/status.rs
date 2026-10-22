@@ -648,6 +648,51 @@ mod tests {
     }
 
     #[test]
+    fn runs_recorded_from_many_threads_all_land_and_none_stay_in_flight() {
+        let r = std::sync::Arc::new(Recorder::new(&manifest()));
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let r = r.clone();
+                std::thread::spawn(move || {
+                    for i in 0..250 {
+                        let id = format!("run-{t}-{i}");
+                        r.run_started(&id, "a", "u", 0);
+                        r.run_progress(&id, "a", 1, 10);
+                        r.record_request(Target::Route(7), "GET", "/a/1", if i % 5 == 0 { 500 } else { 200 }, 50, &id, None);
+                        if i % 4 == 0 {
+                            r.run_cancelled(&id);
+                        } else {
+                            let path = ["a".to_string()];
+                            r.run_finished(RunSummary {
+                                run_id: &id, agent: "a", path: &path,
+                                status: if i % 4 == 1 { "failed" } else { "completed" },
+                                steps: 1, tool_calls: 0, tokens: 10, tree_tokens: 10, cost_usd: None,
+                                code: (i % 4 == 1).then_some("WC304"),
+                            });
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let (runs, tallies) = r.runs();
+        assert!(runs["in_flight"].as_array().unwrap().is_empty());
+        assert_eq!(runs["recent"].as_array().unwrap().len(), RECENT_RUNS);
+        let a = &tallies["a"];
+        assert_eq!(a.runs, 2000);
+        assert_eq!(a.cancelled, 8 * 63);
+        assert_eq!(a.failed, 8 * 63);
+        assert_eq!(a.completed, 8 * 124);
+        assert_eq!(a.tokens, 20_000);
+        assert_eq!(r.requests()["total"]["requests"], 2000);
+        let errors = r.errors();
+        assert_eq!(errors["total"], 8 * 50 + 8 * 63, "the 5xx requests and the failed runs");
+        assert_eq!(errors["recent"].as_array().unwrap().len(), RECENT_ERRORS);
+    }
+
+    #[test]
     fn requests_are_counted_by_route_pattern_and_class() {
         let r = Recorder::new(&manifest());
         r.record_request(Target::Route(7), "GET", "/a/1", 200, 120, "r1", None);
