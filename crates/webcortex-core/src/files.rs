@@ -23,7 +23,10 @@ impl FileServer {
         Ok(Self { root, index, cache_secs })
     }
 
-    pub fn serve(&self, relative: &str, if_none_match: Option<&str>) -> WebCortexResponse {
+    /// Serve `relative` (the path beneath the mount point). `request_path` is
+    /// the full path the client asked for, used only to redirect a directory
+    /// requested without its trailing slash.
+    pub fn serve(&self, relative: &str, request_path: &str, if_none_match: Option<&str>) -> WebCortexResponse {
         let Some(safe) = self.resolve(relative) else {
             // Deliberately 404, not 403: a traversal attempt should learn
             // nothing about what does or does not exist outside the root.
@@ -32,6 +35,19 @@ impl FileServer {
 
         let target = if safe.is_dir() {
             match &self.index {
+                // `/docs/guide` served `guide/index.html` as if it were the
+                // file `/docs/guide`, so every relative link in it resolved
+                // one directory too high. Redirect to the slash, as every
+                // static server does. The Location is relative ("./guide/"),
+                // so no request path can turn it into an off-site redirect.
+                Some(_) if !request_path.ends_with('/') => {
+                    let last = request_path.rsplit('/').next().unwrap_or_default();
+                    return WebCortexResponse {
+                        status: 301,
+                        headers: vec![("location".into(), format!("./{last}/"))],
+                        body: bytes::Bytes::new(),
+                    };
+                }
                 Some(name) => safe.join(name),
                 None => return WebCortexResponse::coded(404, "WC207", "not found"),
             }
@@ -45,10 +61,13 @@ impl FileServer {
         };
 
         let etag = weak_etag(&bytes);
-        if if_none_match.is_some_and(|v| v == etag) {
+        if if_none_match.is_some_and(|v| etag_matches(v, &etag)) {
             return WebCortexResponse {
                 status: 304,
-                headers: vec![("etag".into(), etag)],
+                headers: vec![
+                    ("etag".into(), etag),
+                    ("cache-control".into(), format!("public, max-age={}", self.cache_secs)),
+                ],
                 body: bytes::Bytes::new(),
             };
         }
@@ -110,6 +129,16 @@ impl FileServer {
     }
 }
 
+/// `If-None-Match` against our tag, by the weak comparison RFC 9110 §13.1.2
+/// prescribes: `*`, or any tag in the comma-separated list whose opaque part
+/// equals ours, `W/` or not. 2.5.3 compared the whole header to one tag, so a
+/// browser or CDN sending a list (or the strong form) never got a 304.
+fn etag_matches(header: &str, etag: &str) -> bool {
+    let opaque = |t: &str| t.trim().trim_start_matches("W/").to_string();
+    let ours = opaque(etag);
+    header.split(',').any(|t| t.trim() == "*" || opaque(t) == ours)
+}
+
 fn weak_etag(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -160,7 +189,7 @@ mod tests {
     #[test]
     fn serves_a_file_with_a_guessed_mime_type() {
         let f = Fixture::new();
-        let res = f.server().serve("/app.js", None);
+        let res = f.server().serve("/app.js", "/s/app.js", None);
         assert_eq!(res.status, 200);
         let ct = res.headers.iter().find(|(k, _)| k == "content-type").unwrap();
         assert!(ct.1.contains("javascript"), "got {}", ct.1);
@@ -169,7 +198,7 @@ mod tests {
     #[test]
     fn serves_the_index_for_a_directory() {
         let f = Fixture::new();
-        let res = f.server().serve("/", None);
+        let res = f.server().serve("/", "/s/", None);
         assert_eq!(res.status, 200);
         assert!(String::from_utf8_lossy(&res.body).contains("home"));
     }
@@ -177,7 +206,7 @@ mod tests {
     #[test]
     fn nested_paths_work() {
         let f = Fixture::new();
-        assert_eq!(f.server().serve("/sub/deep.txt", None).status, 200);
+        assert_eq!(f.server().serve("/sub/deep.txt", "/s/sub/deep.txt", None).status, 200);
     }
 
     #[test]
@@ -191,23 +220,23 @@ mod tests {
             "/sub/../../etc/passwd",
             "/....//etc/passwd",
         ] {
-            assert_eq!(s.serve(attack, None).status, 404, "leaked via {attack}");
+            assert_eq!(s.serve(attack, attack, None).status, 404, "leaked via {attack}");
         }
     }
 
     #[test]
     fn dotfiles_are_never_served() {
         let f = Fixture::new();
-        assert_eq!(f.server().serve("/.env", None).status, 404);
+        assert_eq!(f.server().serve("/.env", "/s/.env", None).status, 404);
     }
 
     #[test]
     fn etag_enables_a_304() {
         let f = Fixture::new();
         let s = f.server();
-        let first = s.serve("/app.js", None);
+        let first = s.serve("/app.js", "/s/app.js", None);
         let etag = first.headers.iter().find(|(k, _)| k == "etag").unwrap().1.clone();
-        let second = s.serve("/app.js", Some(&etag));
+        let second = s.serve("/app.js", "/s/app.js", Some(&etag));
         assert_eq!(second.status, 304);
         assert!(second.body.is_empty());
     }
@@ -215,6 +244,31 @@ mod tests {
     #[test]
     fn missing_file_is_404() {
         let f = Fixture::new();
-        assert_eq!(f.server().serve("/nope.txt", None).status, 404);
+        assert_eq!(f.server().serve("/nope.txt", "/s/nope.txt", None).status, 404);
+    }
+
+    #[test]
+    fn if_none_match_uses_the_weak_comparison_over_a_list() {
+        let f = Fixture::new();
+        let s = f.server();
+        let first = s.serve("/app.js", "/s/app.js", None);
+        let etag = first.headers.iter().find(|(k, _)| k == "etag").unwrap().1.clone();
+        let strong = etag.trim_start_matches("W/").to_string();
+        for header in [format!("W/\"other\", {etag}"), strong, "*".to_string(), format!(" {etag} ")] {
+            assert_eq!(s.serve("/app.js", "/s/app.js", Some(&header)).status, 304, "{header}");
+        }
+        assert_eq!(s.serve("/app.js", "/s/app.js", Some("W/\"other\"")).status, 200);
+    }
+
+    #[test]
+    fn a_directory_without_its_slash_redirects_relatively() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.join("sub/index.html"), b"sub").expect("write");
+        let res = f.server().serve("/sub", "/s/sub", None);
+        assert_eq!(res.status, 301);
+        assert_eq!(res.headers, vec![("location".to_string(), "./sub/".to_string())]);
+        assert_eq!(f.server().serve("/sub/", "/s/sub/", None).status, 200);
+        // The mount point itself, reached without a slash.
+        assert_eq!(f.server().serve("/", "/s", None).headers[0].1, "./s/");
     }
 }

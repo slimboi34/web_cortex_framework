@@ -489,6 +489,15 @@ impl App {
             Err(MatchError::NotFound) => return self.no_route(&req.method, &req.path),
             Err(MatchError::MethodNotAllowed) => {
                 let allowed = self.router.allowed_methods(&req.path).join(", ");
+                // OPTIONS asks what a path supports; the answer is the Allow
+                // header, not a 405 for having asked.
+                if req.method.eq_ignore_ascii_case("OPTIONS") {
+                    return WebCortexResponse {
+                        status: 204,
+                        headers: vec![("allow".into(), allowed)],
+                        body: bytes::Bytes::new(),
+                    };
+                }
                 let mut res = WebCortexResponse::coded(
                     405,
                     "WC202",
@@ -567,10 +576,10 @@ impl App {
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.as_ref().ok_or("no database configured")?;
-                    let bindings: Vec<serde_json::Value> = params
-                        .iter()
-                        .map(|name| req.lookup(name).unwrap_or(serde_json::Value::Null))
-                        .collect();
+                    let bindings = match req.bind(params) {
+                        Ok(b) => b,
+                        Err(e) => return Ok(WebCortexResponse::coded(400, "WC205", e)),
+                    };
                     let value = match db.run(sql, &bindings, *returns).await {
                         Ok(v) => v,
                         Err(e) => return Ok(WebCortexResponse::coded(e.status(), e.code(), e.message())),
@@ -601,7 +610,7 @@ impl App {
                     .next()
                     .cloned()
                     .unwrap_or_else(|| "/".into());
-                Ok(server.serve(&relative, req.headers.get("if-none-match").map(|s| s.as_str())))
+                Ok(server.serve(&relative, &req.path, req.headers.get("if-none-match").map(|s| s.as_str())))
             }
 
             Op::Agent { agent, .. } => {
@@ -815,10 +824,10 @@ impl App {
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.as_ref().ok_or("no database configured")?;
-                    let bindings: Vec<serde_json::Value> = params
-                        .iter()
-                        .map(|n| req.lookup(n).unwrap_or(serde_json::Value::Null))
-                        .collect();
+                    let bindings = match req.bind(params) {
+                        Ok(b) => b,
+                        Err(e) => return Ok(WebCortexResponse::coded(400, "WC205", e)),
+                    };
                     let value = match db.run(sql, &bindings, *returns).await {
                         Ok(v) => v,
                         Err(e) => return Ok(WebCortexResponse::coded(e.status(), e.code(), e.message())),

@@ -240,7 +240,8 @@ Every template also receives:
 {{ user.id }}  {{ user.authenticated }}  {{ user.scopes }}
 ```
 
-`.html`, `.htm`, and `.xml` templates autoescape. Template inheritance,
+`.html`, `.htm`, `.xhtml`, `.xml` and `.svg` templates autoescape (also as
+`page.html.j2`). Template inheritance,
 `{% extends %}`, `{% block %}`, and filters all work. See
 [Frontend](frontend.md).
 

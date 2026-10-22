@@ -87,6 +87,39 @@ impl WebCortexRequest {
         None
     }
 
+    /// Resolve each of `names` as [`Self::lookup`] does, for a declared query.
+    ///
+    /// The body is parsed once, not once per name (a 30 MB body bound to five
+    /// parameters was parsed five times). And a body a name has to be read
+    /// from must be a JSON object: 2.5.3 treated a malformed, too deeply
+    /// nested or non-object body as absent, so `POST /items` with `{bad json`
+    /// bound every column to NULL and inserted an empty row. That is a 400
+    /// now, with the reason as the `Err`.
+    pub fn bind(&self, names: &[String]) -> Result<Vec<serde_json::Value>, String> {
+        let mut body: Option<Result<serde_json::Map<String, serde_json::Value>, String>> = None;
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            if name == "@principal" || self.path_params.contains_key(name) || self.query.contains_key(name) {
+                out.push(self.lookup(name).unwrap_or(serde_json::Value::Null));
+                continue;
+            }
+            if self.body.is_empty() {
+                out.push(serde_json::Value::Null);
+                continue;
+            }
+            let parsed = body.get_or_insert_with(|| match serde_json::from_slice(&self.body) {
+                Ok(serde_json::Value::Object(map)) => Ok(map),
+                Ok(_) => Err("the request body must be a JSON object naming the route's parameters".into()),
+                Err(e) => Err(format!("the request body is not valid JSON: {e}")),
+            });
+            match parsed {
+                Ok(map) => out.push(map.get(name).cloned().unwrap_or(serde_json::Value::Null)),
+                Err(e) => return Err(e.clone()),
+            }
+        }
+        Ok(out)
+    }
+
     pub fn json_body(&self) -> Result<serde_json::Value, serde_json::Error> {
         if self.body.is_empty() {
             return Ok(serde_json::Value::Null);
@@ -98,11 +131,23 @@ impl WebCortexRequest {
 /// Path and query values arrive as strings but are semantically typed. Coercing
 /// here means a `Query` op can bind `/users/42` to an integer column without the
 /// declaration having to restate the type.
+///
+/// Only text that *is* a number in its plain spelling is converted; anything
+/// else stays a string, which SQLite still compares numerically against a
+/// numeric column. 2.5.3 handed every string Rust could parse to `f64`, so
+/// `?q=nan`, `inf` or `1e999` bound as NULL (JSON has no NaN), the ZIP code
+/// `02134` lost its zero, and `99999999999999999999` lost its last digits.
 fn coerce_scalar(s: &str) -> serde_json::Value {
-    if let Ok(i) = s.parse::<i64>() {
+    if let Ok(i) = s.parse::<i64>()
+        && plain_number(s, false)
+    {
         return serde_json::Value::from(i);
     }
-    if let Ok(f) = s.parse::<f64>() {
+    if plain_number(s, true)
+        && s.contains(['.', 'e', 'E'])
+        && let Ok(f) = s.parse::<f64>()
+        && f.is_finite()
+    {
         return serde_json::Value::from(f);
     }
     match s {
@@ -110,6 +155,28 @@ fn coerce_scalar(s: &str) -> serde_json::Value {
         "false" => serde_json::Value::Bool(false),
         _ => serde_json::Value::String(s.to_string()),
     }
+}
+
+/// Whether `s` is spelled as JSON spells a number: an optional `-`, digits
+/// with no superfluous leading zero, and (if `fraction`) a fraction and an
+/// exponent. No `+`, no whitespace, no `inf`/`nan`, no `0x`.
+fn plain_number(s: &str, fraction: bool) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    let (mantissa, exponent) = match digits.split_once(['e', 'E']) {
+        Some((m, e)) if fraction => (m, Some(e)),
+        Some(_) => return false,
+        None => (digits, None),
+    };
+    let (int, frac) = match mantissa.split_once('.') {
+        Some((i, f)) if fraction => (i, Some(f)),
+        Some(_) => return false,
+        None => (mantissa, None),
+    };
+    let all_digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    all_digits(int)
+        && (int == "0" || !int.starts_with('0'))
+        && frac.is_none_or(all_digits)
+        && exponent.is_none_or(|e| all_digits(e.strip_prefix(['-', '+']).unwrap_or(e)))
 }
 
 #[derive(Debug, Clone)]
@@ -240,7 +307,50 @@ pub(crate) fn percent_decode(s: &str, plus_as_space: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::percent_decode;
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn only_plainly_spelled_numbers_are_coerced() {
+        assert_eq!(coerce_scalar("42"), json!(42));
+        assert_eq!(coerce_scalar("-7"), json!(-7));
+        assert_eq!(coerce_scalar("0"), json!(0));
+        assert_eq!(coerce_scalar("1.5"), json!(1.5));
+        assert_eq!(coerce_scalar("-0.25e2"), json!(-25.0));
+        assert_eq!(coerce_scalar("true"), json!(true));
+        for kept in ["nan", "NaN", "inf", "-Infinity", "1e999", "007", "02134", "+5", " 5", "5 ",
+                     "0x10", "1_000", "99999999999999999999", "1.", ".5", "1e", "-", ""] {
+            assert_eq!(coerce_scalar(kept), json!(kept), "{kept:?} must stay a string");
+        }
+    }
+
+    fn with_body(body: &str) -> WebCortexRequest {
+        let mut req = WebCortexRequest::synthetic("POST", "/x");
+        req.body = Bytes::from(body.to_string());
+        req
+    }
+
+    #[test]
+    fn bind_reads_path_query_then_body() {
+        let mut req = with_body(r#"{"a": 1, "b": "two"}"#);
+        req.query.insert("b".into(), "q".into());
+        req.path_params.insert("c".into(), "9".into());
+        let names: Vec<String> = ["a", "b", "c", "missing"].map(String::from).to_vec();
+        assert_eq!(req.bind(&names).unwrap(), vec![json!(1), json!("q"), json!(9), json!(null)]);
+        assert_eq!(WebCortexRequest::synthetic("GET", "/").bind(&names).unwrap()[0], json!(null));
+    }
+
+    #[test]
+    fn bind_refuses_a_body_it_cannot_read() {
+        let names = vec!["a".to_string()];
+        for bad in ["{bad json", "[1, 2]", "\"text\"", &format!("{{\"a\": {}1{}}}", "[".repeat(200), "]".repeat(200))] {
+            assert!(with_body(bad).bind(&names).is_err(), "{bad:.40}");
+        }
+        // A body no name is read from is not inspected.
+        let mut req = with_body("{bad json");
+        req.query.insert("a".into(), "1".into());
+        assert_eq!(req.bind(&names).unwrap(), vec![json!(1)]);
+    }
 
     #[test]
     fn percent_decoding_handles_escapes_plus_and_junk() {

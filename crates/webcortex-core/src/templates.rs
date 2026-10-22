@@ -36,7 +36,7 @@ impl Templates {
         // default is not an acceptable trade for a framework in 2026.
         if cfg.autoescape {
             env.set_auto_escape_callback(|name| {
-                if name.ends_with(".html") || name.ends_with(".htm") || name.ends_with(".xml") {
+                if escapes_html(name) {
                     minijinja::AutoEscape::Html
                 } else {
                     minijinja::AutoEscape::None
@@ -84,6 +84,21 @@ impl Templates {
             }
         }
     }
+}
+
+/// Whether a template's output is markup, judged by its extension.
+///
+/// Case-insensitive, and looking through a trailing Jinja suffix: in 2.5.3
+/// `page.html.j2`, `page.html.jinja` and `PAGE.HTML` all rendered with no
+/// escaping at all, so data in them was an XSS. `.svg` and `.xhtml` are
+/// markup too.
+fn escapes_html(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let inner = [".j2", ".jinja", ".jinja2"]
+        .iter()
+        .find_map(|suffix| lower.strip_suffix(suffix))
+        .unwrap_or(&lower);
+    [".html", ".htm", ".xhtml", ".xml", ".svg"].iter().any(|ext| inner.ends_with(ext))
 }
 
 fn add_filters(env: &mut Environment<'static>) {
@@ -158,6 +173,20 @@ mod tests {
         let body = String::from_utf8_lossy(&res.body);
         assert!(!body.contains("<script>"), "XSS must be escaped: {body}");
         assert!(body.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn markup_is_recognised_through_jinja_suffixes_and_case() {
+        for name in ["a.html", "a.HTML", "a.htm", "a.html.j2", "a.html.jinja", "a.Html.Jinja2",
+                     "a.xml", "a.svg", "a.xhtml"] {
+            assert!(escapes_html(name), "{name} must escape");
+        }
+        for name in ["a.txt", "a.json", "a.j2", "a.txt.jinja", "html", "a.md"] {
+            assert!(!escapes_html(name), "{name} must not escape");
+        }
+        let (_d, t) = temp_templates(&[("x.html.j2", "{{ data }}")]);
+        let res = t.render("x.html.j2", &serde_json::json!({"data": "<script>"}), 200);
+        assert_eq!(String::from_utf8_lossy(&res.body), "&lt;script&gt;");
     }
 
     #[test]

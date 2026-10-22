@@ -78,6 +78,12 @@ impl Db {
         for b in bindings {
             q = bind_value(q, b);
         }
+        // `returns="one"` stops at the first row instead of materialising
+        // every row the statement matches and keeping one.
+        if returns == QueryReturns::One {
+            let row = q.fetch_optional(&self.pool).await.map_err(QueryError::from_sqlx)?;
+            return Ok(row.as_ref().map(row_to_json).unwrap_or(Value::Null));
+        }
         let rows = q.fetch_all(&self.pool).await.map_err(QueryError::from_sqlx)?;
 
         let mut out = Vec::with_capacity(rows.len());
@@ -85,10 +91,7 @@ impl Db {
             out.push(row_to_json(row));
         }
 
-        match returns {
-            QueryReturns::One => Ok(out.into_iter().next().unwrap_or(Value::Null)),
-            _ => Ok(Value::Array(out)),
-        }
+        Ok(Value::Array(out))
     }
 }
 

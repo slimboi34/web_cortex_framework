@@ -59,9 +59,15 @@ impl Principal {
     /// True when the root of the delegation chain presented no credential.
     /// Every such caller shares the one id `anonymous`, so nothing keyed by
     /// identity — a session, an `@principal` binding — may be handed to one.
+    ///
+    /// A bearer token without a `sub` counts as well: every such token is the
+    /// one principal `jwt-subject-unset`, so keying a session or an
+    /// `@principal` query by it would pool every subject-less caller's data,
+    /// exactly as it would for anonymous ones.
     pub fn root_is_anonymous(&self) -> bool {
         self.is_anonymous()
             || self.claims.get("root_anonymous").and_then(|v| v.as_bool()).unwrap_or(false)
+            || self.root_id() == JWT_SUBJECT_UNSET
     }
 
     pub fn has_scope(&self, scope: &str) -> bool {
@@ -122,6 +128,15 @@ impl Principal {
         }
     }
 }
+
+/// The id of a bearer token that names no subject.
+pub const JWT_SUBJECT_UNSET: &str = "jwt-subject-unset";
+
+/// Claim names the runtime writes into a principal itself, to track delegation.
+/// A token's own claims of these names are dropped at the edge: a signed
+/// `"root": "alice"` claim otherwise became the caller's root identity, which
+/// is what an `@principal` query binds, so it read and wrote alice's rows.
+const RESERVED_CLAIMS: &[&str] = &["root", "root_anonymous", "agent", "on_behalf_of"];
 
 #[derive(Debug, Deserialize)]
 struct Claims {
@@ -202,12 +217,8 @@ impl Authenticator {
         }
 
         if let Some(auth) = headers.get("authorization") {
-            let value = auth.trim();
-            if let Some(token) = value
-                .strip_prefix("Bearer ")
-                .or_else(|| value.strip_prefix("bearer "))
-            {
-                return self.authenticate_jwt(token.trim());
+            if let Some(token) = bearer_token(auth) {
+                return self.authenticate_jwt(token);
             }
             return Err(AuthError::Malformed(
                 "Authorization header must use the Bearer scheme".into(),
@@ -270,13 +281,27 @@ impl Authenticator {
         scopes.sort();
         scopes.dedup();
 
+        let mut claims = c.extra;
+        for name in RESERVED_CLAIMS {
+            claims.remove(*name);
+        }
         Ok(Principal {
-            id: c.sub.unwrap_or_else(|| "jwt-subject-unset".into()),
+            // An empty `sub` names nobody, the same as a missing one.
+            id: c.sub.filter(|s| !s.is_empty()).unwrap_or_else(|| JWT_SUBJECT_UNSET.into()),
             kind: PrincipalKind::Jwt,
             scopes,
-            claims: c.extra,
+            claims,
         })
     }
+}
+
+/// The token of a `Bearer` credential. The scheme name is case-insensitive
+/// (RFC 9110 §11.1), so `BEARER x` is a bearer token, not a malformed header,
+/// and any run of spaces or tabs may separate it from the token.
+fn bearer_token(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let (scheme, token) = value.split_once([' ', '\t'])?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim()).filter(|t| !t.is_empty())
 }
 
 fn build_jwt_decoder(cfg: &JwtConfig) -> Result<JwtDecoder, String> {
@@ -431,6 +456,82 @@ mod tests {
         assert_eq!(a.root_id(), "u1");
         assert_eq!(b.root_id(), "u1");
         assert_ne!(b.id, "u1");
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("bEaReR \t abc "), Some("abc"));
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Bearer   "), None);
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearerabc"), None);
+    }
+
+    fn jwt_authenticator() -> Authenticator {
+        // A unique variable name, read only by this authenticator.
+        let var = format!("WC_TEST_JWT_{}", uuid::Uuid::new_v4().simple());
+        unsafe { std::env::set_var(&var, "a-test-secret-that-is-long-enough-123456") };
+        Authenticator::build(&AuthConfig {
+            jwt: Some(JwtConfig {
+                secret_env: var,
+                algorithm: "HS256".into(),
+                audience: None,
+                issuer: None,
+                leeway_secs: 0,
+            }),
+            ..Default::default()
+        })
+        .expect("authenticator")
+    }
+
+    fn sign(claims: serde_json::Value) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"a-test-secret-that-is-long-enough-123456"),
+        )
+        .expect("sign")
+    }
+
+    fn exp() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600
+    }
+
+    fn auth_with(a: &Authenticator, token: &str) -> Principal {
+        let mut headers = BTreeMap::new();
+        headers.insert("authorization".to_string(), format!("bearer {token}"));
+        a.authenticate(&headers).expect("token accepted")
+    }
+
+    #[test]
+    fn a_token_cannot_claim_a_root_identity() {
+        let a = jwt_authenticator();
+        let p = auth_with(&a, &sign(serde_json::json!({
+            "sub": "mallory", "root": "alice", "root_anonymous": false,
+            "agent": "x", "on_behalf_of": "alice", "team": "red", "exp": exp(),
+        })));
+        assert_eq!(p.root_id(), "mallory");
+        assert_eq!(p.claims.get("team"), Some(&serde_json::json!("red")), "other claims are kept");
+        for name in RESERVED_CLAIMS {
+            assert!(!p.claims.contains_key(*name), "{name} survived");
+        }
+        let delegated = p.delegate_to_agent("helper", &[]);
+        assert_eq!(delegated.root_id(), "mallory");
+    }
+
+    #[test]
+    fn a_token_without_a_subject_has_no_identity_to_key_on() {
+        let a = jwt_authenticator();
+        for claims in [serde_json::json!({"exp": exp()}), serde_json::json!({"sub": "", "exp": exp()})] {
+            let p = auth_with(&a, &sign(claims));
+            assert_eq!(p.id, JWT_SUBJECT_UNSET);
+            assert!(p.root_is_anonymous());
+            assert!(p.delegate_to_agent("a", &[]).root_is_anonymous());
+        }
+        let named = auth_with(&a, &sign(serde_json::json!({"sub": "u1", "exp": exp()})));
+        assert!(!named.root_is_anonymous());
     }
 
     #[test]

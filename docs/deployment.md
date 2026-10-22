@@ -178,9 +178,13 @@ present an API key.
  "python_workers": 10, "sessions": 3, "pending_approvals": 0}
 ```
 
-On `SIGTERM` or `SIGINT`, the server stops accepting connections and drains
-in-flight requests for up to `shutdown_timeout` seconds. A deploy never severs a
-request that was mid-flight.
+On `SIGTERM` or `SIGINT`, the server stops accepting connections, closes idle
+keep-alive connections, and drains in-flight requests (answered with
+`Connection: close`) for up to `shutdown_timeout` seconds. A deploy never severs
+a request that was mid-flight.
+
+`HEAD` is answered wherever `GET` is, so `HEAD /_webcortex/health` works as a
+probe too.
 
 Set your orchestrator's grace period **above** `shutdown_timeout`:
 

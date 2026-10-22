@@ -1519,6 +1519,13 @@ class WebCortex:
         """Routes, plus a discovery route at `/` when the app leaves it free."""
         if any(r["path"] == "/" and r["method"] == "GET" for r in self._routes):
             return self._routes
+        # A static directory mounted at `/` with an index serves `/` itself.
+        if any(
+            r["method"] == "GET" and r["op"].get("kind") == "files" and r["op"].get("index")
+            and r["path"].startswith("/{*")
+            for r in self._routes
+        ):
+            return self._routes
         default = {
             "id": self._next_id,
             "method": "GET",

@@ -29,7 +29,6 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// How much of an oversized body is read and thrown away before the 413, and
@@ -93,7 +92,14 @@ where
         tracing::info!(devices = app.devices().len(), watchers = watchers.len(), "device hub running");
     }
 
-    let tracker = Arc::new(tokio::sync::Semaphore::new(Semaphore::MAX_PERMITS));
+    // Shutdown is broadcast to every connection task, and each task holds a
+    // receiver for as long as it runs, so "all receivers dropped" is exactly
+    // "every connection has finished". 2.5.3 counted connections with a
+    // semaphore and waited for `MAX_PERMITS as u32` of them back — a
+    // truncation that was satisfied immediately, so the drain never waited and
+    // in-flight requests were severed when the process exited. Idle keep-alive
+    // connections were never told to close, either.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     tokio::pin!(shutdown);
 
     loop {
@@ -112,28 +118,69 @@ where
                 };
                 let app = app.clone();
                 let header_timeout = header_read_timeout(app.manifest.server.request_timeout_secs);
-                let permit = tracker.clone().acquire_owned().await.ok();
+                let mut stop = stop_rx.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
                     // hyper's header timeout starts once it reads; the auto
                     // builder's protocol sniff before that waits forever, so
                     // a client that connects and sends nothing is dropped here.
-                    if tokio::time::timeout(header_timeout, stream.readable()).await.is_err() {
-                        tracing::debug!(%peer, "connection sent nothing; closed");
-                        return;
+                    tokio::select! {
+                        ready = tokio::time::timeout(header_timeout, stream.readable()) => {
+                            if ready.is_err() {
+                                tracing::debug!(%peer, "connection sent nothing; closed");
+                                return;
+                            }
+                        }
+                        _ = stop.changed() => return,
                     }
-                    let io = TokioIo::new(stream);
+                    let activity = Arc::new(Activity::new());
+                    let io = TokioIo::new(Tracked { inner: stream, activity: activity.clone() });
+                    let in_service = activity.clone();
                     let svc = service_fn(move |req| {
                         let app = app.clone();
                         let client_ip = peer.ip().to_string();
-                        async move { Ok::<_, Infallible>(handle(app, req, client_ip).await) }
+                        let busy = in_service.begin();
+                        async move {
+                            let res = handle(app, req, client_ip).await;
+                            drop(busy);
+                            Ok::<_, Infallible>(res)
+                        }
                     });
                     let mut builder = auto::Builder::new(TokioExecutor::new());
                     // hyper applies a header read timeout only when it has a
                     // timer; without one, slow or silent clients were held forever.
                     builder.http1().timer(TokioTimer::new()).header_read_timeout(header_timeout);
                     builder.http2().timer(TokioTimer::new());
-                    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+                    let conn = builder.serve_connection_with_upgrades(io, svc);
+                    tokio::pin!(conn);
+                    // hyper's header timeout covers HTTP/1 only. An HTTP/2
+                    // connection — or one that sent part of the HTTP/2
+                    // preface, which the protocol sniff waits on forever —
+                    // was held open indefinitely, so idle sockets could be
+                    // piled up past every timeout. A connection with nothing
+                    // in flight and no bytes moving for the header timeout is
+                    // now closed, whatever its protocol.
+                    let tick = (header_timeout / 4).max(std::time::Duration::from_millis(250));
+                    let result = loop {
+                        tokio::select! {
+                            r = conn.as_mut() => break r,
+                            _ = stop.changed() => {
+                                // Finish the request in flight, answer it with
+                                // `connection: close`, and close an idle one now.
+                                conn.as_mut().graceful_shutdown();
+                                break conn.await;
+                            }
+                            _ = tokio::time::sleep(tick) => {
+                                if activity.idle_for() >= header_timeout {
+                                    tracing::debug!(%peer, "idle connection closed");
+                                    conn.as_mut().graceful_shutdown();
+                                    break tokio::time::timeout(header_timeout, conn.as_mut())
+                                        .await
+                                        .unwrap_or(Ok(()));
+                                }
+                            }
+                        }
+                    };
+                    if let Err(e) = result {
                         tracing::debug!(%peer, error = %e, "connection closed");
                     }
                 });
@@ -145,21 +192,134 @@ where
         w.abort();
     }
 
-    // Draining: wait for every outstanding connection permit to come back.
+    // Draining: tell every connection to finish, then wait for them all.
+    drop(listener);
+    drop(stop_rx);
+    let _ = stop_tx.send(true);
     let deadline = std::time::Duration::from_secs(cfg.shutdown_timeout_secs);
-    match tokio::time::timeout(
-        deadline,
-        tracker.acquire_many(Semaphore::MAX_PERMITS as u32),
-    )
-    .await
-    {
-        Ok(_) => tracing::info!("all connections drained; exiting"),
+    match tokio::time::timeout(deadline, stop_tx.closed()).await {
+        Ok(()) => tracing::info!("all connections drained; exiting"),
         Err(_) => tracing::warn!(
             timeout_secs = cfg.shutdown_timeout_secs,
+            open = stop_tx.receiver_count(),
             "drain timed out; exiting with connections still open"
         ),
     }
     Ok(())
+}
+
+/// What a connection is doing: when bytes last moved, and how many requests
+/// are being handled on it. Idle means neither, for a while.
+struct Activity {
+    epoch: std::time::Instant,
+    last_ms: std::sync::atomic::AtomicU64,
+    in_flight: std::sync::atomic::AtomicUsize,
+}
+
+/// Held while a request is being handled.
+struct Busy(Arc<Activity>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.touch();
+    }
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            epoch: std::time::Instant::now(),
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let now = self.epoch.elapsed().as_millis() as u64;
+        self.last_ms.store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn begin(self: &Arc<Self>) -> Busy {
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.touch();
+        Busy(self.clone())
+    }
+
+    /// How long the connection has had nothing in flight and moved no bytes.
+    fn idle_for(&self) -> std::time::Duration {
+        if self.in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            return std::time::Duration::ZERO;
+        }
+        let last = self.last_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let now = self.epoch.elapsed().as_millis() as u64;
+        std::time::Duration::from_millis(now.saturating_sub(last))
+    }
+}
+
+/// A socket that records, in its [`Activity`], every read or write that moves bytes.
+struct Tracked<T> {
+    inner: T,
+    activity: Arc<Activity>,
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Tracked<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            self.activity.touch();
+        }
+        res
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Tracked<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let res = std::pin::Pin::new(&mut self.inner).poll_write(cx, data);
+        if matches!(res, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.touch();
+        }
+        res
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let res = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if matches!(res, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.touch();
+        }
+        res
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 async fn shutdown_signal() {
@@ -233,14 +393,36 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
         }
     };
 
-    // Applied on every exit path, including errors and rejections.
-    res.headers.push(("x-request-id".into(), request_id.clone()));
-    for h in middleware::security_headers(&app.manifest.security_headers, false) {
-        res.headers.push(h);
+    strip_framing_headers(&mut res);
+
+    // A handler can answer with a status or a header hyper cannot send. That
+    // used to become a bare text/plain 500 built after logging — no security
+    // headers, no request id, and a log line recording the status that was
+    // never sent. It is a coded 500 now, decided before anything is recorded.
+    if let Err(problem) = sendable(&res) {
+        tracing::error!(
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            problem = %problem,
+            "handler produced a response that cannot be sent; returning 500"
+        );
+        res = WebCortexResponse::coded(500, "WC001", format!("the handler's response could not be sent: {problem}"));
     }
 
+    // Applied on every exit path, including errors and rejections. The id is
+    // always ours, so it matches the log; a security header the handler set
+    // itself is its decision and is not duplicated (two conflicting
+    // X-Frame-Options are worse than either).
+    res.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("x-request-id"));
+    res.headers.push(("x-request-id".into(), request_id.clone()));
+    for (k, v) in middleware::security_headers(&app.manifest.security_headers, false) {
+        push_absent(&mut res.headers, k, v);
+    }
+    dedupe_content_type(&mut res.headers);
+
     let elapsed_us = started.elapsed().as_micros() as u64;
-    let target = if path.starts_with(&app.manifest.server.control_prefix) {
+    let target = if control_path(&path, &app.manifest.server.control_prefix).is_some() {
         crate::status::Target::Control
     } else {
         let id = app.route_id_for(&method, &path).or_else(|| {
@@ -280,16 +462,24 @@ async fn route_request(
     let path = uri.path().to_string();
     let query = parse_query(uri.query().unwrap_or(""));
 
-    let mut headers = std::collections::BTreeMap::new();
-    for (k, v) in req.headers() {
-        if let Ok(s) = v.to_str() {
-            headers.insert(k.as_str().to_ascii_lowercase(), s.to_string());
-        }
+    let mut headers = collect_headers(req.headers());
+    // HTTP/2 carries the host as the `:authority` pseudo-header, never as
+    // `Host`; give handlers the same `host` header either way.
+    if !headers.contains_key("host")
+        && let Some(authority) = uri.authority()
+    {
+        headers.insert("host".into(), authority.as_str().to_string());
     }
     let origin = headers.get("origin").cloned();
 
-    // 1. CORS preflight, before any rejection could pre-empt it.
-    if method == "OPTIONS" && app.manifest.cors.enabled {
+    // 1. CORS preflight, before any rejection could pre-empt it. Only a
+    //    browser's OPTIONS (one carrying an Origin) is treated as a preflight;
+    //    an OPTIONS from anything else is an ordinary request, answered by the
+    //    app's own OPTIONS route or the router's `Allow` reply. 2.5.3 refused
+    //    every OPTIONS without an Origin with 403 "origin not allowed" once
+    //    CORS was on, which also made a declared OPTIONS route unreachable.
+    let preflight = method == "OPTIONS" && origin.is_some();
+    if preflight && app.manifest.cors.enabled {
         if let Some(cors_headers) = app.cors.preflight(origin.as_deref()) {
             return (
                 WebCortexResponse { status: 204, headers: cors_headers, body: Bytes::new() },
@@ -410,8 +600,7 @@ async fn route_request(
         }
     };
 
-    let prefix = app.manifest.server.control_prefix.clone();
-    let mut res = if let Some(rest) = path.strip_prefix(&prefix) {
+    let mut res = if let Some(rest) = control_path(&path, &app.manifest.server.control_prefix) {
         control_plane(app, &method, rest, &body, &principal, request_id).await
     } else {
         let timeout = std::time::Duration::from_secs(secs);
@@ -456,16 +645,161 @@ fn is_plain_request_id(id: &str) -> bool {
 
 fn finish_cors(app: &Arc<App>, res: &mut WebCortexResponse, origin: Option<&str>) {
     if app.manifest.cors.enabled {
-        for h in app.cors.headers_for(origin) {
-            res.headers.push(h);
+        for (k, v) in app.cors.headers_for(origin) {
+            if k == "vary" {
+                merge_vary(&mut res.headers, &v);
+            } else {
+                push_absent(&mut res.headers, k, v);
+            }
+        }
+        // The CORS headers depend on Origin, so every response says so — also
+        // the ones that carry none. Otherwise a shared cache can store the
+        // answer to a request without Origin and replay it, header-less, to
+        // the trusted origin's browser.
+        merge_vary(&mut res.headers, "Origin");
+    }
+}
+
+/// The request's headers, keyed by lower-case name.
+///
+/// A repeated header is joined the way RFC 9110 §5.3 allows — `; ` for
+/// `cookie` (HTTP/2 sends each cookie as its own field), `, ` otherwise —
+/// where 2.5.3 kept only the last one. A value that is not visible ASCII is
+/// kept as UTF-8, lossily if it must be, rather than dropped: dropping a
+/// non-ASCII `Authorization` or API key header made the caller anonymous
+/// instead of refusing the credential it sent.
+fn collect_headers(map: &hyper::HeaderMap) -> std::collections::BTreeMap<String, String> {
+    let mut headers: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (k, v) in map {
+        let name = k.as_str().to_ascii_lowercase();
+        let value = String::from_utf8_lossy(v.as_bytes()).into_owned();
+        match headers.get_mut(&name) {
+            Some(existing) => {
+                existing.push_str(if name == "cookie" { "; " } else { ", " });
+                existing.push_str(&value);
+            }
+            None => {
+                headers.insert(name, value);
+            }
         }
     }
+    headers
+}
+
+/// The part of `path` under the control prefix, when it is under it. Matches
+/// at a segment boundary only (`/_webcortexfoo` is an application path), and
+/// ignores one trailing slash (`/_webcortex/health/` is the health check).
+fn control_path<'p>(path: &'p str, prefix: &str) -> Option<&'p str> {
+    let rest = path.strip_prefix(prefix)?;
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return None;
+    }
+    Some(match rest.strip_suffix('/') {
+        Some(trimmed) if !trimmed.is_empty() => trimmed,
+        _ => rest,
+    })
+}
+
+/// Add a response header unless the response already carries one by that name.
+fn push_absent(headers: &mut Vec<(String, String)>, name: String, value: String) {
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(&name)) {
+        headers.push((name, value));
+    }
+}
+
+/// Add a token to `Vary`, once, alongside whatever the handler varied on.
+fn merge_vary(headers: &mut Vec<(String, String)>, token: &str) {
+    let present = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("vary"))
+        .flat_map(|(_, v)| v.split(','))
+        .any(|t| t.trim() == "*" || t.trim().eq_ignore_ascii_case(token));
+    if !present {
+        headers.push(("vary".into(), token.to_string()));
+    }
+}
+
+/// One `Content-Type`, the last one set. A Python handler's
+/// `Response(headers={"Content-Type": ...})` used to be sent alongside the
+/// default `application/json`, and a client is free to honour either.
+fn dedupe_content_type(headers: &mut Vec<(String, String)>) {
+    let count = headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-type")).count();
+    if count <= 1 {
+        return;
+    }
+    let mut seen = 0;
+    headers.retain(|(k, _)| {
+        if !k.eq_ignore_ascii_case("content-type") {
+            return true;
+        }
+        seen += 1;
+        seen == count
+    });
+}
+
+/// Remove the headers that frame the message on the wire, which the server
+/// owns. hyper trusts a `Content-Length` it is handed (it only asserts in
+/// debug builds), so a Python handler that set one shorter than its body made
+/// the rest of the body read as the *next* response on a keep-alive
+/// connection — response splitting from one wrong header — and one longer
+/// left the client waiting for bytes that never came. `Connection: close` is
+/// kept (the server sends it on a 408); on a 101 the upgrade headers are the
+/// point of the response and are left alone.
+fn strip_framing_headers(res: &mut WebCortexResponse) {
+    let upgrade = res.status == 101;
+    res.headers.retain(|(k, v)| {
+        let k = k.to_ascii_lowercase();
+        match k.as_str() {
+            "content-length" | "transfer-encoding" | "keep-alive" | "proxy-connection" | "te"
+            | "trailer" => false,
+            "connection" => upgrade || v.trim().eq_ignore_ascii_case("close"),
+            _ => true,
+        }
+    });
+}
+
+/// Whether hyper can send this response: a final status, and header names and
+/// values that are legal on the wire (no CR, LF or NUL to split a header with).
+fn sendable(res: &WebCortexResponse) -> Result<(), String> {
+    // 101 is the one interim status a response may carry: a WebSocket upgrade.
+    if res.status != 101 && !(200..=599).contains(&res.status) {
+        return Err(format!("{} is not a final HTTP status", res.status));
+    }
+    for (k, v) in &res.headers {
+        if hyper::header::HeaderName::from_bytes(k.as_bytes()).is_err() {
+            return Err(format!("{k:?} is not a valid header name"));
+        }
+        if hyper::header::HeaderValue::from_str(v).is_err() {
+            return Err(format!("the value of header {k:?} contains a control character"));
+        }
+    }
+    Ok(())
 }
 
 async fn read_body(req: Request<Incoming>) -> Result<Bytes, WebCortexResponse> {
     let too_large = || WebCortexResponse::coded(413, "WC204", format!("request body exceeds {MAX_BODY_BYTES} bytes"));
+    // A declared length over the limit is never buffered. 2.5.3 held up to
+    // 32 MB per connection of a request that was always going to be refused.
+    // A client waiting for `100 Continue` is answered at once. One already
+    // sending is read (and discarded) as far as the limit and drained a
+    // little past it, exactly as an undeclared oversized body is, so it gets
+    // to read the 413 instead of a reset.
+    let declared = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let expects_continue = req
+        .headers()
+        .get(hyper::header::EXPECT)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
+    let refused = declared.is_some_and(|n| n > MAX_BODY_BYTES as u64);
+    if refused && expects_continue {
+        return Err(too_large());
+    }
     let mut body = req.into_body();
     let mut buf = bytes::BytesMut::new();
+    let mut seen = 0usize;
     while let Some(frame) = body.frame().await {
         // A body that fails to decode (a malformed chunk size, a connection
         // cut mid-body) is a bad request, not an oversized one.
@@ -473,22 +807,35 @@ async fn read_body(req: Request<Incoming>) -> Result<Bytes, WebCortexResponse> {
             return Err(WebCortexResponse::coded(400, "WC205", "malformed or incomplete request body"));
         };
         let Ok(data) = frame.into_data() else { continue };
-        if buf.len() + data.len() > MAX_BODY_BYTES {
-            let _ = tokio::time::timeout(DRAIN_TIME, async {
-                let mut drained = 0usize;
-                while drained <= DRAIN_BYTES {
-                    match body.frame().await {
-                        Some(Ok(f)) => drained += f.data_ref().map_or(0, |d| d.len()),
-                        _ => break,
-                    }
-                }
-            })
-            .await;
+        seen += data.len();
+        if seen > MAX_BODY_BYTES {
+            drain(&mut body).await;
             return Err(too_large());
         }
-        buf.extend_from_slice(&data);
+        if !refused {
+            buf.extend_from_slice(&data);
+        }
+    }
+    if refused {
+        // The client sent less than it declared; hyper reports that as an
+        // error frame above, but answer the declaration either way.
+        return Err(too_large());
     }
     Ok(buf.freeze())
+}
+
+/// Read and discard a bounded overshoot of a refused body (see [`DRAIN_BYTES`]).
+async fn drain(body: &mut Incoming) {
+    let _ = tokio::time::timeout(DRAIN_TIME, async {
+        let mut drained = 0usize;
+        while drained <= DRAIN_BYTES {
+            match body.frame().await {
+                Some(Ok(f)) => drained += f.data_ref().map_or(0, |d| d.len()),
+                _ => break,
+            }
+        }
+    })
+    .await;
 }
 
 /// Introspection and operations endpoints, mounted under `control_prefix`.
@@ -516,6 +863,8 @@ async fn control_plane(
         );
     }
 
+    // HEAD is GET without the body; hyper drops the body.
+    let method = if method == "HEAD" { "GET" } else { method };
     match (method, rest) {
         ("GET", "/health") => WebCortexResponse::json(
             200,
@@ -769,7 +1118,101 @@ fn to_hyper(res: WebCortexResponse) -> Response<Full<Bytes>> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_plain_request_id;
+    use super::*;
+
+    #[test]
+    fn repeated_request_headers_are_joined_and_non_ascii_is_kept() {
+        let mut map = hyper::HeaderMap::new();
+        map.append("cookie", "a=1".parse().unwrap());
+        map.append("cookie", "b=2".parse().unwrap());
+        map.append("accept", "text/html".parse().unwrap());
+        map.append("accept", "application/json".parse().unwrap());
+        map.append("x-name", hyper::header::HeaderValue::from_bytes("café".as_bytes()).unwrap());
+        map.append("x-api-key", hyper::header::HeaderValue::from_bytes(b"\xffkey").unwrap());
+        let h = collect_headers(&map);
+        assert_eq!(h["cookie"], "a=1; b=2");
+        assert_eq!(h["accept"], "text/html, application/json");
+        assert_eq!(h["x-name"], "café");
+        // Present, so it is checked (and refused) rather than ignored.
+        assert_eq!(h["x-api-key"], "\u{fffd}key");
+    }
+
+    #[test]
+    fn the_control_prefix_matches_at_a_segment_boundary() {
+        let p = "/_webcortex";
+        assert_eq!(control_path("/_webcortex/health", p), Some("/health"));
+        assert_eq!(control_path("/_webcortex/health/", p), Some("/health"));
+        assert_eq!(control_path("/_webcortex", p), Some(""));
+        assert_eq!(control_path("/_webcortex/", p), Some("/"));
+        assert_eq!(control_path("/_webcortexfoo", p), None);
+        assert_eq!(control_path("/other", p), None);
+    }
+
+    #[test]
+    fn framework_headers_do_not_duplicate_the_handlers() {
+        let mut h = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("X-Frame-Options".to_string(), "SAMEORIGIN".to_string()),
+            ("content-type".to_string(), "text/csv".to_string()),
+            ("Vary".to_string(), "Accept, origin".to_string()),
+        ];
+        push_absent(&mut h, "x-frame-options".into(), "DENY".into());
+        push_absent(&mut h, "referrer-policy".into(), "no-referrer".into());
+        merge_vary(&mut h, "Origin");
+        dedupe_content_type(&mut h);
+        assert_eq!(
+            h,
+            vec![
+                ("X-Frame-Options".to_string(), "SAMEORIGIN".to_string()),
+                ("content-type".to_string(), "text/csv".to_string()),
+                ("Vary".to_string(), "Accept, origin".to_string()),
+                ("referrer-policy".to_string(), "no-referrer".to_string()),
+            ]
+        );
+        let mut plain = Vec::new();
+        merge_vary(&mut plain, "Origin");
+        merge_vary(&mut plain, "Origin");
+        assert_eq!(plain, vec![("vary".to_string(), "Origin".to_string())]);
+    }
+
+    #[test]
+    fn the_server_owns_message_framing() {
+        let mut res = WebCortexResponse::text(200, "body");
+        for (k, v) in [("Content-Length", "2"), ("transfer-encoding", "chunked"), ("Connection", "keep-alive, x"),
+                       ("keep-alive", "timeout=5"), ("TE", "trailers"), ("trailer", "x"), ("x-kept", "1")] {
+            res.headers.push((k.into(), v.into()));
+        }
+        strip_framing_headers(&mut res);
+        let names: Vec<&str> = res.headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["content-type", "x-kept"]);
+        let mut closing = WebCortexResponse::text(408, "");
+        closing.headers.push(("connection".into(), "close".into()));
+        strip_framing_headers(&mut closing);
+        assert!(closing.headers.iter().any(|(k, v)| k == "connection" && v == "close"));
+        let mut upgrade = WebCortexResponse::text(101, "");
+        upgrade.headers.push(("connection".into(), "Upgrade".into()));
+        strip_framing_headers(&mut upgrade);
+        assert!(upgrade.headers.iter().any(|(k, _)| k == "connection"));
+    }
+
+    #[test]
+    fn an_unsendable_response_is_caught_before_hyper_sees_it() {
+        let ok = WebCortexResponse::text(200, "x");
+        assert!(sendable(&ok).is_ok());
+        for status in [42, 100, 199, 600, 999] {
+            assert!(sendable(&WebCortexResponse::text(status, "x")).is_err(), "{status}");
+        }
+        assert!(sendable(&WebCortexResponse::text(101, "")).is_ok(), "a WebSocket upgrade");
+        let mut split = WebCortexResponse::text(200, "x");
+        split.headers.push(("x-a".into(), "ok\r\nx-injected: yes".into()));
+        assert!(sendable(&split).is_err());
+        let mut bad_name = WebCortexResponse::text(200, "x");
+        bad_name.headers.push(("bad name".into(), "v".into()));
+        assert!(sendable(&bad_name).is_err());
+        let mut utf8 = WebCortexResponse::text(200, "x");
+        utf8.headers.push(("x-u".into(), "café".into()));
+        assert!(sendable(&utf8).is_ok(), "obs-text is legal in a value");
+    }
 
     #[test]
     fn only_a_short_plain_request_id_is_echoed() {

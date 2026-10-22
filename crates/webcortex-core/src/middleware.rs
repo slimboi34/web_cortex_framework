@@ -6,7 +6,7 @@
 //! thing that takes a line of configuration.
 
 use crate::manifest::{CorsConfig, RateLimitConfig, SecurityHeaders};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -19,12 +19,19 @@ use std::time::{Duration, Instant};
 /// Sharded because a single mutex over one map is a contention point at exactly
 /// the moment you need the limiter most — when you are being flooded.
 pub struct RateLimiter {
-    shards: Vec<Mutex<BTreeMap<String, Bucket>>>,
+    shards: Vec<Mutex<Shard>>,
     capacity: f64,
     refill_per_sec: f64,
     /// Buckets idle longer than this are evicted, so an attacker rotating keys
     /// cannot grow the map without bound.
     idle_eviction: Duration,
+}
+
+#[derive(Default)]
+struct Shard {
+    buckets: HashMap<String, Bucket>,
+    /// When idle buckets were last evicted from this shard.
+    swept: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,12 +48,14 @@ pub struct RateDecision {
 }
 
 const SHARDS: usize = 16;
+/// The longest a shard goes between evictions of idle buckets.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
 impl RateLimiter {
     pub fn new(cfg: &RateLimitConfig) -> Self {
         let mut shards = Vec::with_capacity(SHARDS);
         for _ in 0..SHARDS {
-            shards.push(Mutex::new(BTreeMap::new()));
+            shards.push(Mutex::new(Shard::default()));
         }
         Self {
             shards,
@@ -56,7 +65,7 @@ impl RateLimiter {
         }
     }
 
-    fn shard_for(&self, key: &str) -> &Mutex<BTreeMap<String, Bucket>> {
+    fn shard_for(&self, key: &str) -> &Mutex<Shard> {
         // FNV-1a; cheap and good enough to spread keys across shards.
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for b in key.as_bytes() {
@@ -69,20 +78,35 @@ impl RateLimiter {
     pub fn check(&self, key: &str) -> RateDecision {
         let now = Instant::now();
         let shard = self.shard_for(key);
-        let mut map = match shard.lock() {
+        let mut shard = match shard.lock() {
             Ok(m) => m,
             // A poisoned lock must not become an outage; fail open on the
             // limiter rather than 500 every request behind it.
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        map.retain(|_, b| now.duration_since(b.last) < self.idle_eviction);
+        // Evict idle buckets at most once per sweep interval, not on every
+        // check: 2.5.3 walked the whole shard on every request, so a flood
+        // from many addresses (an IPv6 /64 is 2^64 of them) made each check
+        // O(keys) — quadratic work under exactly the load the limiter exists for.
+        let interval = self.idle_eviction.min(SWEEP_EVERY);
+        if shard.swept.is_none_or(|at| now.duration_since(at) >= interval) {
+            let idle = self.idle_eviction;
+            shard.buckets.retain(|_, b| now.duration_since(b.last) < idle);
+            shard.swept = Some(now);
+        }
 
-        let bucket = map.entry(key.to_string()).or_insert(Bucket {
+        let idle = self.idle_eviction;
+        let bucket = shard.buckets.entry(key.to_string()).or_insert(Bucket {
             tokens: self.capacity,
             last: now,
         });
 
+        // A bucket idle past the eviction age is as good as new, whether or
+        // not a sweep has removed it yet.
+        if now.duration_since(bucket.last) >= idle {
+            bucket.tokens = self.capacity;
+        }
         let elapsed = now.duration_since(bucket.last).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         bucket.last = now;
@@ -282,6 +306,46 @@ mod tests {
         assert!(rl.check("a").allowed);
         assert!(!rl.check("a").allowed);
         assert!(rl.check("b").allowed, "one key must not exhaust another");
+    }
+
+    #[test]
+    fn idle_buckets_are_evicted() {
+        let rl = RateLimiter::new(&RateLimitConfig {
+            enabled: true,
+            per_second: 1.0,
+            burst: 1,
+            idle_eviction_secs: 0,
+        });
+        for i in 0..2000 {
+            assert!(rl.check(&format!("ip:{i}")).allowed);
+        }
+        // Eviction age 0: every bucket is idle at once; the next sweep empties
+        // the shard rather than the map growing with every key ever seen.
+        assert!(rl.check("ip:fresh").allowed);
+        let held: usize = rl.shards.iter().map(|s| s.lock().unwrap().buckets.len()).sum();
+        assert!(held < 2000, "idle buckets were never evicted ({held} held)");
+    }
+
+    #[test]
+    fn the_limit_holds_exactly_under_concurrency() {
+        let rl = std::sync::Arc::new(limiter(0.001, 50));
+        let allowed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (rl, allowed) = (rl.clone(), allowed.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        if rl.check("shared").allowed {
+                            allowed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(allowed.load(std::sync::atomic::Ordering::Relaxed), 50);
     }
 
     #[test]

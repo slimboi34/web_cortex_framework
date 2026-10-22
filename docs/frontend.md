@@ -94,7 +94,9 @@ Data is resolved **before** rendering begins, from exactly one declared source.
 
 ### Escaping
 
-`.html`, `.htm`, and `.xml` autoescape. `.txt` and `.json` do not.
+`.html`, `.htm`, `.xhtml`, `.xml` and `.svg` autoescape, in any letter case and
+behind a `.j2`, `.jinja` or `.jinja2` suffix (`page.html.j2` escapes). `.txt`
+and `.json` do not.
 
 ```jinja
 {{ user_input }}          {# <script> becomes &lt;script&gt; #}
