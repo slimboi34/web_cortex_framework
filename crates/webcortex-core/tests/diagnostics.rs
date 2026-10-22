@@ -125,7 +125,9 @@ async fn mcp_offers_status_and_explain_and_codes_its_tool_errors() {
     assert_eq!(res["result"]["structuredContent"]["error"]["code"], "WC502");
 
     let res = mcp::handle(&app, &call("ghost", json!({})), &who).await.json_value();
-    assert_eq!(res["result"]["structuredContent"]["error"]["code"], "WC314");
+    // An unknown tool is a protocol error (MCP 2025-06-18), not a tool result.
+    assert_eq!(res["error"]["code"], -32602);
+    assert_eq!(res["error"]["data"]["code"], "WC314");
 
     let res = mcp::handle(&app, &call(mcp::STATUS_TOOL, json!({"section": "errors"})), &who).await.json_value();
     let recent = res["result"]["structuredContent"]["errors"]["recent"].as_array().unwrap().clone();

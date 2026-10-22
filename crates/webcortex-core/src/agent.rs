@@ -346,6 +346,12 @@ struct RunState {
     /// Where the conversation is saved: the session id scoped by the entry
     /// agent and the caller, so another principal's id cannot reach it.
     session_key: Option<String>,
+    /// The revision of the session this run loaded (0 for none), and where in
+    /// `conversation` this turn's own messages start. A run resumed after an
+    /// approval checks the revision: if other turns were saved meanwhile, its
+    /// turn is moved onto the newer history instead of overwriting it.
+    session_rev: u64,
+    turn_start: usize,
     /// Where step events go, and how many steps have been sent.
     events: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     emitted: usize,
@@ -410,14 +416,26 @@ impl AgentRuntime {
             .session_id
             .as_ref()
             .map(|sid| SessionStore::key(&def.name, &caller.id, sid));
-        let mut conversation = match (&session_key, opts.reset_session) {
-            (Some(key), false) => app.sessions().load(key).unwrap_or_default(),
+        // A top-level turn holds its session until it finishes, so a second
+        // turn on it waits rather than racing it. A nested run (an agent
+        // reached as a tool) is already inside its caller's turn and does not
+        // wait, which would deadlock an agent that calls itself.
+        let _turn = match (&session_key, opts.depth) {
+            (Some(key), 0) => Some(app.sessions().lock_turn(key).await),
+            _ => None,
+        };
+        let (mut conversation, session_rev) = match (&session_key, opts.reset_session) {
+            (Some(key), false) => {
+                let (c, rev) = app.sessions().load_with_revision(key);
+                (c.unwrap_or_default(), rev)
+            }
             (Some(key), true) => {
                 app.sessions().forget(key);
-                Conversation::default()
+                (Conversation::default(), 0)
             }
-            _ => Conversation::default(),
+            _ => (Conversation::default(), 0),
         };
+        let turn_start = conversation.messages.len();
         let content = if opts.images.is_empty() {
             json!(input)
         } else {
@@ -486,6 +504,8 @@ impl AgentRuntime {
             compaction_retry_at: 0,
             session_id: opts.session_id,
             session_key,
+            session_rev,
+            turn_start,
             events: opts.events,
             emitted: 0,
             cost_usd: Some(0.0),
@@ -513,6 +533,11 @@ impl AgentRuntime {
     ) -> RunResult {
         let SuspendedRun { state: mut st, calls, gated, mut results, approval_id, .. } = suspended;
         let call = &calls[gated];
+        let _turn = match (&st.session_key, st.depth) {
+            (Some(key), 0) => Some(app.sessions().lock_turn(key).await),
+            _ => None,
+        };
+        rebase_onto_session(app, &mut st);
         app.recorder().run_started(&st.run_id, &st.def.name, &st.caller.id, st.depth);
         // The approved call runs before `drive` does; dropped there, the run
         // is cancelled just the same.
@@ -974,6 +999,9 @@ impl AgentRuntime {
         let summary = response.text;
 
         let before = st.conversation.messages.len();
+        // This turn's messages move with the cut; a turn whose start was
+        // summarised now starts at the summary.
+        st.turn_start = if st.turn_start >= cut { st.turn_start - cut + 1 } else { 0 };
         let tail = st.conversation.messages.split_off(cut);
         st.conversation.messages = vec![Message {
             role: "user".into(),
@@ -1192,6 +1220,24 @@ impl AgentRuntime {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Before a suspended run continues, move its turn onto the session as it is
+/// now. Turns saved while it waited for a human (or a reset) would otherwise
+/// be overwritten when it finished, since it carried the history from before
+/// it suspended. Called with the session's turn lock held.
+fn rebase_onto_session(app: &App, st: &mut RunState) {
+    let Some(key) = &st.session_key else { return };
+    let (current, rev) = app.sessions().load_with_revision(key);
+    if rev == st.session_rev {
+        return;
+    }
+    let turn = st.conversation.messages.split_off(st.turn_start.min(st.conversation.messages.len()));
+    let mut base = current.unwrap_or_default();
+    st.turn_start = base.messages.len();
+    base.messages.extend(turn);
+    st.conversation = base;
+    st.session_rev = rev;
+}
 
 /// The catalogued code a run's outcome carries: none for a run that completed
 /// or is waiting on a human; the failing step's code for a failure.
@@ -1755,6 +1801,48 @@ mod tests {
         let other = Principal { id: "u2".into(), ..caller(&[]) };
         let _ = app.invoke_agent("a", "hello", &other, opts).await.unwrap();
         assert_eq!(provider.snapshots()[2].message_count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_turn_waits_for_the_turn_ahead_of_it_on_the_same_session() {
+        let (app, _, provider) = app_with(ScriptedProvider::text("ok")).await;
+        let held = app.sessions().lock_turn(&SessionStore::key("a", "u1", "s")).await;
+        let opts = RunOptions { session_id: Some("s".into()), ..Default::default() };
+        let turn = tokio::spawn({
+            let app = app.clone();
+            async move { app.invoke_agent("a", "hi", &caller(&[]), opts).await.unwrap() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(provider.calls(), 0, "the second turn started while the first held the session");
+        drop(held);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await.unwrap().unwrap();
+        assert_eq!(out.status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_approval_keeps_the_turns_saved_while_it_waited() {
+        // 2.6.0: the resumed run saved the history it suspended with, and the
+        // turn taken while it waited was lost.
+        let (app, _, provider) = app_with(ScriptedProvider::sequence(vec![
+            ("tool", "danger", json!({})),
+            ("text", "two", json!(null)),
+            ("text", "approved", json!(null)),
+        ]))
+        .await;
+        let opts = RunOptions { session_id: Some("s".into()), ..Default::default() };
+        let first = app.invoke_agent("a", "first", &caller(&["*"]), opts.clone()).await.unwrap();
+        let id = first.pending_approval.expect("suspended").approval_id;
+        let second = app.invoke_agent("a", "second", &caller(&["*"]), opts).await.unwrap();
+        assert_eq!(second.output, "two");
+
+        let resumed = app.resolve_approval(&id, true, "", &caller(&["*"])).await.unwrap();
+        assert_eq!(resumed.output, "approved");
+        assert_eq!(provider.snapshots()[2].message_count, 5, "the resumed step sees the newer turn");
+        let kept = app.sessions().load(&SessionStore::key("a", "u1", "s")).unwrap().messages;
+        let texts: Vec<String> = kept.iter().map(|m| render_message(&m.content)).collect();
+        assert_eq!(kept.len(), 6, "{texts:?}");
+        assert_eq!((texts[0].as_str(), texts[1].as_str()), ("second", "two"));
+        assert_eq!((texts[2].as_str(), texts[5].as_str()), ("first", "approved"));
     }
 
     #[tokio::test]

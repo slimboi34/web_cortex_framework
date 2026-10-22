@@ -3,6 +3,29 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [Unreleased]
+
+### Fixed — agents and MCP
+
+- **Concurrent turns on one session are no longer lost.** Each turn loaded the same
+  history and the last one to finish saved over the others. Turns on a session now run
+  one after another, in arrival order. A nested run (an agent reached as a tool) does not
+  wait, so an agent that calls itself cannot deadlock.
+- **A run resumed after an approval no longer overwrites newer turns.** It saved the
+  history it had when it suspended, so any turn taken on the session while it waited for
+  a human was lost. On resume, its turn is now moved onto the session as it is now, and
+  the model sees the newer turns.
+- **Closing an agent WebSocket mid-turn cancels the run.** The socket was read only
+  between turns, so the run kept going, and kept paying for model calls, until the
+  model's step came back. Turns sent ahead are queued (up to 8) and answered in order;
+  beyond that they get a `WC306` error.
+
+### Changed
+
+- **An unknown tool in MCP `tools/call` is now a JSON-RPC error** `-32602` with
+  `data.code` `WC314`, as MCP 2025-06-18 specifies. It used to be a tool result with
+  `isError: true`. A tool that exists but the caller cannot use is still a tool error.
+
 ## [2.6.0] — 2026-10-22
 
 A hardening pass over the whole framework: the HTTP layer, the agent runtime and MCP,

@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from webcortex import WebCortex
+from webcortex.client import AgentSocket
 
 ADMIN_KEY = "stress-admin-key-0123456789abcdef"
 USER_KEY = "stress-user-key-0123456789abcdef0"
@@ -212,6 +213,9 @@ app.static("GET", "/ping", {"pong": True}, tool=True, tool_name="ping")
 
 app.agent("oa", model="stub/m", tools=["record", "ping"], max_steps=4)
 app.agent("an", model="astub/m", tools=["record", "ping"], max_steps=4)
+
+app.static("GET", "/nuke", {"nuked": True}, tool=True, tool_name="nuke", approval="required")
+app.agent("oag", model="stub/m", tools=["nuke"], max_steps=4)
 '''
 
 
@@ -631,3 +635,96 @@ def test_mcp_survives_a_full_batch_of_concurrent_callers(fake):
         assert s == 200 and [o["id"] for o in out] == list(range(32))
         assert all(isinstance(o["result"]["structuredContent"], dict) for o in out)
         assert out[1]["result"]["structuredContent"]["v"] == 2**64 - 1
+
+
+# --------------------------------------------------------------------------- 2.6.1: sessions, sockets, MCP
+
+
+def _user_inputs(messages):
+    return [m["content"] for m in messages if m["role"] == "user" and isinstance(m["content"], str)]
+
+
+def _slow(text, secs):
+    def answer(_body):
+        time.sleep(secs)
+        return oa_text(text)
+    return answer
+
+
+def test_concurrent_turns_on_one_session_all_land(wire):
+    # 2.6.0: each turn loaded the same history and the last to finish saved
+    # over the others, so three of these four turns vanished from the session.
+    base, stub = wire
+    stub.set(*[(200, _slow(f"a{i}", 0.3)) for i in range(4)], (200, oa_text("last")))
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        results = list(pool.map(lambda i: _ask(base, "oa", f"turn {i}", session_id="race"), range(4)))
+    assert all(s == 200 and o["status"] == "completed" for s, o in results), results
+    _, out = _ask(base, "oa", "what did I say?", session_id="race")
+    assert out["status"] == "completed"
+    said = _user_inputs(stub.requests()[-1]["body"]["messages"])
+    assert sorted(said[:-1]) == [f"turn {i}" for i in range(4)], said
+    assert_replayable_openai(stub.requests()[-1]["body"]["messages"])
+
+
+def test_a_resumed_approval_does_not_overwrite_turns_taken_while_it_waited(wire):
+    # 2.6.0: the resumed run saved the history it had when it suspended.
+    base, stub = wire
+    stub.set((200, oa_calls([{"id": "n1", "name": "nuke"}])), (200, oa_text("two")),
+             (200, oa_text("approved")), (200, oa_text("three")))
+    s, first = _ask(base, "oag", "first", session_id="gate")
+    assert s == 202 and first["status"] == "awaiting_approval", first
+    _, second = _ask(base, "oag", "second", session_id="gate")
+    assert second["output"] == "two"
+    s, resumed = _request(base, f"/_webcortex/approvals/{first['pending_approval']['approval_id']}",
+                          "POST", {"approve": True})
+    assert s == 200 and resumed["output"] == "approved", resumed
+    _ask(base, "oag", "third", session_id="gate")
+    messages = stub.requests()[-1]["body"]["messages"]
+    assert _user_inputs(messages) == ["second", "first", "third"], messages
+    assert_replayable_openai(messages)
+
+
+def _in_flight(base):
+    return _request(base, "/_webcortex/status")[1]["agents"]["in_flight"]
+
+
+def test_closing_an_agent_socket_mid_turn_cancels_the_run(wire):
+    # 2.6.0 did not read the socket during a turn: the run kept going (and
+    # paying for model calls) until the model's step came back.
+    base, stub = wire
+    stub.set((200, _slow("too late", 6)))
+    sock = AgentSocket(base, "/agents/oa", key=ADMIN_KEY, timeout=30)
+    sock.ws.send_json({"input": "take your time"})
+    deadline = time.time() + 5
+    while not _in_flight(base) and time.time() < deadline:
+        time.sleep(0.05)
+    assert _in_flight(base), "the turn never started"
+    sock.close()
+    closed = time.time()
+    while _in_flight(base) and time.time() - closed < 3:
+        time.sleep(0.05)
+    assert _in_flight(base) == [], "the run outlived its client"
+    assert time.time() - closed < 3
+
+
+def test_turns_sent_ahead_on_an_agent_socket_are_answered_in_order(wire):
+    base, stub = wire
+    stub.set((200, _slow("one", 0.3)), (200, oa_text("two")), (200, oa_text("three")))
+    with AgentSocket(base, "/agents/oa", key=ADMIN_KEY, timeout=30) as sock:
+        for text in ("a", "b", "c"):
+            sock.ws.send_json({"input": text})
+        outputs = []
+        while len(outputs) < 3:
+            event = sock.ws.recv_json()
+            if event["type"] == "result":
+                outputs.append(event["result"]["output"])
+    assert outputs == ["one", "two", "three"]
+
+
+def test_mcp_unknown_tool_is_a_protocol_error(fake):
+    # MCP 2025-06-18 lists an unknown tool as a JSON-RPC error; 2.6.0 answered
+    # with a tool result flagged isError.
+    _, out = _mcp(fake, {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                         "params": {"name": "no_such_tool", "arguments": {}}})
+    assert out["id"] == 7 and "result" not in out, out
+    assert out["error"]["code"] == -32602 and out["error"]["data"]["code"] == "WC314", out

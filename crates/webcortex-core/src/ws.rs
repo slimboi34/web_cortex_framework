@@ -370,13 +370,25 @@ fn frame_event(f: &crate::devices::Frame) -> Value {
     v
 }
 
+/// Turns a client may send ahead while one is running. They run in order once
+/// it finishes; past this many the extra ones are refused, not buffered.
+const MAX_QUEUED_TURNS: usize = 8;
+
 async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: Socket) {
     let t = TIMING;
     let (mut out, mut inbound) = ws.split();
     if !deliver(&mut out, text(json!({"type": "ready", "agent": agent})), t).await {
         return;
     }
-    while let Some(msg) = inbound.next().await {
+    let mut queued: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
+    loop {
+        let msg = match queued.pop_front() {
+            Some(m) => Ok(m),
+            None => match inbound.next().await {
+                Some(m) => m,
+                None => break,
+            },
+        };
         let raw = match msg {
             Ok(Message::Text(t)) => t,
             Ok(Message::Close(_)) => break,
@@ -417,6 +429,9 @@ async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: S
         let limit = Duration::from_secs(app.manifest.server.agent_timeout_secs);
         let run = tokio::time::timeout(limit, app.invoke_agent(&agent, &turn.input, &principal, opts));
         tokio::pin!(run);
+        // The socket is read during the turn too. 2.6.0 read it only between
+        // turns, so a client that closed mid-turn kept its run, and the model
+        // calls it paid for, going until the model's step finished.
         let outcome = loop {
             tokio::select! {
                 Some(ev) = rx.recv() => {
@@ -424,6 +439,29 @@ async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: S
                         return;
                     }
                 }
+                m = inbound.next() => match m {
+                    // Returning drops `run`, which cancels it.
+                    Some(Ok(Message::Close(_))) | None => {
+                        let _ = tokio::time::timeout(t.stalled_send, out.close()).await;
+                        return;
+                    }
+                    Some(Err(e)) => {
+                        if let Some(close) = close_for(&e) {
+                            let _ = deliver(&mut out, Message::Close(Some(close)), t).await;
+                        }
+                        return;
+                    }
+                    Some(Ok(m @ (Message::Text(_) | Message::Binary(_)))) => {
+                        if queued.len() < MAX_QUEUED_TURNS {
+                            queued.push_back(m);
+                        } else if !deliver(&mut out, error("WC306", format!(
+                            "{MAX_QUEUED_TURNS} turns are already waiting; send the next once a result arrives"
+                        )), t).await {
+                            return;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                },
                 done = &mut run => break done,
             }
         };

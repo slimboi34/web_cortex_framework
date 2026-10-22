@@ -177,6 +177,7 @@ async fn handle_one(app: &App, req: Value, caller: &Principal, request_id: &str)
         Err((code, message)) => {
             let wc = match code {
                 -32601 => "WC212",
+                -32602 if message.starts_with("unknown tool") => "WC314",
                 -32602 => "WC206",
                 _ => "WC205",
             };
@@ -402,6 +403,14 @@ async fn call_tool(app: &App, params: &Value, caller: &Principal, request_id: &s
         && let Some(result) = call_builtin(app, name, &args) {
             return Ok(result);
         }
+
+    // MCP (2025-06-18, "Error Handling") makes an unknown tool a protocol
+    // error, -32602, not a tool result. Builtins the caller may not observe are
+    // absent from `tools/list`, so they are unknown here too.
+    if app.route_for_tool(name).is_none() {
+        app.recorder().record_failure("mcp", &format!("tools/call {name}"), "WC314", request_id);
+        return Err((-32602, format!("unknown tool {name:?}")));
+    }
 
     // A gated tool is not callable straight off the MCP surface: approval gates
     // exist so a human sees the call first, and honouring them only inside the

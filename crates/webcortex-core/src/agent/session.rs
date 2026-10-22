@@ -12,7 +12,8 @@
 use super::{Conversation, Message};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Most messages one session keeps. The store is capped by count, but each
@@ -72,6 +73,13 @@ pub fn bound(conversation: &mut Conversation) -> usize {
 
 pub struct SessionStore {
     inner: Mutex<HashMap<String, Entry>>,
+    /// One lock per session with a turn in flight. Two turns on one session
+    /// each loaded the same history and the second to finish overwrote the
+    /// first; a turn now waits for the one ahead of it.
+    turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Source of [`Entry::revision`]: store-wide, so a session that is
+    /// forgotten and saved again never repeats an earlier revision.
+    revisions: AtomicU64,
     capacity: usize,
     ttl: Duration,
 }
@@ -79,12 +87,20 @@ pub struct SessionStore {
 struct Entry {
     conversation: Conversation,
     touched: Instant,
+    revision: u64,
+}
+
+/// Held for the length of one turn on a session; see [`SessionStore::lock_turn`].
+pub struct TurnGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl SessionStore {
     pub fn new(capacity: usize, ttl_secs: u64) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
+            revisions: AtomicU64::new(0),
             capacity: capacity.max(1),
             ttl: Duration::from_secs(ttl_secs.max(1)),
         }
@@ -95,19 +111,42 @@ impl SessionStore {
     }
 
     pub fn load(&self, key: &str) -> Option<Conversation> {
+        self.load_with_revision(key).0
+    }
+
+    /// The session and its revision, which changes on every save. A missing
+    /// or expired session is revision 0.
+    pub fn load_with_revision(&self, key: &str) -> (Option<Conversation>, u64) {
         let mut map = self.lock();
         let now = Instant::now();
         match map.get_mut(key) {
             Some(e) if now.duration_since(e.touched) <= self.ttl => {
                 e.touched = now;
-                Some(e.conversation.clone())
+                (Some(e.conversation.clone()), e.revision)
             }
             Some(_) => {
                 map.remove(key);
-                None
+                (None, 0)
             }
-            None => None,
+            None => (None, 0),
         }
+    }
+
+    /// Wait for any other turn on `key` to finish, then hold the session until
+    /// the guard drops. Turns on one session run one after another, in the
+    /// order they arrived (tokio's mutex is fair).
+    pub async fn lock_turn(&self, key: &str) -> TurnGuard {
+        let lock = {
+            let mut turns = match self.turns.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            // Drop the locks no turn holds or waits on, so the map is bounded
+            // by the turns in flight rather than by every session ever seen.
+            turns.retain(|k, l| k == key || Arc::strong_count(l) > 1);
+            turns.entry(key.to_string()).or_default().clone()
+        };
+        TurnGuard { _guard: lock.lock_owned().await }
     }
 
     pub fn save(&self, key: String, mut conversation: Conversation) {
@@ -128,7 +167,8 @@ impl SessionStore {
                 map.remove(&oldest);
             }
         }
-        map.insert(key, Entry { conversation, touched: now });
+        let revision = self.revisions.fetch_add(1, Ordering::Relaxed) + 1;
+        map.insert(key, Entry { conversation, touched: now, revision });
     }
 
     pub fn forget(&self, key: &str) -> bool {
@@ -214,6 +254,37 @@ mod tests {
         let mut small = Conversation::default();
         small.messages.extend(turn(0));
         assert_eq!(bound(&mut small), 0, "a small session is untouched");
+    }
+
+    #[test]
+    fn every_save_moves_the_revision() {
+        let s = SessionStore::new(10, 60);
+        assert_eq!(s.load_with_revision("k").1, 0);
+        s.save("k".into(), conv(1));
+        let first = s.load_with_revision("k").1;
+        s.save("k".into(), conv(2));
+        let second = s.load_with_revision("k").1;
+        assert!(first > 0 && second > first);
+        s.forget("k");
+        s.save("k".into(), conv(1));
+        assert!(s.load_with_revision("k").1 > second, "a re-created session never repeats a revision");
+    }
+
+    #[tokio::test]
+    async fn turns_on_one_session_run_one_at_a_time() {
+        let s = Arc::new(SessionStore::new(10, 60));
+        let first = s.lock_turn("k").await;
+        let waiting = tokio::spawn({
+            let s = s.clone();
+            async move { s.lock_turn("k").await; }
+        });
+        let _other = s.lock_turn("other").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "a second turn on the same session must wait");
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
+        let _ = s.lock_turn("k").await;
+        assert!(s.turns.lock().unwrap().len() <= 2, "idle locks are dropped");
     }
 
     #[test]
