@@ -3,6 +3,23 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [Unreleased]
+
+### Fixed
+
+- **An endless generator no longer runs the server out of memory.** A handler, behaviour or
+  tool that returned a generator (sync or async, or one nested in the result) had it collected
+  with no bound, so an endless one grew until the process was killed, and kept growing after
+  the caller timed out. Collection now stops at `WEBCORTEX_MAX_RESULT_ITEMS` (default 100,000)
+  or `WEBCORTEX_MAX_RESULT_BYTES` (default 64 MiB) with the new code **WC406**, and stops as
+  soon as the caller has gone (504, WC203). Either way the generator is closed, so its
+  `finally` blocks run.
+
+### Added
+
+- Error code `WC406` (Returned generator too large). A behaviour failure that carries a
+  code from the bridge now keeps it instead of becoming WC003.
+
 ## [2.6.0] — 2026-10-22
 
 A hardening pass over the whole framework: the HTTP layer, the agent runtime and MCP,

@@ -42,7 +42,8 @@ from typing import Annotated, Literal, NewType, Optional, TypedDict, Union
 import pytest
 
 from webcortex import HTTPError, Request, Response, WebCortex, starters
-from webcortex._bridge import Dispatcher, InvalidJSON, _encode, jsonable
+from webcortex import _bridge
+from webcortex._bridge import Dispatcher, InvalidJSON, ResultTooLarge, _encode, jsonable
 from webcortex.app import _bind_handler, _path_params, _request_param, resolve_port
 from webcortex.schema import coerce, json_schema_for, schema_from_signature, type_hints
 
@@ -564,6 +565,140 @@ def _dispatch(dispatcher, index) -> tuple:
     return c.wait()
 
 
+# ---- endless generators ------------------------------------------------------
+# 2.6.0 collected a returned generator with list(): an endless one grew until
+# the process ran out of memory, and kept growing after the caller timed out.
+
+
+class _Tracked:
+    """An endless generator that records whether it was closed."""
+
+    def __init__(self, item=0, delay: float = 0.0) -> None:
+        self.closed = False
+        self.item = item
+        self.delay = delay
+
+    def __call__(self, req=None):
+        try:
+            while True:
+                if self.delay:
+                    time.sleep(self.delay)
+                yield self.item
+        finally:
+            self.closed = True
+
+
+def _error(raw: bytes) -> dict:
+    return json.loads(raw)["error"]
+
+
+def test_an_endless_sync_generator_fails_with_wc406_and_is_closed(monkeypatch):
+    monkeypatch.setattr(_bridge, "MAX_RESULT_ITEMS", 1000)
+    gen = _Tracked()
+    d = Dispatcher([gen], workers=1)
+    try:
+        kind, status, raw, *_ = _dispatch(d, 0)
+        assert (kind, status, _error(raw)["code"]) == ("complete", 500, "WC406")
+        assert "1000 items" in _error(raw)["message"]
+        assert gen.closed
+    finally:
+        d.shutdown()
+
+
+def test_an_endless_async_generator_handler_fails_with_wc406_and_is_closed(monkeypatch):
+    monkeypatch.setattr(_bridge, "MAX_RESULT_ITEMS", 500)
+    state = {"closed": False}
+
+    async def stream():
+        try:
+            while True:
+                yield 1
+        finally:
+            state["closed"] = True
+
+    d = Dispatcher([_bind_handler(stream, None)], workers=1)
+    try:
+        kind, status, raw, *_ = _dispatch(d, 0)
+        assert (kind, status, _error(raw)["code"]) == ("complete", 500, "WC406")
+        assert state["closed"]
+    finally:
+        d.shutdown()
+
+
+def test_a_generator_of_big_items_hits_the_byte_cap(monkeypatch):
+    monkeypatch.setattr(_bridge, "MAX_RESULT_BYTES", 4 * 1024 * 1024)
+    gen = _Tracked(item={"blob": "x" * (1024 * 1024)})
+    d = Dispatcher([gen], workers=1)
+    try:
+        kind, status, raw, *_ = _dispatch(d, 0)
+        assert (kind, status, _error(raw)["code"]) == ("complete", 500, "WC406")
+        assert "bytes" in _error(raw)["message"] and gen.closed
+    finally:
+        d.shutdown()
+
+
+def test_a_generator_nested_in_a_result_is_bounded_too(monkeypatch):
+    monkeypatch.setattr(_bridge, "MAX_RESULT_ITEMS", 100)
+    with pytest.raises(ResultTooLarge):
+        jsonable({"rows": _Tracked()()})
+    # Finite lazy iterables are unaffected.
+    assert jsonable({"rows": (i for i in range(100)), "r": range(3)}) == {"rows": list(range(100)),
+                                                                            "r": [0, 1, 2]}
+
+
+class _GivesUp(FakeCompleter):
+    """A caller that stops waiting after `after` seconds."""
+
+    def __init__(self, after: float) -> None:
+        super().__init__()
+        self.deadline = time.monotonic() + after
+
+    def abandoned(self) -> bool:
+        return time.monotonic() > self.deadline
+
+
+def test_a_slow_endless_generator_stops_once_the_caller_is_gone():
+    # Too slow to reach either cap: only the caller leaving can stop it.
+    gen = _Tracked(delay=0.01)
+    d = Dispatcher([gen], workers=1)
+    try:
+        c = _GivesUp(0.3)
+        d.submit(0, dict(RAW), c)
+        kind, status, raw, *_ = c.wait()
+        assert (kind, status, _error(raw)["code"]) == ("complete", 504, "WC203")
+        assert gen.closed
+    finally:
+        d.shutdown()
+
+
+def test_a_slow_endless_async_generator_stops_once_the_caller_is_gone():
+    state = {"closed": False}
+
+    async def stream():
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+                yield 1
+        finally:
+            state["closed"] = True
+
+    d = Dispatcher([_bind_handler(stream, None)], workers=1)
+    try:
+        c = _GivesUp(0.3)
+        d.submit(0, dict(RAW), c)
+        kind, status, raw, *_ = c.wait()
+        assert (kind, status) == ("complete", 504) and state["closed"]
+    finally:
+        d.shutdown()
+
+
+def test_the_result_caps_are_read_from_the_environment():
+    code = ("import webcortex._bridge as b; print(b.MAX_RESULT_ITEMS, b.MAX_RESULT_BYTES)")
+    env = {**os.environ, "WEBCORTEX_MAX_RESULT_ITEMS": "7", "WEBCORTEX_MAX_RESULT_BYTES": "nope"}
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["7", str(64 * 1024 * 1024)]
+
+
 def test_sys_exit_in_an_async_handler_does_not_kill_its_event_loop():
     # 2.5.3: SystemExit escaped the task into run_forever(), the loop thread
     # died, and every later request queued on that loop timed out (504).
@@ -993,7 +1128,7 @@ def test_typescript_client_names_are_valid_and_unique():
 
 
 APP_SOURCE = r'''
-import asyncio, dataclasses, datetime, decimal, enum, math, threading
+import asyncio, dataclasses, datetime, decimal, enum, itertools, math, threading
 from webcortex import WebCortex, Response, HTTPError
 
 app = WebCortex("stress", port={port}, request_timeout=60)
@@ -1067,6 +1202,22 @@ def big(mb: int = 1) -> dict:
 def gen(n: int = 3):
     for i in range(n):
         yield i
+
+@app.get("/endless")
+def endless():
+    i = 0
+    while True:
+        yield i
+        i += 1
+
+@app.get("/aendless")
+async def aendless():
+    while True:
+        yield "x" * 4096
+
+@app.behaviour("endless_result")
+def endless_result(ctx, input):
+    return {{"rows": itertools.count()}}
 
 class Callable:
     async def __call__(self, x: int = 1) -> dict:
@@ -1258,3 +1409,17 @@ def test_http_behaviour_results_are_encoded_and_a_cycle_fails_cleanly(stress):
     assert status == 500 and body["error"]["code"] == "WC003"
     assert stress.proc.poll() is None, "the server process died"
     assert stress.json("/sync?i=1") == (200, {"i": 1})
+
+
+def test_http_endless_generators_fail_with_wc406_and_the_server_lives(stress):
+    # 2.6.0: the worker collected forever and the process's memory grew
+    # until it was killed; the client got a 504 after request_timeout.
+    for path in ("/endless", "/aendless"):
+        started = time.time()
+        status, body = stress.json(path)
+        assert status == 500 and body["error"]["code"] == "WC406", (path, body)
+        assert time.time() - started < 30
+    status, body = stress.json("/behaviours/endless-result", "POST", {})
+    assert status == 500 and body["error"]["code"] == "WC406", body
+    assert stress.proc.poll() is None
+    assert stress.json("/gen?n=4") == (200, [0, 1, 2, 3])

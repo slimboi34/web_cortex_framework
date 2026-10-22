@@ -160,6 +160,8 @@ pub static CATALOGUE: &[ErrorInfo] = &[
        "The run used max_steps before the model stopped asking for tools. Raise max_steps, or give the agent fewer, sharper tools."),
     e!("WC405", "limits", None, "MCP batch too large",
        "A JSON-RPC batch may hold at most 32 messages. Split it."),
+    e!("WC406", "limits", Some(500), "Returned generator too large",
+       "A handler, behaviour or tool returned a generator (or other lazy iterable) that went past WEBCORTEX_MAX_RESULT_ITEMS (default 100000) or WEBCORTEX_MAX_RESULT_BYTES (default 64 MiB). A response is sent whole, so return a bounded result: page it, or raise the limits."),
 
     // ---- WC5xx devices and actuators ------------------------------------
     e!("WC501", "devices", Some(404), "Unknown device",

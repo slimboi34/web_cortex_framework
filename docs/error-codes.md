@@ -334,6 +334,12 @@ The run used max_steps before the model stopped asking for tools. Raise max_step
 
 A JSON-RPC batch may hold at most 32 messages. Split it.
 
+### WC406 — Returned generator too large {#wc406}
+
+*limits · HTTP 500*
+
+A handler, behaviour or tool returned a generator (or other lazy iterable) that went past WEBCORTEX_MAX_RESULT_ITEMS (default 100000) or WEBCORTEX_MAX_RESULT_BYTES (default 64 MiB). A response is sent whole, so return a bounded result: page it, or raise the limits.
+
 ## Devices, actuators and the emergency stop (WC5xx)
 
 ### WC501 — Unknown device {#wc501}

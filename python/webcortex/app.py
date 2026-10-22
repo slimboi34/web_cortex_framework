@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from . import schema as _schema
 from ._bridge import Dispatcher, HTTPError, Request, Response, default_worker_count, jsonable
+from ._bridge import acollect as _bridge_acollect
 from .contextpack import _derive_tool_name
 
 __all__ = ["WebCortex", "Request", "Response", "HTTPError", "Resource"]
@@ -1897,7 +1898,7 @@ def _bind_handler(fn: Callable, request_param: str | None) -> Callable:
     Async-ness is preserved rather than papered over, because the dispatcher
     routes coroutine handlers and blocking handlers to different pools. An
     object whose ``__call__`` is ``async def`` counts as async, and an async
-    generator's items are collected into the response list.
+    generator's items are collected into the response list (bounded: WC406).
     """
     sig = inspect.signature(fn)
     hints = _schema.type_hints(fn)
@@ -1918,7 +1919,8 @@ def _bind_handler(fn: Callable, request_param: str | None) -> Callable:
     if inspect.isasyncgenfunction(fn) or inspect.isasyncgenfunction(getattr(fn, "__call__", None)):
 
         async def async_gen_handler(req: Request) -> Any:
-            return [item async for item in call(req)]
+            # Bounded: past the result caps it fails with WC406 and is closed.
+            return await _bridge_acollect(call(req), f"handler {name!r}")
 
         async_gen_handler.__name__ = name
         return async_gen_handler

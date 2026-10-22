@@ -803,7 +803,11 @@ impl App {
                     tool: Some(name.to_string()),
                     detail: serde_json::json!({"error": &e}),
                 });
-                Ok(WebCortexResponse::coded(500, "WC003", e))
+                // A failure the bridge already coded ("WC406: …") keeps its code.
+                let code = crate::errors::code_in(e.get(..6).unwrap_or_default())
+                    .filter(|_| e.as_bytes().get(5) == Some(&b':'))
+                    .unwrap_or("WC003");
+                Ok(WebCortexResponse::coded(500, code, e))
             }
         }
     }

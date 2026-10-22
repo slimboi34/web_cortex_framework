@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import dataclasses
 import datetime as _dt
 import decimal
@@ -30,6 +31,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 import uuid
 from collections.abc import Iterable, Mapping
@@ -42,6 +44,27 @@ __all__ = ["Dispatcher", "free_threaded", "default_worker_count"]
 # enabled. A stack trace in an HTTP response hands an attacker your file layout,
 # dependency versions, and code structure for free.
 _EXPOSE_TRACEBACKS = os.environ.get("WEBCORTEX_DEBUG_ERRORS", "").lower() in {"1", "true", "yes"}
+
+
+def _env_limit(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# A generator (or any lazy iterable) returned by a handler, behaviour or tool
+# is collected into a JSON array, because a response is sent whole. These caps
+# stop an endless or enormous one from growing without bound: past them the
+# call fails with WC406 and the generator is closed.
+MAX_RESULT_ITEMS = _env_limit("WEBCORTEX_MAX_RESULT_ITEMS", 100_000)
+MAX_RESULT_BYTES = _env_limit("WEBCORTEX_MAX_RESULT_BYTES", 64 * 1024 * 1024)
+
+# The current call's "has the caller gone?" check, so collection deep inside
+# the JSON encoder can stop pulling once nobody is waiting for the answer.
+_ABANDONED: contextvars.ContextVar[Callable[[], bool] | None] = contextvars.ContextVar(
+    "webcortex_abandoned", default=None)
 
 
 def free_threaded() -> bool:
@@ -83,7 +106,7 @@ class _LoopWorker:
 
     def _start(self, coro_fn: Callable[[], Any], completer: Any) -> None:
         try:
-            task = self.loop.create_task(_run_async(coro_fn))
+            task = self.loop.create_task(_run_async(coro_fn, completer))
         except Exception:
             _fail(completer, traceback.format_exc())
             return
@@ -131,7 +154,7 @@ class Dispatcher:
             worker = self._loops[next(self._counter) % len(self._loops)]
             worker.submit(lambda: handler(req), completer)
         else:
-            future = self._threads.submit(_run_sync, handler, req)
+            future = self._threads.submit(_run_sync, handler, req, completer)
             future.add_done_callback(lambda f: _settle_future(f, completer))
 
     def submit_behaviour(self, handler_id: int, ctx: Any, payload: Any, completer: Any) -> None:
@@ -334,6 +357,99 @@ class InvalidJSON(HTTPError, ValueError):
         super().__init__(400, message, code="WC205")
 
 
+class ResultTooLarge(HTTPError):
+    """A returned generator went past MAX_RESULT_ITEMS or MAX_RESULT_BYTES (``WC406``)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(500, message, code="WC406")
+
+
+class _CallerGone(HTTPError):
+    """The caller stopped waiting while a returned generator was being collected."""
+
+    def __init__(self) -> None:
+        super().__init__(504, "the caller stopped waiting; the handler's generator was closed",
+                         code="WC203")
+
+
+def _approx_size(item: Any, depth: int = 2) -> int:
+    """A cheap lower bound on an item's encoded size, for the byte cap."""
+    if isinstance(item, str):
+        return len(item)
+    if isinstance(item, (bytes, bytearray, memoryview)):
+        return len(item) * 4 // 3
+    if depth and isinstance(item, Mapping):
+        return sum(_approx_size(k, 0) + _approx_size(v, depth - 1) for k, v in item.items()) + 2
+    if depth and isinstance(item, (list, tuple)):
+        return sum(_approx_size(v, depth - 1) for v in item) + 2
+    return 8
+
+
+class _Collector:
+    """Counts what a lazy iterable has produced and decides when to stop."""
+
+    def __init__(self, what: str) -> None:
+        self.what = what
+        self.items: list[Any] = []
+        self.size = 0
+        self.abandoned = _ABANDONED.get()
+        self.checked = time.monotonic()
+
+    def add(self, item: Any) -> None:
+        self.items.append(item)
+        self.size += _approx_size(item) + 1
+        if len(self.items) > MAX_RESULT_ITEMS:
+            raise ResultTooLarge(
+                f"{self.what} produced more than {MAX_RESULT_ITEMS} items; a response is sent "
+                "whole, so an endless or very large generator cannot be returned")
+        if self.size > MAX_RESULT_BYTES:
+            raise ResultTooLarge(
+                f"{self.what} produced more than {MAX_RESULT_BYTES} bytes; a response is sent "
+                "whole, so an endless or very large generator cannot be returned")
+        if self.abandoned is not None:
+            now = time.monotonic()
+            if now - self.checked >= 0.05:
+                self.checked = now
+                if self.abandoned():
+                    raise _CallerGone()
+
+
+def collect(iterable: Iterable[Any], what: str = "the returned iterable") -> list[Any]:
+    """``list(iterable)``, bounded by the result caps; closes a generator it gives up on."""
+    if isinstance(iterable, (list, tuple, set, frozenset, dict, str, bytes)):
+        return list(iterable)
+    bag = _Collector(what)
+    try:
+        for item in iterable:
+            bag.add(item)
+    except BaseException:
+        close = getattr(iterable, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        raise
+    return bag.items
+
+
+async def acollect(aiterable: Any, what: str = "the returned async generator") -> list[Any]:
+    """The async form of :func:`collect`; calls ``aclose()`` on a generator it gives up on."""
+    bag = _Collector(what)
+    try:
+        async for item in aiterable:
+            bag.add(item)
+    except BaseException:
+        aclose = getattr(aiterable, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:
+                pass
+        raise
+    return bag.items
+
+
 # RFC 9110 `token`: what a header name may contain.
 _HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
@@ -471,7 +587,7 @@ def _fallback(obj: Any) -> Any:
     if isinstance(obj, Mapping):
         return dict(obj)
     if isinstance(obj, Iterable) and not isinstance(obj, (str, bytes)):
-        return list(obj)
+        return collect(obj)
     if hasattr(obj, "__dict__"):
         return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
     return str(obj)
@@ -541,18 +657,20 @@ async def _drain(value: Any) -> Any:
     if inspect.isawaitable(value):
         value = await value
     if hasattr(value, "__aiter__") and hasattr(value, "__anext__"):
-        value = [item async for item in value]
+        value = await acollect(value)
     return value
 
 
-async def _run_async(coro_fn: Callable[[], Any]) -> Any:
+async def _run_async(coro_fn: Callable[[], Any], completer: Any = None) -> Any:
+    _ABANDONED.set(getattr(completer, "abandoned", None))
     try:
         return await _drain(coro_fn())
     except (SystemExit, KeyboardInterrupt) as e:
         raise _HandlerExit(f"handler raised {type(e).__name__}({e})") from e
 
 
-def _run_sync(handler: Callable[[Any], Any], req: Any) -> Any:
+def _run_sync(handler: Callable[[Any], Any], req: Any, completer: Any = None) -> Any:
+    _ABANDONED.set(getattr(completer, "abandoned", None))
     try:
         result = handler(req)
     except (SystemExit, KeyboardInterrupt) as e:
@@ -584,9 +702,21 @@ def _settle_future(future: Any, completer: Any) -> None:
     _deliver(future.result(), completer)
 
 
+def _encode_for(value: Any, completer: Any) -> tuple[int, bytes, str, list]:
+    token = _ABANDONED.set(getattr(completer, "abandoned", None))
+    try:
+        return _encode(value)
+    finally:
+        _ABANDONED.reset(token)
+
+
 def _deliver(value: Any, completer: Any) -> None:
     try:
-        status, body, content_type, headers = _encode(value)
+        status, body, content_type, headers = _encode_for(value, completer)
+    except HTTPError as e:
+        # A generator past the result caps, or one whose caller went away.
+        _deliver_exception(e, completer)
+        return
     except Exception as e:
         # Logged in full; the client sees the traceback only when tracebacks
         # are explicitly exposed, as for an exception the handler raised.
@@ -645,12 +775,17 @@ def _settle_behaviour(future: Any, completer: Any) -> None:
             except Exception:
                 traceback.print_exc()
                 return
+        if isinstance(exc, ResultTooLarge):
+            _fail(completer, f"{exc.code}: {exc.message}")
+            return
         detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         print(f"[webcortex] behaviour failed:\n{detail}", file=sys.stderr, flush=True)
         _fail(completer, detail if _EXPOSE_TRACEBACKS else "behaviour failed")
         return
     try:
         completer.complete(jsonable(future.result()))
+    except ResultTooLarge as e:
+        _fail(completer, f"{e.code}: {e.message}")
     except Exception:
         detail = traceback.format_exc()
         print(f"[webcortex] behaviour returned an unconvertible value:\n{detail}",
