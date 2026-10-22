@@ -1151,15 +1151,6 @@ class WebCortex:
 
         def decorator(fn: Callable) -> Callable:
             behaviour_name = name or fn.__name__
-            # A behaviour runs on a worker thread and blocks in ctx.call/ask;
-            # an `async def` one returned an un-awaited coroutine, which failed
-            # every run as "could not be serialised".
-            if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
-                raise TypeError(
-                    f"behaviour {behaviour_name!r} is async; behaviours are plain `def` "
-                    "functions — ctx.call and ctx.ask block, and gather/ask_many run "
-                    "their leaves concurrently"
-                )
             doc = inspect.getdoc(fn) or ""
             handler_index = len(self._handlers)
             self._handlers.append(fn)

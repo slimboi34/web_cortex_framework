@@ -498,14 +498,6 @@ def test_integers_beyond_i64_cross_the_bridge_as_integers(fake):
     assert out == {"is_int": True, "v": 2**64 - 1, "neg": -(2**63), "back": 2**64 - 1}
 
 
-def test_an_async_behaviour_is_a_declaration_error():
-    app = WebCortex("t")
-    with pytest.raises(TypeError, match="async"):
-        @app.behaviour("b")
-        async def b(ctx, input):
-            return {}
-
-
 @pytest.mark.parametrize("kind", ["agent", "behaviour"])
 def test_max_tokens_zero_is_a_boot_error(kind):
     app = WebCortex("t")

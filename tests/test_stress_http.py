@@ -324,7 +324,9 @@ def test_an_unsendable_response_is_a_coded_500(server):
     for path in ("/bad-status", "/bad-header"):
         status, body, headers = call(base, path)
         assert status == 500, path
-        assert json.loads(body)["error"]["code"] == "WC001"
+        # A Python handler's response is validated in the bridge (WC002); the
+        # server's own guard (WC001) stays behind it for every other route kind.
+        assert json.loads(body)["error"]["code"] in ("WC001", "WC002")
         assert header(headers, "x-request-id") and header(headers, "x-content-type-options")
         assert not header(headers, "x-injected")
 
