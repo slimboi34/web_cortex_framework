@@ -1451,7 +1451,8 @@ class WebCortex:
             raise ValueError(f"device {name!r} is declared twice")
         if source is not None and not source.startswith(("http://", "https://")):
             raise ValueError(f"camera {name!r}: source must be an http(s) snapshot URL")
-        if max_fps <= 0 or keep < 1 or max_frame_bytes < 1:
+        # `not (x > 0)` also refuses NaN, which every comparison lets through.
+        if not (0 < max_fps < float("inf")) or keep < 1 or max_frame_bytes < 1:
             raise ValueError(f"device {name!r}: max_fps, keep and max_frame_bytes must be positive")
         self._devices.append({
             "name": name,
@@ -1534,8 +1535,8 @@ class WebCortex:
         if not any(d["name"] == device for d in self._devices):
             raise ValueError(f"watcher {name!r} watches {device!r}, which is not declared; "
                              f"call app.camera({device!r}) or app.sensor({device!r}) first")
-        if every < 1:
-            raise ValueError("watch(): every must be at least 1 second")
+        if not (1 <= every < float("inf")):
+            raise ValueError("watch(): every must be at least 1 second (and finite)")
         if max_runs_per_hour < 1:
             raise ValueError("watch(): max_runs_per_hour must be at least 1")
         if webhook is not None and not webhook.startswith(("http://", "https://")):

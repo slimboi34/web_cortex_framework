@@ -55,7 +55,7 @@ pub struct App {
     self_ref: std::sync::OnceLock<std::sync::Weak<App>>,
     /// The emergency stop. While set, every route declared `actuator` refuses
     /// to run, whoever asks and however they arrive.
-    halt: Mutex<Option<serde_json::Value>>,
+    halt: Arc<Mutex<Option<serde_json::Value>>>,
     /// Cameras and sensors: frames, telemetry, insights and their subscribers.
     devices: crate::devices::DeviceHub,
     /// Request counters, recent failures and agent runs: the live view.
@@ -194,7 +194,7 @@ impl App {
             sessions,
             approvals: Mutex::new(HashMap::new()),
             self_ref: std::sync::OnceLock::new(),
-            halt: Mutex::new(manifest_start_halted.then(|| {
+            halt: Arc::new(Mutex::new(manifest_start_halted.then(|| {
                 // The boot time, not 0: a reader computing "halted for" from
                 // since_unix would otherwise see fifty years.
                 let since = std::time::SystemTime::now()
@@ -203,7 +203,7 @@ impl App {
                     .unwrap_or(0);
                 serde_json::json!({"reason": "started halted; release to enable actuators",
                                    "by": "boot", "since_unix": since})
-            })),
+            }))),
             devices,
             recorder,
         })
@@ -392,6 +392,11 @@ impl App {
         self.halt.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    /// The emergency stop, for a handler to check as it starts.
+    pub fn halt_gate(&self) -> crate::bridge::HaltGate {
+        crate::bridge::HaltGate::new(self.halt.clone(), self.manifest.server.control_prefix.clone())
+    }
+
     pub fn behaviour(&self, name: &str) -> Option<&crate::manifest::BehaviourDef> {
         self.behaviours.get(name)
     }
@@ -549,17 +554,8 @@ impl App {
         // op, so it covers HTTP, agent tool calls, behaviours, flows, MCP and
         // approvals resumed after the halt — they all come through dispatch.
         if route.actuator
-            && let Some(state) = self.halted() {
-                let reason = state.get("reason").and_then(|r| r.as_str()).unwrap_or("");
-                return WebCortexResponse::coded(
-                    423,
-                    "WC502",
-                    format!(
-                        "actuators are halted ({reason}); nothing that moves hardware will run \
-                         until an operator releases the stop at {}/release",
-                        self.manifest.server.control_prefix
-                    ),
-                );
+            && let Some(refusal) = self.halt_gate().refusal() {
+                return WebCortexResponse::coded(423, "WC502", refusal);
             }
 
         match self.execute(&route.op, req).await {
@@ -572,6 +568,13 @@ impl App {
         match op {
             Op::Static { status, body } => Ok(WebCortexResponse::json(*status, body)),
 
+            // An actuator checks the stop again as its handler starts: it may
+            // have queued behind other handlers since dispatch let it through.
+            Op::Python { handler }
+                if req.route_id.and_then(|id| self.routes_by_id.get(&id)).is_some_and(|r| r.actuator) =>
+            {
+                self.bridge.call_actuator(*handler, req, self.halt_gate()).await
+            }
             Op::Python { handler } => self.bridge.call(*handler, req).await,
 
             Op::Query { sql, params, returns } => {

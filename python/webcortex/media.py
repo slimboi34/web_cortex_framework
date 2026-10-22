@@ -23,7 +23,7 @@ neither is a dependency.
 from __future__ import annotations
 
 import base64
-import mimetypes
+import operator
 import struct
 import zlib
 from pathlib import Path
@@ -72,6 +72,8 @@ class Image:
                 raise ValueError(f"Image url must be http(s): {url!r}")
             self.data, self.media_type, self.url = None, media_type, url
             return
+        if isinstance(data, str):
+            raise TypeError("Image data must be bytes (the encoded file), not str")
         data = bytes(data)  # type: ignore[arg-type]
         if not data:
             raise ValueError("Image data is empty")
@@ -80,12 +82,22 @@ class Image:
                 f"Image is {len(data)} bytes; providers accept at most {MAX_IMAGE_BYTES}. "
                 "Downscale it, or encode it as JPEG."
             )
-        media_type = media_type or sniff(data)
-        if media_type not in MEDIA_TYPES:
+        if media_type is not None and media_type not in MEDIA_TYPES:
             raise ValueError(
                 f"unsupported image type {media_type!r}; encode as one of {', '.join(MEDIA_TYPES)}"
             )
-        self.data, self.media_type, self.url = data, media_type, None
+        # The bytes decide, not the label: a provider refuses an image whose
+        # declared type does not match its contents, far from where the
+        # mistake was made (a .png file that is really a BMP, say).
+        found = sniff(data)
+        if found is None:
+            raise ValueError(
+                "unsupported image data: not a PNG, JPEG, GIF or WebP image"
+                + (f" (it was labelled {media_type})" if media_type else "")
+            )
+        if media_type is not None and media_type != found:
+            raise ValueError(f"Image data is {found} but was labelled {media_type}")
+        self.data, self.media_type, self.url = data, found, None
 
     # -- constructors ---------------------------------------------------
 
@@ -96,10 +108,8 @@ class Image:
 
     @classmethod
     def from_path(cls, path: str | Path) -> "Image":
-        """An image file on disk."""
-        path = Path(path)
-        data = path.read_bytes()
-        return cls(data, sniff(data) or mimetypes.guess_type(path.name)[0])
+        """An image file on disk. Its type is read from its bytes, not its name."""
+        return cls(Path(path).read_bytes())
 
     @classmethod
     def from_url(cls, url: str) -> "Image":
@@ -186,11 +196,11 @@ _COLOUR_TYPE = {1: 0, 2: 4, 3: 2, 4: 6}  # channels -> PNG colour type
 def _raw_pixels(pixels: Any, bgr: bool) -> tuple[int, int, int, bytes]:
     shape = getattr(pixels, "shape", None)
     if shape is not None:  # NumPy, or anything shaped like it
-        if str(getattr(pixels, "dtype", "uint8")) != "uint8":
-            raise ValueError(
-                f"Image.from_array needs uint8 pixels, got {pixels.dtype}; "
-                "scale and convert with `(a * 255).astype('uint8')` first"
-            )
+        dtype = str(getattr(pixels, "dtype", "uint8"))
+        if dtype != "uint8":
+            how = ("keep the high byte with `(a >> 8).astype('uint8')`" if dtype in ("uint16", ">u2", "<u2")
+                   else "scale 0..1 floats with `(a * 255).clip(0, 255).astype('uint8')`")
+            raise ValueError(f"Image.from_array needs uint8 pixels, got {dtype}; {how} first")
         if len(shape) not in (2, 3):
             raise ValueError(f"Image.from_array needs a (h, w) or (h, w, c) array, got shape {shape}")
         height, width = int(shape[0]), int(shape[1])
@@ -200,21 +210,35 @@ def _raw_pixels(pixels: Any, bgr: bool) -> tuple[int, int, int, bytes]:
             pixels = pixels[..., order]
         return width, height, channels, pixels.tobytes()
 
-    rows = [list(r) for r in pixels]
+    try:
+        rows = [list(r) for r in pixels]
+    except TypeError:
+        raise ValueError("Image.from_array needs rows of pixels: a 2-D list, or a (h, w[, c]) array") from None
     if not rows or not rows[0]:
         raise ValueError("Image.from_array got no pixels")
     height, width = len(rows), len(rows[0])
     first = rows[0][0]
-    channels = 1 if isinstance(first, int) else len(first)
+    # A pixel is a number (greyscale) or a sequence of channel values; NumPy
+    # scalars are numbers too, though not `int`.
+    channels = len(first) if isinstance(first, (list, tuple)) else 1
     out = bytearray()
-    for row in rows:
-        if len(row) != width:
-            raise ValueError("Image.from_array rows must all be the same width")
-        for px in row:
-            values = [px] if channels == 1 else list(px)
-            if bgr and channels in (3, 4):
-                values[0], values[2] = values[2], values[0]
-            out.extend(values)
+    try:
+        for row in rows:
+            if len(row) != width:
+                raise ValueError("Image.from_array rows must all be the same width")
+            for px in row:
+                values = [operator.index(px)] if channels == 1 else [operator.index(v) for v in px]
+                if len(values) != channels:
+                    raise ValueError(f"Image.from_array pixels must all have {channels} channel(s); got {px!r}")
+                if bgr and channels in (3, 4):
+                    values[0], values[2] = values[2], values[0]
+                out.extend(values)
+    except (TypeError, OverflowError):
+        raise ValueError("Image.from_array pixel values must be integers 0..255") from None
+    except ValueError as e:
+        if "range" in str(e):
+            raise ValueError("Image.from_array pixel values must be integers 0..255") from None
+        raise
     return width, height, channels, bytes(out)
 
 
@@ -222,6 +246,10 @@ def encode_png(width: int, height: int, channels: int, raw: bytes) -> bytes:
     """Encode 8-bit pixels as PNG. `raw` is row-major, channels interleaved."""
     if channels not in _COLOUR_TYPE:
         raise ValueError(f"PNG needs 1, 2, 3 or 4 channels, got {channels}")
+    # A PNG with a zero dimension is invalid; 2.5.3 encoded one from an empty
+    # array, and the provider refused it far from the cause.
+    if not (0 < width < 2**31 and 0 < height < 2**31):
+        raise ValueError(f"an image must be at least 1x1 pixel (and under 2**31 a side); got {width}x{height}")
     stride = width * channels
     if len(raw) != stride * height:
         raise ValueError(f"expected {stride * height} bytes of pixels, got {len(raw)}")

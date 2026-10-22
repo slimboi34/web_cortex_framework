@@ -38,6 +38,9 @@ const KEEP_INSIGHTS: usize = 32;
 const CHANNEL_CAPACITY: usize = 64;
 /// Arrival times kept for the frame rate, whatever `keep` is.
 const RATE_WINDOW: usize = 32;
+/// The longest gap `max_fps` can ask for. A vanishingly small rate would
+/// otherwise overflow an `Instant`.
+const MAX_FRAME_INTERVAL: Duration = Duration::from_secs(365 * 24 * 3600);
 
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -123,6 +126,9 @@ pub fn sniff(data: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// What one pull of a `source` camera produced.
+type PullResult = Result<Arc<Frame>, String>;
+
 pub struct Device {
     pub def: DeviceDef,
     frames: Mutex<VecDeque<Arc<Frame>>>,
@@ -132,7 +138,12 @@ pub struct Device {
     telemetry: Mutex<Option<(u64, Arc<Value>)>>,
     insights: Mutex<VecDeque<Value>>,
     seq: AtomicU64,
-    last_ingest: Mutex<Option<Instant>>,
+    /// When the next pushed frame is due (GCRA). A frame may arrive up to half
+    /// an interval early; see [`Device::admit`].
+    next_due: Mutex<Option<Instant>>,
+    /// The newest pull of a `source` camera and when it finished, shared by
+    /// every caller that asked while it was in flight.
+    pull: tokio::sync::Mutex<Option<(Instant, PullResult)>>,
     frames_in: AtomicU64,
     frames_dropped: AtomicU64,
     /// Frames refused as invalid (not an image, empty, over max_frame_bytes,
@@ -151,7 +162,8 @@ impl Device {
             telemetry: Mutex::new(None),
             insights: Mutex::new(VecDeque::new()),
             seq: AtomicU64::new(0),
-            last_ingest: Mutex::new(None),
+            next_due: Mutex::new(None),
+            pull: tokio::sync::Mutex::new(None),
             frames_in: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
             frames_rejected: AtomicU64::new(0),
@@ -167,6 +179,12 @@ impl Device {
             self.frames_rejected.fetch_add(1, Ordering::Relaxed);
         }
         result
+    }
+
+    /// Count a frame refused before it reached [`Self::push_frame`]: one over
+    /// a socket's message ceiling is refused by the WebSocket layer itself.
+    pub(crate) fn note_rejected(&self) {
+        self.frames_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     fn accept_frame(&self, data: Bytes) -> Result<u64, IngestError> {
@@ -189,21 +207,41 @@ impl Device {
         let media_type = sniff(&data).ok_or_else(|| {
             IngestError::Invalid("frame is not a PNG, JPEG, GIF or WebP image".into())
         })?;
-        {
-            // try_: a vanishingly small max_fps overflows a Duration, and the
-            // panic took the request (or the device's socket) down with it.
-            let interval = Duration::try_from_secs_f64(1.0 / self.def.max_fps).unwrap_or(Duration::MAX);
-            let mut last = self.last_ingest.lock().unwrap_or_else(|p| p.into_inner());
-            if last.is_some_and(|t| t.elapsed() < interval) {
-                self.frames_dropped.fetch_add(1, Ordering::Relaxed);
-                return Err(IngestError::TooFast);
-            }
-            *last = Some(Instant::now());
+        if !self.admit(Instant::now()) {
+            self.frames_dropped.fetch_add(1, Ordering::Relaxed);
+            return Err(IngestError::TooFast);
         }
-        Ok(self.store(media_type, data))
+        Ok(self.store(media_type, data).seq)
     }
 
-    fn store(&self, media_type: &'static str, data: Bytes) -> u64 {
+    /// Whether a frame arriving at `now` is within `max_fps`.
+    ///
+    /// A generic cell rate algorithm with a tolerance of half an interval.
+    /// Through 2.5.3 a frame was refused if it came less than a full interval
+    /// after the last one, so a camera sending at exactly its `max_fps`, with
+    /// ordinary timer and network jitter, lost about a third of its frames.
+    /// Now a frame may be up to half an interval early; the long-run rate
+    /// still never exceeds `max_fps`, and no two frames are accepted closer
+    /// together than half an interval.
+    fn admit(&self, now: Instant) -> bool {
+        // try_: a vanishingly small max_fps overflows a Duration, and the
+        // panic took the request (or the device's socket) down with it.
+        let interval = Duration::try_from_secs_f64(1.0 / self.def.max_fps)
+            .unwrap_or(MAX_FRAME_INTERVAL)
+            .min(MAX_FRAME_INTERVAL);
+        let mut due = self.next_due.lock().unwrap_or_else(|p| p.into_inner());
+        if due.is_some_and(|t| now + interval / 2 < t) {
+            return false;
+        }
+        *due = Some(due.map_or(now, |t| t.max(now)) + interval);
+        true
+    }
+
+    /// Hold a frame and tell subscribers. Sequence numbers are assigned under
+    /// the ring's lock, so the ring, `latest()` and the broadcast all see
+    /// frames in sequence order however many pushes and pulls race.
+    fn store(&self, media_type: &'static str, data: Bytes) -> Arc<Frame> {
+        let mut frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let frame = Arc::new(Frame { seq, media_type, data, at_ms: now_ms() });
         {
@@ -213,17 +251,14 @@ impl Device {
                 arrivals.pop_front();
             }
         }
-        {
-            let mut frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
-            frames.push_back(frame.clone());
-            while frames.len() > self.def.keep {
-                frames.pop_front();
-            }
+        frames.push_back(frame.clone());
+        while frames.len() > self.def.keep {
+            frames.pop_front();
         }
         self.frames_in.fetch_add(1, Ordering::Relaxed);
-        // No subscribers is not an error.
-        let _ = self.tx.send(Event::Frame(frame));
-        seq
+        // No subscribers is not an error. Sent under the lock to keep the order.
+        let _ = self.tx.send(Event::Frame(frame.clone()));
+        frame
     }
 
     pub fn push_telemetry(&self, value: Value) -> Result<(), IngestError> {
@@ -361,8 +396,30 @@ impl DeviceHub {
     }
 
     /// The newest frame, fetching a fresh one first when the device is pulled.
+    ///
+    /// Callers that ask while a pull is in flight share its result (frame or
+    /// error) rather than each fetching: forty agents and viewers asking at
+    /// once used to open forty connections to the camera, which many IP
+    /// cameras answer by refusing all but a few.
     pub async fn current_frame(&self, device: &Device) -> Result<Option<Arc<Frame>>, String> {
-        let Some(src) = &device.def.source else { return Ok(device.latest()) };
+        if device.def.source.is_none() {
+            return Ok(device.latest());
+        }
+        let asked = Instant::now();
+        let mut last = device.pull.lock().await;
+        if let Some((finished, result)) = &*last
+            && *finished >= asked
+        {
+            return result.clone().map(Some);
+        }
+        let result = self.pull(device).await;
+        *last = Some((Instant::now(), result.clone()));
+        result.map(Some)
+    }
+
+    /// One fetch of a pulled camera's snapshot URL.
+    async fn pull(&self, device: &Device) -> PullResult {
+        let Some(src) = &device.def.source else { return Err("this camera is not pulled".into()) };
         let mut req = self
             .client
             .get(&src.url)
@@ -406,8 +463,7 @@ impl DeviceHub {
         let media_type = sniff(&data)
             .ok_or_else(|| format!("camera {:?} did not send a PNG, JPEG, GIF or WebP image", device.def.name))?;
         // A pull is not rate-limited like a push: it happens because someone asked.
-        device.store(media_type, data);
-        Ok(device.latest())
+        Ok(device.store(media_type, data))
     }
 
     /// The JSON a `snapshot` route and tool return.
@@ -886,6 +942,148 @@ mod tests {
         let err = hub.current_frame(hub.get("cam").unwrap()).await.unwrap_err();
         assert!(err.contains("did not answer"), "{err}");
         assert!(!err.contains("hunter2") && !err.contains("snapshot.jpg"), "{err}");
+    }
+
+    #[test]
+    fn a_camera_at_exactly_max_fps_keeps_its_frames_despite_jitter() {
+        // 2.5.3 refused any frame less than a full interval after the last:
+        // a 10 fps camera with ±10 ms of jitter lost about a third of them.
+        let d = Device::new(def(10.0, 4));
+        let t0 = Instant::now();
+        let jitter = [0i64, 9, -8, 10, -10, 3, -9, 7, -2, 10, -10, 0];
+        for round in 0..20u64 {
+            for (k, j) in jitter.iter().enumerate() {
+                let slot = (round * jitter.len() as u64 + k as u64) * 100 + 20;
+                let at = t0 + Duration::from_millis((slot as i64 + j) as u64);
+                assert!(d.admit(at), "frame {k} of round {round} dropped");
+            }
+        }
+    }
+
+    #[test]
+    fn max_fps_still_caps_a_flood_over_the_long_run() {
+        let d = Device::new(def(10.0, 4));
+        let t0 = Instant::now();
+        // One frame a millisecond for ten seconds.
+        let accepted = (0..10_000u64).filter(|ms| d.admit(t0 + Duration::from_millis(*ms))).count();
+        assert!((100..=102).contains(&accepted), "accepted {accepted} frames in 10 s at max_fps=10");
+        // And never two closer together than half an interval.
+        let d = Device::new(def(10.0, 4));
+        assert!(d.admit(t0));
+        assert!(!d.admit(t0 + Duration::from_millis(49)));
+        assert!(d.admit(t0 + Duration::from_millis(50)));
+        assert!(!d.admit(t0 + Duration::from_millis(100)), "the early frame used the next slot");
+    }
+
+    #[test]
+    fn concurrent_pushes_keep_the_ring_in_sequence_order() {
+        let d = Arc::new(Device::new(def(1e9, 64)));
+        let mut rx = d.subscribe();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let d = d.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        d.store("image/png", Bytes::from_static(PNG));
+                    }
+                })
+            })
+            .collect();
+        let mut seen = Vec::new();
+        for t in threads {
+            t.join().unwrap();
+        }
+        while let Ok(Event::Frame(f)) = rx.try_recv() {
+            seen.push(f.seq);
+        }
+        let ring: Vec<u64> = d.frames.lock().unwrap().iter().map(|f| f.seq).collect();
+        assert!(ring.windows(2).all(|w| w[0] < w[1]), "ring out of order: {ring:?}");
+        assert_eq!(d.latest().unwrap().seq, 4000);
+        // The broadcast is bounded (subscribers lag), but what it holds is in order.
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "broadcast out of order");
+    }
+
+    /// An HTTP camera that counts requests, answering each after `delay_ms`.
+    async fn slow_camera(delay_ms: u64, status: &'static str) -> (String, Arc<AtomicU64>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        PNG.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(PNG).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn concurrent_askers_share_one_pull_of_an_ip_camera() {
+        let (url, hits) = slow_camera(300, "200 OK").await;
+        let hub = Arc::new(pulled(&url, 1024));
+        let askers: Vec<_> = (0..30)
+            .map(|_| {
+                let hub = hub.clone();
+                tokio::spawn(async move { hub.current_frame(hub.get("cam").unwrap()).await })
+            })
+            .collect();
+        for a in askers {
+            assert!(a.await.unwrap().unwrap().is_some());
+        }
+        let n = hits.load(Ordering::SeqCst);
+        // Thirty concurrent askers, but the camera is fetched once (twice if
+        // a slow runner spawned some askers after the first pull finished).
+        assert!(n <= 3, "the camera was fetched {n} times");
+        // A caller arriving after a pull finished gets a fresh one.
+        hub.current_frame(hub.get("cam").unwrap()).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), n + 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_camera_fails_its_waiters_together_not_one_timeout_each() {
+        let (url, hits) = slow_camera(300, "503 Service Unavailable").await;
+        let hub = Arc::new(pulled(&url, 1024));
+        let started = Instant::now();
+        let askers: Vec<_> = (0..20)
+            .map(|_| {
+                let hub = hub.clone();
+                tokio::spawn(async move { hub.current_frame(hub.get("cam").unwrap()).await })
+            })
+            .collect();
+        for a in askers {
+            let err = a.await.unwrap().unwrap_err();
+            assert!(err.contains("503"), "{err}");
+        }
+        assert!(hits.load(Ordering::SeqCst) <= 3);
+        // Serialised, twenty failures would take 20 × 300 ms.
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn an_enormous_watcher_period_is_refused_at_validation() {
+        // Finite, so it passed validation, then overflowed a Duration and
+        // panicked the watcher task in spawn_watchers.
+        let manifest: crate::manifest::Manifest = serde_json::from_value(json!({
+            "name": "w",
+            "devices": [{"name": "cam"}],
+            "agents": [{"name": "eye", "model": "test", "tools": []}],
+            "watchers": [{"name": "w", "device": "cam", "agent": "eye", "input": "look", "every_secs": 1e30}]
+        }))
+        .unwrap();
+        assert!(manifest.validate().unwrap_err().contains("too large"));
     }
 
     #[test]

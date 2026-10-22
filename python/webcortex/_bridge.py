@@ -115,7 +115,7 @@ class Dispatcher:
         )
 
     # Called from Rust.
-    def submit(self, handler_id: int, request: dict, completer: Any) -> None:
+    def submit(self, handler_id: int, request: dict, completer: Any, gate: Any = None) -> None:
         try:
             handler = self._handlers[handler_id]
         except IndexError:
@@ -123,6 +123,9 @@ class Dispatcher:
             return
 
         req = Request(request)
+
+        if gate is not None:
+            handler = _gated(handler, gate, completer, self._is_async[handler_id])
 
         if self._is_async[handler_id]:
             worker = self._loops[next(self._counter) % len(self._loops)]
@@ -159,6 +162,34 @@ class Dispatcher:
         for w in self._loops:
             w.shutdown()
         self._threads.shutdown(wait=False)
+
+
+def _gated(handler: Callable[..., Any], gate: Any, completer: Any, is_async: bool) -> Callable[..., Any]:
+    """An actuator handler that checks the emergency stop as it starts.
+
+    The runtime checked it when the call was dispatched, but the call may
+    then have queued behind other handlers; a move must not start after the
+    stop was pressed, nor after its caller gave up waiting (a 504 that moves
+    the arm anyway is worse than either answer)."""
+
+    def check() -> None:
+        refusal = gate.refusal()
+        if refusal is not None:
+            raise HTTPError(423, refusal, code="WC502")
+        if completer.abandoned():
+            raise HTTPError(504, "the caller stopped waiting before this actuator started; it did not run",
+                            code="WC203")
+
+    if is_async:
+        async def run_async(req: Any) -> Any:
+            check()
+            return await handler(req)
+        return run_async
+
+    def run(req: Any) -> Any:
+        check()
+        return handler(req)
+    return run
 
 
 class Request:

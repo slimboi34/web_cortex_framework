@@ -121,7 +121,11 @@ if it is missing — a boot error, not a runtime one.
 engaged (`POST /_webcortex/halt`, `webcortex halt`, or
 `WebCortex(..., start_halted=True)` at boot) `App::dispatch` answers it with
 **423** before the op runs — so HTTP, agent tool calls, behaviours, flows, MCP
-and approvals resumed after the stop are all refused. `security_report()` lists
+and approvals resumed after the stop are all refused. A Python actuator is
+checked again as its handler starts (`PyBridge::call_actuator` passes a
+`HaltGate`): a call queued behind busy handler threads when the stop is pressed
+gets 423, and one whose caller already timed out (504) is not started.
+A handler already running is not interrupted. `security_report()` lists
 actuators and warns about any that are unscoped, or agent tools without
 `approval="required"`. Section 8a covers images.
 
@@ -644,11 +648,17 @@ No vision model is embedded (DESIGN §5); pixels are carried to the model.
   ring of `Arc<Frame>`, latest telemetry, last 32 insights, and a
   `tokio::sync::broadcast` channel (capacity 64; slow subscribers get
   `lagged`). `push_frame` sniffs the media type from magic bytes, enforces
-  `max_frame_bytes` and `max_fps` (`IngestError::TooFast` → 429 over HTTP,
-  silent drop over WS). Pulled cameras are fetched in `current_frame`.
+  `max_frame_bytes` and `max_fps` (a GCRA with half an interval of tolerance,
+  `Device::admit`; `IngestError::TooFast` → 429 over HTTP, silent drop over
+  WS). Sequence numbers are assigned under the ring's lock. Pulled cameras are
+  fetched in `current_frame`; concurrent askers share one in-flight pull.
 - **WebSockets:** `server.rs` detects an upgrade after authentication and rate
   limiting, then calls `ws::accept`, which runs `App::authorize` (route match
   and scope check, the same check as `dispatch`) and spawns the socket task.
+  Ingest replies go through a 16-message queue on their own task and are
+  dropped when the device is not reading; every send has a 30 s stall limit
+  (`Timing`), streams are pinged when quiet, and protocol errors are closed
+  with 1002/1007/1009 (`close_for`).
   Connections are served with `serve_connection_with_upgrades`. A browser may
   authenticate an upgrade with `?access_token=` (it is injected as the API-key
   header only on upgrades with no header credential). Agent routes accept

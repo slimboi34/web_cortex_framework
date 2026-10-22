@@ -63,6 +63,31 @@ impl Completer {
     fn fail(&self, message: String) -> PyResult<()> {
         self.send(Err(message))
     }
+
+    /// True once nobody is waiting for this response: the request timed out
+    /// or the client went away. An actuator queued that long is not started.
+    fn abandoned(&self) -> bool {
+        self.tx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_none_or(|tx| tx.is_closed())
+    }
+}
+
+/// The emergency stop, handed to Python with each actuator call so the
+/// dispatcher can check it as the handler starts rather than when it queued.
+#[pyclass]
+struct ActuatorGate {
+    gate: webcortex_core::bridge::HaltGate,
+}
+
+#[pymethods]
+impl ActuatorGate {
+    /// The 423 message while the stop is engaged, else `None`.
+    fn refusal(&self) -> Option<String> {
+        self.gate.refusal()
+    }
 }
 
 /// Why `name: value` cannot be sent as an HTTP header, if it cannot: an empty
@@ -105,11 +130,12 @@ struct PythonBridge {
     workers: usize,
 }
 
-impl PyBridge for PythonBridge {
-    fn call<'a>(
+impl PythonBridge {
+    fn submit<'a>(
         &'a self,
         handler: u32,
         req: WebCortexRequest,
+        gate: Option<webcortex_core::bridge::HaltGate>,
     ) -> futures::future::BoxFuture<'a, Result<WebCortexResponse, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -121,9 +147,10 @@ impl PyBridge for PythonBridge {
                 },
             )?;
             let request = request_to_py(py, &req)?;
+            let gate = gate.map(|gate| Py::new(py, ActuatorGate { gate })).transpose()?;
             self.dispatcher
                 .bind(py)
-                .call_method1("submit", (handler, request, completer))?;
+                .call_method1("submit", (handler, request, completer, gate))?;
             Ok(())
         });
 
@@ -136,6 +163,25 @@ impl PyBridge for PythonBridge {
                 Err(_) => Err("Python handler dropped the request without responding".to_string()),
             }
         })
+    }
+}
+
+impl PyBridge for PythonBridge {
+    fn call<'a>(
+        &'a self,
+        handler: u32,
+        req: WebCortexRequest,
+    ) -> futures::future::BoxFuture<'a, Result<WebCortexResponse, String>> {
+        self.submit(handler, req, None)
+    }
+
+    fn call_actuator<'a>(
+        &'a self,
+        handler: u32,
+        req: WebCortexRequest,
+        gate: webcortex_core::bridge::HaltGate,
+    ) -> futures::future::BoxFuture<'a, Result<WebCortexResponse, String>> {
+        self.submit(handler, req, Some(gate))
     }
 
     fn call_behaviour<'a>(
