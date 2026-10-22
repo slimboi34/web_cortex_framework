@@ -2,4 +2,4 @@
 # system with no migration path, so an unpinned build would break without
 # warning.
 mkdocs-material>=9.5,<10
-mkdocs>=1.6,<2
+mkdocs>=1.6.1,<2
