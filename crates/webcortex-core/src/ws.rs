@@ -17,9 +17,10 @@
 
 use crate::app::App;
 use crate::auth::Principal;
-use crate::devices::{Event, IngestError};
+use crate::devices::{Device, Event, IngestError};
 use crate::http::WebCortexResponse;
 use crate::manifest::{DeviceAction, Op};
+use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use hyper::Request;
 use hyper::body::Incoming;
@@ -28,8 +29,10 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -41,6 +44,17 @@ type Socket = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 const SMALL_MESSAGE: usize = 64 * 1024;
 /// Inbound ceiling for an agent turn: input plus up to 16 images.
 const AGENT_MESSAGE: usize = 32 * 1024 * 1024;
+/// How long a socket waits on a peer: the time one send may take before the
+/// peer is treated as gone, and how often a quiet stream is pinged.
+#[derive(Clone, Copy)]
+struct Timing {
+    stalled_send: Duration,
+    keepalive: Duration,
+}
+
+const TIMING: Timing = Timing { stalled_send: Duration::from_secs(30), keepalive: Duration::from_secs(30) };
+/// Replies queued for a device before further ones are dropped.
+const INGEST_REPLIES: usize = 16;
 
 /// True for a WebSocket upgrade request.
 pub fn is_upgrade(headers: &BTreeMap<String, String>) -> bool {
@@ -150,11 +164,37 @@ fn error(code: &str, message: impl Into<String>) -> Message {
     }))
 }
 
-async fn ingest(app: Arc<App>, name: String, principal: Principal, mut ws: Socket) {
+async fn ingest<S>(app: Arc<App>, name: String, principal: Principal, ws: WebSocketStream<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let Some(device) = app.devices().get(&name).cloned() else { return };
     tracing::info!(device = %name, principal = %principal.id, "device connected");
-    let _ = ws.send(text(json!({"type": "ready", "device": name, "max_fps": device.def.max_fps}))).await;
-    while let Some(msg) = ws.next().await {
+    ingest_loop(device, ws, TIMING).await;
+    tracing::info!(device = %name, "device disconnected");
+}
+
+/// A device's socket: frames and telemetry in, the occasional reply out.
+///
+/// Replies go out on their own task through a short queue. A device that
+/// never reads them (most camera drivers only write) used to fill its TCP
+/// window with error replies, after which the hub blocked sending the next
+/// one and stopped reading frames: the device then blocked too, for good.
+/// Now a reply that does not fit in the queue is dropped; `frames_rejected`
+/// still counts every refusal.
+async fn ingest_loop<S>(device: Arc<Device>, mut ws: WebSocketStream<S>, t: Timing)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let name = device.def.name.clone();
+    // Sent before anything is read, so it is always the first message.
+    if !deliver(&mut ws, text(json!({"type": "ready", "device": name, "max_fps": device.def.max_fps})), t).await {
+        return;
+    }
+    let (out, mut inbound) = ws.split();
+    let (replies, queue) = tokio::sync::mpsc::channel::<Message>(INGEST_REPLIES);
+    let writer = tokio::spawn(write_replies(out, queue, t));
+    while let Some(msg) = inbound.next().await {
         let reply = match msg {
             Ok(Message::Binary(data)) => match device.push_frame(data) {
                 // Dropping a frame that came too fast is the point of max_fps,
@@ -166,37 +206,100 @@ async fn ingest(app: Arc<App>, name: String, principal: Principal, mut ws: Socke
                 Ok(v) => device.push_telemetry(v).err().map(|e| error(e.code(), e.message())),
                 Err(e) => Some(error("WC505", format!("telemetry must be JSON: {e}"))),
             },
+            // The writer's close flushes the reply tungstenite queued.
             Ok(Message::Close(_)) => break,
-            Err(tokio_tungstenite::tungstenite::Error::Capacity(e)) => {
-                // A frame over the socket's ceiling: say why before closing,
-                // in the log and (if the device still reads) a 1009 close,
-                // rather than a bare reset nobody can explain.
-                tracing::warn!(device = %name, error = %e, max_frame_bytes = device.def.max_frame_bytes,
-                               "device socket closed: message too large");
-                let _ = ws
-                    .send(Message::Close(Some(CloseFrame {
-                        code: CloseCode::Size,
-                        reason: "[WC505] message over max_frame_bytes".into(),
-                    })))
-                    .await;
-                break;
-            }
             Err(e) => {
-                tracing::debug!(device = %name, error = %e, "device socket error");
+                if let WsError::Capacity(c) = &e {
+                    // Almost always a frame (telemetry is refused far below
+                    // a camera's ceiling); count it like any refused frame.
+                    if device.def.kind == crate::manifest::DeviceKind::Camera {
+                        device.note_rejected();
+                    }
+                    // A frame over the socket's ceiling: say why before closing,
+                    // in the log and (if the device still reads) a 1009 close,
+                    // rather than a bare reset nobody can explain.
+                    tracing::warn!(device = %name, error = %c, max_frame_bytes = device.def.max_frame_bytes,
+                                   "device socket closed: message too large");
+                    let _ = replies
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Size,
+                            reason: "[WC505] message over max_frame_bytes".into(),
+                        })))
+                        .await;
+                } else {
+                    tracing::debug!(device = %name, error = %e, "device socket error");
+                    if let Some(close) = close_for(&e) {
+                        let _ = replies.send(Message::Close(Some(close))).await;
+                    }
+                }
                 break;
             }
             Ok(_) => None,
         };
-        if let Some(reply) = reply
-            && ws.send(reply).await.is_err() {
-                break;
-            }
+        if let Some(reply) = reply {
+            // Full means the device is not reading: drop the reply, not the frame.
+            let _ = replies.try_send(reply);
+        }
     }
-    tracing::info!(device = %name, "device disconnected");
+    drop(replies);
+    let _ = writer.await;
 }
 
-async fn stream(app: Arc<App>, name: String, binary: bool, ws: Socket) {
+async fn write_replies<S>(
+    mut out: SplitSink<WebSocketStream<S>, Message>,
+    mut queue: tokio::sync::mpsc::Receiver<Message>,
+    t: Timing,
+)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    while let Some(m) = queue.recv().await {
+        let closing = matches!(m, Message::Close(_));
+        if !deliver(&mut out, m, t).await || closing {
+            break;
+        }
+    }
+    // Completes the closing handshake: after the peer's close, this sends the
+    // reply tungstenite queued; otherwise it sends our own close.
+    let _ = tokio::time::timeout(t.stalled_send, out.close()).await;
+}
+
+/// Send one message, giving up on a peer that has stopped reading. Without
+/// the limit a subscriber that connected and never read held its task, its
+/// connection and its place in the subscriber count forever.
+async fn deliver<S>(out: &mut S, m: Message, t: Timing) -> bool
+where
+    S: futures::Sink<Message> + Unpin,
+{
+    matches!(tokio::time::timeout(t.stalled_send, out.send(m)).await, Ok(Ok(())))
+}
+
+/// The close frame owed to a peer whose messages broke the protocol
+/// (RFC 6455 §7.4.1), or `None` when the connection is simply gone.
+fn close_for(e: &WsError) -> Option<CloseFrame> {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    let (code, reason) = match e {
+        WsError::Capacity(_) => (CloseCode::Size, "message too large"),
+        WsError::Utf8(_) => (CloseCode::Invalid, "text message is not valid UTF-8"),
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => return None,
+        WsError::Protocol(_) => (CloseCode::Protocol, "protocol error"),
+        _ => return None,
+    };
+    Some(CloseFrame { code, reason: reason.into() })
+}
+
+async fn stream<S>(app: Arc<App>, name: String, binary: bool, ws: WebSocketStream<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let Some(device) = app.devices().get(&name).cloned() else { return };
+    stream_loop(device, binary, ws, TIMING).await;
+}
+
+async fn stream_loop<S>(device: Arc<Device>, binary: bool, ws: WebSocketStream<S>, t: Timing)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut events = device.subscribe();
     let (mut out, mut inbound) = ws.split();
 
@@ -213,11 +316,15 @@ async fn stream(app: Arc<App>, name: String, binary: bool, ws: Socket) {
         opening.push(text(json!({"type": "telemetry", "data": *t})));
     }
     for m in opening {
-        if out.send(m).await.is_err() {
+        if !deliver(&mut out, m, t).await {
             return;
         }
     }
 
+    // A quiet stream is pinged, so a viewer that vanished without closing is
+    // eventually noticed and its subscription released.
+    let mut keepalive = tokio::time::interval_at(tokio::time::Instant::now() + t.keepalive, t.keepalive);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let batch: Vec<Message> = tokio::select! {
             ev = events.recv() => match ev {
@@ -236,16 +343,25 @@ async fn stream(app: Arc<App>, name: String, binary: bool, ws: Socket) {
                 Err(RecvError::Closed) => break,
             },
             m = inbound.next() => match m {
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Err(e)) => {
+                    if let Some(close) = close_for(&e) {
+                        let _ = deliver(&mut out, Message::Close(Some(close)), t).await;
+                    }
+                    return;
+                }
                 _ => continue,
             },
+            _ = keepalive.tick() => vec![Message::Ping(bytes::Bytes::new())],
         };
         for m in batch {
-            if out.send(m).await.is_err() {
+            if !deliver(&mut out, m, t).await {
                 return;
             }
         }
+        keepalive.reset();
     }
+    let _ = tokio::time::timeout(t.stalled_send, out.close()).await;
 }
 
 fn frame_event(f: &crate::devices::Frame) -> Value {
@@ -255,21 +371,36 @@ fn frame_event(f: &crate::devices::Frame) -> Value {
 }
 
 async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: Socket) {
+    let t = TIMING;
     let (mut out, mut inbound) = ws.split();
-    if out.send(text(json!({"type": "ready", "agent": agent}))).await.is_err() {
+    if !deliver(&mut out, text(json!({"type": "ready", "agent": agent})), t).await {
         return;
     }
     while let Some(msg) = inbound.next().await {
         let raw = match msg {
             Ok(Message::Text(t)) => t,
-            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(Message::Close(_)) => break,
+            Err(e) => {
+                if let Some(close) = close_for(&e) {
+                    let _ = deliver(&mut out, Message::Close(Some(close)), t).await;
+                }
+                return;
+            }
+            // A binary message used to be ignored without a word, leaving the
+            // client waiting for a result that would never come.
+            Ok(Message::Binary(_)) => {
+                if !deliver(&mut out, error("WC306", "send each turn as a JSON text message"), t).await {
+                    return;
+                }
+                continue;
+            }
             Ok(_) => continue,
         };
         let turn = match parse_turn(&raw, &principal) {
             Ok(t) => t,
             Err((code, e)) => {
-                if out.send(error(code, e)).await.is_err() {
-                    break;
+                if !deliver(&mut out, error(code, e), t).await {
+                    return;
                 }
                 continue;
             }
@@ -289,7 +420,7 @@ async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: S
         let outcome = loop {
             tokio::select! {
                 Some(ev) = rx.recv() => {
-                    if out.send(text(ev)).await.is_err() {
+                    if !deliver(&mut out, text(ev), t).await {
                         return;
                     }
                 }
@@ -297,17 +428,20 @@ async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: S
             }
         };
         while let Ok(ev) = rx.try_recv() {
-            let _ = out.send(text(ev)).await;
+            if !deliver(&mut out, text(ev), t).await {
+                return;
+            }
         }
         let reply = match outcome {
             Ok(Ok(result)) => text(json!({"type": "result", "result": result})),
             Ok(Err(e)) => error(crate::errors::classify_run_error(&e), e),
             Err(_) => error("WC203", "the run exceeded agent_timeout_secs"),
         };
-        if out.send(reply).await.is_err() {
-            break;
+        if !deliver(&mut out, reply, t).await {
+            return;
         }
     }
+    let _ = tokio::time::timeout(t.stalled_send, out.close()).await;
 }
 
 #[derive(Debug)]
@@ -366,6 +500,143 @@ mod tests {
         assert_eq!(v["code"], "WC505");
         assert_eq!(v["hint"], crate::errors::hint("WC505"));
         assert_eq!(v["message"], "telemetry must be JSON");
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    fn device(max_fps: f64) -> Arc<Device> {
+        let def: crate::manifest::DeviceDef =
+            serde_json::from_value(json!({"name": "cam", "max_fps": max_fps, "keep": 2})).unwrap();
+        crate::devices::DeviceHub::new(&[def], reqwest::Client::new()).get("cam").unwrap().clone()
+    }
+
+    async fn server(io: tokio::io::DuplexStream) -> WebSocketStream<tokio::io::DuplexStream> {
+        WebSocketStream::from_raw_socket(io, Role::Server, None).await
+    }
+
+    async fn client(io: tokio::io::DuplexStream) -> WebSocketStream<tokio::io::DuplexStream> {
+        WebSocketStream::from_raw_socket(io, Role::Client, None).await
+    }
+
+    const QUICK: Timing = Timing { stalled_send: Duration::from_millis(300), keepalive: Duration::from_secs(60) };
+
+    /// A masked client frame, written by hand so it can be malformed.
+    fn raw_frame(first: u8, payload: &[u8], mask: bool) -> Vec<u8> {
+        let mut f = vec![first, (if mask { 0x80 } else { 0 }) | payload.len() as u8];
+        let key = [1u8, 2, 3, 4];
+        if mask {
+            f.extend_from_slice(&key);
+        }
+        f.extend(payload.iter().enumerate().map(|(i, b)| if mask { b ^ key[i % 4] } else { *b }));
+        f
+    }
+
+    /// The close code in the first close frame the server wrote back.
+    async fn close_code_after(device: Arc<Device>, bytes: Vec<u8>) -> Option<u16> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (a, mut b) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(ingest_loop(device, server(a).await, QUICK));
+        b.write_all(&bytes).await.unwrap();
+        let mut got = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(10), b.read_to_end(&mut got)).await;
+        task.abort();
+        // Walk the server's (unmasked, short) frames to the close.
+        let mut i = 0;
+        while i + 2 <= got.len() {
+            let (op, mut len, mut at) = (got[i] & 0x0f, (got[i + 1] & 0x7f) as usize, i + 2);
+            if len == 126 {
+                len = u16::from_be_bytes([got[at], got[at + 1]]) as usize;
+                at += 2;
+            }
+            if op == 0x8 {
+                return (len >= 2).then(|| u16::from_be_bytes([got[at], got[at + 1]]));
+            }
+            i = at + len;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn protocol_violations_are_answered_with_the_rfc_close_code() {
+        // Through 2.5.3 the hub dropped the TCP connection without a close
+        // frame, so a client saw 1006 and no reason.
+        let unmasked = raw_frame(0x81, b"{}", false);
+        assert_eq!(close_code_after(device(10.0), unmasked).await, Some(1002));
+        let bad_utf8 = raw_frame(0x81, b"\xff\xfe", true);
+        assert_eq!(close_code_after(device(10.0), bad_utf8).await, Some(1007));
+        let reserved_bits = raw_frame(0xC1, b"{}", true);
+        assert_eq!(close_code_after(device(10.0), reserved_bits).await, Some(1002));
+        let lone_continuation = raw_frame(0x80, b"{}", true);
+        assert_eq!(close_code_after(device(10.0), lone_continuation).await, Some(1002));
+        // A clean close is answered with a close, completing the handshake.
+        let close = raw_frame(0x88, &1000u16.to_be_bytes(), true);
+        assert_eq!(close_code_after(device(10.0), close).await, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn a_device_that_never_reads_its_replies_is_still_read() {
+        // Every one of these frames is refused with an error reply the device
+        // never reads. In 2.5.3 the replies filled the socket and the hub
+        // stopped reading after a couple of thousand; the device then blocked.
+        let d = device(1e9);
+        let (a, b) = tokio::io::duplex(4096);
+        let task = tokio::spawn(ingest_loop(d.clone(), server(a).await, QUICK));
+        let mut cam = client(b).await;
+        let sending = async {
+            for _ in 0..3000 {
+                cam.send(Message::Binary(bytes::Bytes::from_static(b"BM not an image"))).await.unwrap();
+            }
+            cam.send(Message::Binary(bytes::Bytes::from_static(PNG))).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(60), sending).await.expect("the device was blocked");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while d.describe()["frames_in"] != 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(d.describe()["frames_rejected"], 3000);
+        assert_eq!(d.describe()["frames_in"], 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_that_stops_reading_is_let_go() {
+        let d = device(1e9);
+        let (a, _b) = tokio::io::duplex(1024);
+        let task = tokio::spawn(stream_loop(d.clone(), true, server(a).await, QUICK));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while d.describe()["subscribers"] != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut big = PNG.to_vec();
+        big.resize(256 * 1024, 0);
+        d.push_frame(bytes::Bytes::from(big)).unwrap();
+        // The viewer reads nothing; its send stalls, and after stalled_send
+        // the hub lets it go rather than holding it (and its subscription) forever.
+        tokio::time::timeout(Duration::from_secs(30), task).await.expect("the stalled subscriber was held").unwrap();
+        assert_eq!(d.describe()["subscribers"], 0);
+        // Ingest was never held up by it.
+        d.push_frame(bytes::Bytes::from_static(PNG)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_quiet_stream_is_pinged() {
+        let d = device(10.0);
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let t = Timing { stalled_send: Duration::from_secs(5), keepalive: Duration::from_millis(100) };
+        let task = tokio::spawn(stream_loop(d, true, server(a).await, t));
+        let mut viewer = client(b).await;
+        let hello = viewer.next().await.unwrap().unwrap();
+        assert!(hello.to_text().unwrap().contains("hello"));
+        let next = tokio::time::timeout(Duration::from_secs(10), viewer.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(next, Message::Ping(_)), "{next:?}");
+        // And a viewer's close is answered, not cut off.
+        viewer.close(None).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(10), viewer.next()).await.unwrap();
+        assert!(matches!(reply, Some(Ok(Message::Close(_))) | None), "{reply:?}");
+        tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
     }
 
     #[test]

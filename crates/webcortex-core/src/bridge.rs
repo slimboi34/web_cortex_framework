@@ -6,6 +6,37 @@
 
 use crate::http::{WebCortexRequest, WebCortexResponse};
 use futures::future::BoxFuture;
+use std::sync::{Arc, Mutex};
+
+/// The emergency stop, as an actuator's handler sees it.
+///
+/// `App::dispatch` refuses an actuator while halted, but a call it let through
+/// can then wait in the interpreter's queue behind other handlers. Through
+/// 2.5.3 such a call still ran after the stop was pressed: eight queued moves
+/// went ahead up to two seconds after a halt. The interpreter checks the gate
+/// again as the handler starts.
+#[derive(Clone)]
+pub struct HaltGate {
+    state: Arc<Mutex<Option<serde_json::Value>>>,
+    control_prefix: String,
+}
+
+impl HaltGate {
+    pub(crate) fn new(state: Arc<Mutex<Option<serde_json::Value>>>, control_prefix: String) -> Self {
+        Self { state, control_prefix }
+    }
+
+    /// The 423 message while the stop is engaged, or `None` to proceed.
+    pub fn refusal(&self) -> Option<String> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
+        let reason = state.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+        Some(format!(
+            "actuators are halted ({reason}); nothing that moves hardware will run \
+             until an operator releases the stop at {}/release",
+            self.control_prefix
+        ))
+    }
+}
 
 pub trait PyBridge: Send + Sync + 'static {
     /// Dispatch to the Python handler registered at `handler`. Implementations
@@ -16,6 +47,19 @@ pub trait PyBridge: Send + Sync + 'static {
         handler: u32,
         req: WebCortexRequest,
     ) -> BoxFuture<'a, Result<WebCortexResponse, String>>;
+
+    /// Dispatch to an `actuator` handler. `gate` must be checked when the
+    /// handler is about to start, not only when it was queued; a handler
+    /// that finds the stop engaged answers 423 (`WC502`) without running.
+    fn call_actuator<'a>(
+        &'a self,
+        handler: u32,
+        req: WebCortexRequest,
+        gate: HaltGate,
+    ) -> BoxFuture<'a, Result<WebCortexResponse, String>> {
+        let _ = gate;
+        self.call(handler, req)
+    }
 
     /// Run a Behaviour.
     ///

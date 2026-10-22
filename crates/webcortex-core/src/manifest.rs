@@ -1091,6 +1091,11 @@ impl Manifest {
             if !w.every_secs.is_finite() || w.every_secs < 1.0 {
                 return Err(format!("watcher {:?}: every_secs must be at least 1", w.name));
             }
+            // A finite but enormous period overflowed a Duration and panicked
+            // the watcher's task at boot, silently.
+            if std::time::Duration::try_from_secs_f64(w.every_secs).is_err() {
+                return Err(format!("watcher {:?}: every_secs {} is too large", w.name, w.every_secs));
+            }
             if w.max_runs_per_hour == 0 {
                 return Err(format!("watcher {:?}: max_runs_per_hour must be at least 1", w.name));
             }

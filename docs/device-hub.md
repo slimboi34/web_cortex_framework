@@ -36,7 +36,7 @@ app.sensor("dock_env", description="temperature and humidity")
 | `source` | `None` | An HTTP snapshot URL. The camera is pulled whenever a frame is asked for |
 | `headers`, `bearer_env` | — | Credentials for a pulled camera |
 | `keep` | `8` | Frames held in the ring buffer |
-| `max_fps` | `30` | Ingest ceiling. Faster frames are dropped (WebSocket) or refused with 429 (HTTP) |
+| `max_fps` | `30` | Ingest ceiling. Faster frames are dropped (WebSocket) or refused with 429 (HTTP). A frame may arrive up to half an interval early, so a camera sending at exactly `max_fps` with ordinary jitter keeps every frame; the long-run rate never exceeds it |
 | `max_frame_bytes` | 5 MB | Frames larger than this are refused (422 over HTTP; over the socket, a message past it closes the connection with 1009 and a warning in the log) |
 | `ingest_scopes` | `["devices:ingest"]` | Required to send frames and telemetry |
 | `read_scopes` | `["devices:read"]` | Required to read anything back |
@@ -88,6 +88,13 @@ with DeviceConnection("https://hub.example.com", "dock", key=DEVICE_KEY) as cam:
         cam.send_telemetry({"cpu_temp_c": read_cpu_temp()})
 ```
 
+The hub answers a refused frame or reading with an error message. Each send
+first reads any that have arrived, without blocking: `cam.last_error` is the
+newest and `cam.errors` counts them. If the hub closed the socket (a frame over
+`max_frame_bytes` is closed with 1009), the next send raises `WebSocketError`
+saying why. A device that never reads is never stalled by replies it ignores:
+the hub drops them rather than wait.
+
 **A microcontroller** such as an ESP32-CAM sends an HTTP POST:
 
 ```bash
@@ -96,7 +103,9 @@ curl -X POST https://hub.example.com/devices/dock/frames \
 ```
 
 **An IP camera:** set `source=` to its snapshot URL. Nothing is fetched until a
-frame is asked for. RTSP streams need a sidecar such as ffmpeg or go2rtc, which
+frame is asked for, and everyone who asks while a fetch is in flight shares it
+(its frame, or its error), so forty agents and viewers looking at once cost the
+camera one request, not forty. RTSP streams need a sidecar such as ffmpeg or go2rtc, which
 exposes a snapshot URL or pushes frames.
 
 ## Agents that look
@@ -166,6 +175,13 @@ The `/stream` protocol:
 | `{"type": "telemetry", "data": {…}}` | A reading |
 | `{"type": "insight", …}` | A watcher's conclusion |
 | `{"type": "lagged", "skipped": n}` | A slow subscriber missed `n` events. Frames are dropped for it rather than buffered |
+
+A quiet stream is pinged every 30 seconds, and a subscriber that has not read
+a message within 30 seconds of it being sent is disconnected, so a viewer that
+vanished without closing does not hold its subscription forever. Every socket
+answers a protocol violation with the RFC 6455 close code (1002, 1007 for text
+that is not UTF-8, 1009 for a message that is too large) and answers a close
+with a close.
 
 ## Agents over a WebSocket
 
