@@ -176,7 +176,9 @@ app.security_headers(
 ```
 
 HSTS is emitted only over TLS — over plaintext browsers ignore it, and it is a
-footgun in local development.
+footgun in local development. WebCortex itself speaks plain HTTP, so "over TLS"
+means the TLS proxy in front of it said so with `X-Forwarded-Proto: https` or
+`Forwarded: proto=https`. Set `hsts_max_age=0` to never send it.
 
 ### Request limits
 
@@ -185,7 +187,9 @@ footgun in local development.
 | Body size | 32 MB | compile-time |
 | Request timeout | 30s | `request_timeout` (`agent_timeout` on agent, behaviour and flow routes); the body must arrive within it too, or 408 `WC216` |
 | Header read / idle connection | the request timeout, at most 30s | `request_timeout` |
-| Shutdown drain | 25s | `shutdown_timeout` |
+| Shutdown drain | 25s | `shutdown_timeout`; WebSockets are closed with 1001 (going away) |
+| Open connections | 10,000, WebSockets included | `max_connections`; past it a 503 `WC218` and close |
+| Proxied response body | 64 MiB | `app.upstream(..., max_response_bytes=...)`; past it a 502 `WC217` |
 | Invocation depth | 8 | not yet (`server.max_invocation_depth`) |
 
 ## What has been tested

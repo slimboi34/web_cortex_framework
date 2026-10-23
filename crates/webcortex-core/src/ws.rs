@@ -56,6 +56,22 @@ const TIMING: Timing = Timing { stalled_send: Duration::from_secs(30), keepalive
 /// Replies queued for a device before further ones are dropped.
 const INGEST_REPLIES: usize = 16;
 
+/// Set at server shutdown. A dropped sender (tests, an App never served)
+/// means no shutdown is coming.
+type Stop = tokio::sync::watch::Receiver<bool>;
+
+/// Resolves when shutdown begins; never, if it cannot.
+async fn stopped(stop: &mut Stop) {
+    if stop.wait_for(|s| *s).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The close a socket gets when the server shuts down (RFC 6455 §7.4.1).
+fn going_away() -> Message {
+    Message::Close(Some(CloseFrame { code: CloseCode::Away, reason: "server shutting down".into() }))
+}
+
 /// True for a WebSocket upgrade request.
 pub fn is_upgrade(headers: &BTreeMap<String, String>) -> bool {
     headers
@@ -117,9 +133,18 @@ pub fn accept(
     let Some(key) = headers.get("sec-websocket-key") else {
         return WebCortexResponse::error(400, "missing sec-websocket-key");
     };
+    // The socket outlives the connection task that upgraded it, so it holds
+    // its own place under max_connections, and its own shutdown watch.
+    let Some(slot) = app.admit_connection() else {
+        let mut res = WebCortexResponse::coded(503, "WC218", "too many open connections; retry shortly");
+        res.headers.push(("retry-after".into(), "1".into()));
+        return res;
+    };
+    let stop = app.shutdown_watch();
     let accept_key = derive_accept_key(key.as_bytes());
     let on_upgrade = hyper::upgrade::on(req);
     tokio::spawn(async move {
+        let _slot = slot;
         let upgraded = match on_upgrade.await {
             Ok(u) => u,
             Err(e) => {
@@ -132,9 +157,9 @@ pub fn accept(
             .max_frame_size(Some(max_message));
         let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(config)).await;
         match mode {
-            Mode::Ingest { device } => ingest(app, device, principal, ws).await,
-            Mode::Stream { device, binary } => stream(app, device, binary, ws).await,
-            Mode::Agent { agent } => agent_session(app, agent, principal, ws).await,
+            Mode::Ingest { device } => ingest(app, device, principal, ws, stop).await,
+            Mode::Stream { device, binary } => stream(app, device, binary, ws, stop).await,
+            Mode::Agent { agent } => agent_session(app, agent, principal, ws, stop).await,
         }
     });
 
@@ -164,13 +189,13 @@ fn error(code: &str, message: impl Into<String>) -> Message {
     }))
 }
 
-async fn ingest<S>(app: Arc<App>, name: String, principal: Principal, ws: WebSocketStream<S>)
+async fn ingest<S>(app: Arc<App>, name: String, principal: Principal, ws: WebSocketStream<S>, stop: Stop)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Some(device) = app.devices().get(&name).cloned() else { return };
     tracing::info!(device = %name, principal = %principal.id, "device connected");
-    ingest_loop(device, ws, TIMING).await;
+    ingest_loop(device, ws, TIMING, stop).await;
     tracing::info!(device = %name, "device disconnected");
 }
 
@@ -182,7 +207,7 @@ where
 /// one and stopped reading frames: the device then blocked too, for good.
 /// Now a reply that does not fit in the queue is dropped; `frames_rejected`
 /// still counts every refusal.
-async fn ingest_loop<S>(device: Arc<Device>, mut ws: WebSocketStream<S>, t: Timing)
+async fn ingest_loop<S>(device: Arc<Device>, mut ws: WebSocketStream<S>, t: Timing, mut stop: Stop)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -194,7 +219,17 @@ where
     let (out, mut inbound) = ws.split();
     let (replies, queue) = tokio::sync::mpsc::channel::<Message>(INGEST_REPLIES);
     let writer = tokio::spawn(write_replies(out, queue, t));
-    while let Some(msg) = inbound.next().await {
+    loop {
+        let msg = tokio::select! {
+            m = inbound.next() => match m {
+                Some(m) => m,
+                None => break,
+            },
+            _ = stopped(&mut stop) => {
+                let _ = replies.send(going_away()).await;
+                break;
+            }
+        };
         let reply = match msg {
             Ok(Message::Binary(data)) => match device.push_frame(data) {
                 // Dropping a frame that came too fast is the point of max_fps,
@@ -288,15 +323,15 @@ fn close_for(e: &WsError) -> Option<CloseFrame> {
     Some(CloseFrame { code, reason: reason.into() })
 }
 
-async fn stream<S>(app: Arc<App>, name: String, binary: bool, ws: WebSocketStream<S>)
+async fn stream<S>(app: Arc<App>, name: String, binary: bool, ws: WebSocketStream<S>, stop: Stop)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Some(device) = app.devices().get(&name).cloned() else { return };
-    stream_loop(device, binary, ws, TIMING).await;
+    stream_loop(device, binary, ws, TIMING, stop).await;
 }
 
-async fn stream_loop<S>(device: Arc<Device>, binary: bool, ws: WebSocketStream<S>, t: Timing)
+async fn stream_loop<S>(device: Arc<Device>, binary: bool, ws: WebSocketStream<S>, t: Timing, mut stop: Stop)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -353,6 +388,10 @@ where
                 _ => continue,
             },
             _ = keepalive.tick() => vec![Message::Ping(bytes::Bytes::new())],
+            _ = stopped(&mut stop) => {
+                let _ = deliver(&mut out, going_away(), t).await;
+                break;
+            }
         };
         for m in batch {
             if !deliver(&mut out, m, t).await {
@@ -374,19 +413,31 @@ fn frame_event(f: &crate::devices::Frame) -> Value {
 /// it finishes; past this many the extra ones are refused, not buffered.
 const MAX_QUEUED_TURNS: usize = 8;
 
-async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: Socket) {
+async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: Socket, mut stop: Stop) {
     let t = TIMING;
     let (mut out, mut inbound) = ws.split();
     if !deliver(&mut out, text(json!({"type": "ready", "agent": agent})), t).await {
         return;
     }
     let mut queued: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
+    // A turn in flight at shutdown is finished; the socket closes before the
+    // next one, queued or not.
     loop {
+        if *stop.borrow() {
+            let _ = deliver(&mut out, going_away(), t).await;
+            break;
+        }
         let msg = match queued.pop_front() {
             Some(m) => Ok(m),
-            None => match inbound.next().await {
-                Some(m) => m,
-                None => break,
+            None => tokio::select! {
+                m = inbound.next() => match m {
+                    Some(m) => m,
+                    None => break,
+                },
+                _ = stopped(&mut stop) => {
+                    let _ = deliver(&mut out, going_away(), t).await;
+                    break;
+                }
             },
         };
         let raw = match msg {
@@ -556,6 +607,11 @@ mod tests {
         WebSocketStream::from_raw_socket(io, Role::Client, None).await
     }
 
+    /// A shutdown watch whose sender is gone: shutdown never comes.
+    fn no_stop() -> Stop {
+        tokio::sync::watch::channel(false).1
+    }
+
     const QUICK: Timing = Timing { stalled_send: Duration::from_millis(300), keepalive: Duration::from_secs(60) };
 
     /// A masked client frame, written by hand so it can be malformed.
@@ -573,7 +629,7 @@ mod tests {
     async fn close_code_after(device: Arc<Device>, bytes: Vec<u8>) -> Option<u16> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (a, mut b) = tokio::io::duplex(64 * 1024);
-        let task = tokio::spawn(ingest_loop(device, server(a).await, QUICK));
+        let task = tokio::spawn(ingest_loop(device, server(a).await, QUICK, no_stop()));
         b.write_all(&bytes).await.unwrap();
         let mut got = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(10), b.read_to_end(&mut got)).await;
@@ -618,7 +674,7 @@ mod tests {
         // stopped reading after a couple of thousand; the device then blocked.
         let d = device(1e9);
         let (a, b) = tokio::io::duplex(4096);
-        let task = tokio::spawn(ingest_loop(d.clone(), server(a).await, QUICK));
+        let task = tokio::spawn(ingest_loop(d.clone(), server(a).await, QUICK, no_stop()));
         let mut cam = client(b).await;
         let sending = async {
             for _ in 0..3000 {
@@ -640,7 +696,7 @@ mod tests {
     async fn a_subscriber_that_stops_reading_is_let_go() {
         let d = device(1e9);
         let (a, _b) = tokio::io::duplex(1024);
-        let task = tokio::spawn(stream_loop(d.clone(), true, server(a).await, QUICK));
+        let task = tokio::spawn(stream_loop(d.clone(), true, server(a).await, QUICK, no_stop()));
         tokio::time::timeout(Duration::from_secs(10), async {
             while d.describe()["subscribers"] != 1 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -664,7 +720,7 @@ mod tests {
         let d = device(10.0);
         let (a, b) = tokio::io::duplex(64 * 1024);
         let t = Timing { stalled_send: Duration::from_secs(5), keepalive: Duration::from_millis(100) };
-        let task = tokio::spawn(stream_loop(d, true, server(a).await, t));
+        let task = tokio::spawn(stream_loop(d, true, server(a).await, t, no_stop()));
         let mut viewer = client(b).await;
         let hello = viewer.next().await.unwrap().unwrap();
         assert!(hello.to_text().unwrap().contains("hello"));
@@ -675,6 +731,35 @@ mod tests {
         let reply = tokio::time::timeout(Duration::from_secs(10), viewer.next()).await.unwrap();
         assert!(matches!(reply, Some(Ok(Message::Close(_))) | None), "{reply:?}");
         tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_sockets_with_going_away() {
+        // Through 2.6.0 a shutdown cut every socket with no close frame; a
+        // client saw 1006 and could not tell a deploy from a crash.
+        for ingest in [true, false] {
+            let d = device(10.0);
+            let (a, b) = tokio::io::duplex(64 * 1024);
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let task = if ingest {
+                tokio::spawn(ingest_loop(d, server(a).await, QUICK, rx))
+            } else {
+                tokio::spawn(stream_loop(d, true, server(a).await, QUICK, rx))
+            };
+            let mut peer = client(b).await;
+            let first = peer.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Text(_)), "{first:?}");
+            tx.send_replace(true);
+            let close = loop {
+                match tokio::time::timeout(Duration::from_secs(10), peer.next()).await.unwrap() {
+                    Some(Ok(Message::Close(c))) => break c,
+                    Some(Ok(_)) => continue,
+                    other => panic!("no close frame: {other:?}"),
+                }
+            };
+            assert_eq!(close.map(|c| u16::from(c.code)), Some(1001), "ingest={ingest}");
+            tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
+        }
     }
 
     #[test]

@@ -13,7 +13,11 @@ pub struct WebCortexRequest {
     pub method: String,
     pub path: String,
     pub path_params: BTreeMap<String, String>,
+    /// One value per key: the last, when a key repeats.
     pub query: BTreeMap<String, String>,
+    /// Every query pair in order, repeats included (`?tag=a&tag=b`). Empty for
+    /// synthetic requests that only set [`Self::query`].
+    pub query_all: Vec<(String, String)>,
     pub headers: BTreeMap<String, String>,
     pub body: Bytes,
     /// Set once the router has matched. `None` for synthetic in-process calls.
@@ -40,6 +44,7 @@ impl WebCortexRequest {
             path: path.to_string(),
             path_params: BTreeMap::new(),
             query: BTreeMap::new(),
+            query_all: Vec::new(),
             headers: BTreeMap::new(),
             body: Bytes::new(),
             route_id: None,
@@ -255,16 +260,40 @@ impl WebCortexResponse {
     }
 }
 
+/// The query string as a map: a repeated key keeps its last value.
 pub fn parse_query(raw: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for pair in raw.split('&').filter(|s| !s.is_empty()) {
-        let (k, v) = match pair.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (pair, ""),
-        };
-        out.insert(percent_decode(k, true), percent_decode(v, true));
+    parse_query_pairs(raw).into_iter().collect()
+}
+
+/// Every pair in the query string, in order, repeats included.
+pub fn parse_query_pairs(raw: &str) -> Vec<(String, String)> {
+    raw.split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode(k, true), percent_decode(v, true))
+        })
+        .collect()
+}
+
+impl WebCortexRequest {
+    /// Every value given for a query key, in order. Falls back to the single
+    /// value in [`Self::query`] for a request built without the pairs.
+    pub fn query_values(&self, name: &str) -> Vec<&str> {
+        if self.query_all.is_empty() {
+            return self.query.get(name).map(String::as_str).into_iter().collect();
+        }
+        self.query_all.iter().filter(|(k, _)| k == name).map(|(_, v)| v.as_str()).collect()
     }
-    out
+
+    /// The pairs to forward: all of them when known, else the map.
+    pub fn query_pairs(&self) -> Vec<(&str, &str)> {
+        if self.query_all.is_empty() {
+            self.query.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        } else {
+            self.query_all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        }
+    }
 }
 
 /// Decode `%XX` escapes, and `+` as a space when `plus_as_space` (query
@@ -365,5 +394,23 @@ mod tests {
     fn a_percent_before_a_multibyte_character_does_not_panic() {
         assert_eq!(percent_decode("%aé", false), "%aé");
         assert_eq!(percent_decode("x%é%2F", true), "x%é/");
+    }
+
+    #[test]
+    fn repeated_query_keys_are_all_kept() {
+        let pairs = parse_query_pairs("tag=a&x=1&tag=b+c&tag");
+        assert_eq!(pairs.iter().filter(|(k, _)| k == "tag").count(), 3);
+        // The map keeps the last value, as it always has.
+        assert_eq!(parse_query("tag=a&tag=b")["tag"], "b");
+        let mut req = WebCortexRequest::synthetic("GET", "/");
+        req.query_all = pairs;
+        req.query = req.query_all.iter().cloned().collect();
+        assert_eq!(req.query_values("tag"), vec!["a", "b c", ""]);
+        assert_eq!(req.query_values("nope"), Vec::<&str>::new());
+        // A request built with only the map still answers.
+        let mut bare = WebCortexRequest::synthetic("GET", "/");
+        bare.query.insert("x".into(), "1".into());
+        assert_eq!(bare.query_values("x"), vec!["1"]);
+        assert_eq!(bare.query_pairs(), vec![("x", "1")]);
     }
 }

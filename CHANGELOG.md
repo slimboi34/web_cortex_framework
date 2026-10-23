@@ -5,23 +5,46 @@ bumps could contain breaking changes.
 
 ## [Unreleased]
 
-### Fixed
-
-- **An endless generator no longer runs the server out of memory.** A handler, behaviour or
-  tool that returned a generator (sync or async, or one nested in the result) had it collected
-  with no bound, so an endless one grew until the process was killed, and kept growing after
-  the caller timed out. Collection now stops at `WEBCORTEX_MAX_RESULT_ITEMS` (default 100,000)
-  or `WEBCORTEX_MAX_RESULT_BYTES` (default 64 MiB) with the new code **WC406**, and stops as
-  soon as the caller has gone (504, WC203). Either way the generator is closed, so its
-  `finally` blocks run.
+Closes the issues 2.6.0 left open: the connection and proxy caps, session turns, agent
+WebSockets, HSTS, repeated query keys, the WebSocket drain on shutdown, and endless
+generators.
 
 ### Added
 
+- `WebCortex(max_connections=10_000)`: a ceiling on open connections, WebSockets included.
+  Past it a new connection is answered `503` (`WC218`, `retry-after: 1`) and closed straight
+  from the accept loop, so a flood costs no task. `0` removes the cap.
+- `app.upstream(..., max_response_bytes=64 MiB)`, and error code `WC217`.
+- `Request.query_list(name)`: every value of a repeated query key, in order.
 - Error code `WC406` (Returned generator too large). A behaviour failure that carries a
   code from the bridge now keeps it instead of becoming WC003.
 
-### Fixed — agents and MCP
+### Changed
 
+- **An unknown tool in MCP `tools/call` is now a JSON-RPC error** `-32602` with
+  `data.code` `WC314`, as MCP 2025-06-18 specifies. It used to be a tool result with
+  `isError: true`. A tool that exists but the caller cannot use is still a tool error.
+- **A list-typed handler parameter now receives every value of a repeated query key**, so
+  `?tag=a` gives `["a"]` rather than the bare string `"a"`.
+
+### Fixed
+
+- **Connections had no global cap.** Each idle socket held a task and a descriptor for the
+  header timeout, with nothing bounding how many.
+- **The proxy buffered upstream responses without limit.** A body over `max_response_bytes`
+  is now a `502` `WC217`: refused on its declared length before it is read, or cut off once
+  an undeclared one passes the cap.
+- **HSTS was never sent.** WebCortex serves plain HTTP behind a TLS proxy, so the configured
+  `Strict-Transport-Security` header never went out. It is now sent when the proxy reports
+  `X-Forwarded-Proto: https` or `Forwarded: proto=https`.
+- **Repeated query keys kept only the last value.** A handler parameter typed `list[X]`,
+  `tuple`, `set` or `Sequence` now receives every value (`?tag=a&tag=b` → `["a", "b"]`, and
+  `?tag=a` → `["a"]`); scalar parameters and `req.query` still keep the last. Proxy routes
+  forward repeated keys to the upstream, and a list argument to a GET tool becomes repeated keys.
+- **WebSockets were not drained on shutdown.** They outlive the connection that upgraded
+  them, so the drain never waited for them and the process exit cut them with no close
+  frame. Each now sends a `1001` (going away) close, and the drain waits for them, within
+  `shutdown_timeout`. An agent turn in flight finishes first.
 - **Concurrent turns on one session are no longer lost.** Each turn loaded the same
   history and the last one to finish saved over the others. Turns on a session now run
   one after another, in arrival order. A nested run (an agent reached as a tool) does not
@@ -34,12 +57,13 @@ bumps could contain breaking changes.
   between turns, so the run kept going, and kept paying for model calls, until the
   model's step came back. Turns sent ahead are queued (up to 8) and answered in order;
   beyond that they get a `WC306` error.
-
-### Changed
-
-- **An unknown tool in MCP `tools/call` is now a JSON-RPC error** `-32602` with
-  `data.code` `WC314`, as MCP 2025-06-18 specifies. It used to be a tool result with
-  `isError: true`. A tool that exists but the caller cannot use is still a tool error.
+- **An endless generator no longer runs the server out of memory.** A handler, behaviour or
+  tool that returned a generator (sync or async, or one nested in the result) had it collected
+  with no bound, so an endless one grew until the process was killed, and kept growing after
+  the caller timed out. Collection now stops at `WEBCORTEX_MAX_RESULT_ITEMS` (default 100,000)
+  or `WEBCORTEX_MAX_RESULT_BYTES` (default 64 MiB) with the new code **WC406**, and stops as
+  soon as the caller has gone (504, WC203). Either way the generator is closed, so its
+  `finally` blocks run.
 
 ## [2.6.0] — 2026-10-22
 

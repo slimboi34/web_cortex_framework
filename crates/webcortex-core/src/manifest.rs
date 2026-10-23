@@ -702,8 +702,16 @@ pub struct ServerConfig {
     /// a machine that moves should wait for an operator to release it.
     #[serde(default)]
     pub start_halted: bool,
+    /// Ceiling on open connections, WebSockets included. Past it a new
+    /// connection is answered `503` and closed at once, so a flood of idle
+    /// sockets cannot exhaust file descriptors or memory. `0` means no cap.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 }
 
+fn default_max_connections() -> usize {
+    10_000
+}
 fn default_max_depth() -> u32 {
     8
 }
@@ -751,6 +759,7 @@ impl Default for ServerConfig {
             session_ttl_secs: default_session_ttl(),
             approval_ttl_secs: default_approval_ttl(),
             start_halted: false,
+            max_connections: default_max_connections(),
         }
     }
 }
@@ -782,10 +791,18 @@ pub struct Upstream {
     pub bearer_env: Option<String>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// The largest upstream response body a proxy route will relay. The body
+    /// is buffered, so without a ceiling one huge (or endless) upstream
+    /// response held that much memory per request.
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: usize,
 }
 
 fn default_timeout_ms() -> u64 {
     30_000
+}
+fn default_max_response_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

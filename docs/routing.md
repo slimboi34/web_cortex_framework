@@ -167,7 +167,8 @@ or `@app.route(method, path)`.
 | `req.method` | `str` | |
 | `req.path` | `str` | |
 | `req.params` | `dict` | Path parameters |
-| `req.query` | `dict` | Query string |
+| `req.query` | `dict` | Query string; a repeated key keeps its last value |
+| `req.query_list(name)` | `list[str]` | Every value of a query key, in order (`?tag=a&tag=b`) |
 | `req.headers` | `dict` | Lower-cased keys |
 | `req.body` | `bytes` | Raw |
 | `req.json()` | `Any` | Parsed and cached |

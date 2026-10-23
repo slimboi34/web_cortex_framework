@@ -14,7 +14,7 @@
 
 use crate::app::App;
 use crate::auth::Principal;
-use crate::http::{WebCortexRequest, WebCortexResponse, parse_query};
+use crate::http::{WebCortexRequest, WebCortexResponse, parse_query_pairs};
 use crate::{mcp, middleware, openapi};
 use bytes::Bytes;
 use futures::FutureExt;
@@ -31,6 +31,21 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// The whole answer to a connection over `max_connections`: written straight
+/// to the socket, which is then closed.
+static TOO_MANY_CONNECTIONS: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+    let body = serde_json::json!({"error": {
+        "status": 503, "code": "WC218", "message": "too many open connections; retry shortly",
+        "hint": crate::errors::hint("WC218"),
+    }})
+    .to_string();
+    format!(
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\nretry-after: 1\r\n\
+         connection: close\r\nx-webcortex-error: WC218\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+});
 /// How much of an oversized body is read and thrown away before the 413, and
 /// for how long. Closing on a client that is still sending resets the
 /// connection, and the reset destroys the 413 before the client reads it;
@@ -116,10 +131,19 @@ where
                         continue;
                     }
                 };
+                // Past max_connections a connection is answered and closed
+                // here, without a task, so a flood costs the server nothing
+                // more than the accept. 2.6.0 had no ceiling at all.
+                let Some(slot) = app.admit_connection() else {
+                    tracing::debug!(%peer, max = cfg.max_connections, "connection refused: max_connections open");
+                    let _ = stream.try_write(&TOO_MANY_CONNECTIONS);
+                    continue;
+                };
                 let app = app.clone();
                 let header_timeout = header_read_timeout(app.manifest.server.request_timeout_secs);
                 let mut stop = stop_rx.clone();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     // hyper's header timeout starts once it reads; the auto
                     // builder's protocol sniff before that waits forever, so
                     // a client that connects and sends nothing is dropped here.
@@ -196,12 +220,17 @@ where
     drop(listener);
     drop(stop_rx);
     let _ = stop_tx.send(true);
+    // WebSockets outlive the connection task that upgraded them, so they are
+    // told separately: each sends a 1001 close and its task ends. Through
+    // 2.6.0 they were simply cut when the process exited.
     let deadline = std::time::Duration::from_secs(cfg.shutdown_timeout_secs);
-    match tokio::time::timeout(deadline, stop_tx.closed()).await {
-        Ok(()) => tracing::info!("all connections drained; exiting"),
+    let drained = async { tokio::join!(stop_tx.closed(), app.close_sockets()) };
+    match tokio::time::timeout(deadline, drained).await {
+        Ok(_) => tracing::info!("all connections drained; exiting"),
         Err(_) => tracing::warn!(
             timeout_secs = cfg.shutdown_timeout_secs,
             open = stop_tx.receiver_count(),
+            websockets = app.open_sockets(),
             "drain timed out; exiting with connections still open"
         ),
     }
@@ -322,6 +351,27 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Tracked<T> {
     }
 }
 
+/// Whether the client reached us over TLS, by the proxy's account:
+/// `X-Forwarded-Proto: https` or `Forwarded: proto=https` (the first hop).
+fn forwarded_https(headers: &hyper::HeaderMap) -> bool {
+    let first = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(|v| v.trim().to_ascii_lowercase())
+    };
+    if let Some(proto) = first("x-forwarded-proto") {
+        return proto == "https";
+    }
+    first("forwarded").is_some_and(|hop| {
+        hop.split(';').any(|kv| {
+            kv.split_once('=')
+                .is_some_and(|(k, v)| k.trim() == "proto" && v.trim().trim_matches('"') == "https")
+        })
+    })
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -346,6 +396,10 @@ async fn shutdown_signal() {
 
 async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Response<Full<Bytes>> {
     let started = std::time::Instant::now();
+    // The server speaks plain HTTP; TLS ends at a proxy, which says so. A
+    // forged header only earns its sender an HSTS header their own browser
+    // ignores over plain HTTP, so it needs no trust check.
+    let https = forwarded_https(req.headers());
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
@@ -416,7 +470,7 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
     // X-Frame-Options are worse than either).
     res.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("x-request-id"));
     res.headers.push(("x-request-id".into(), request_id.clone()));
-    for (k, v) in middleware::security_headers(&app.manifest.security_headers, false) {
+    for (k, v) in middleware::security_headers(&app.manifest.security_headers, https) {
         push_absent(&mut res.headers, k, v);
     }
     dedupe_content_type(&mut res.headers);
@@ -460,7 +514,8 @@ async fn route_request(
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
-    let query = parse_query(uri.query().unwrap_or(""));
+    let query_all = parse_query_pairs(uri.query().unwrap_or(""));
+    let query: std::collections::BTreeMap<String, String> = query_all.iter().cloned().collect();
 
     let mut headers = collect_headers(req.headers());
     // HTTP/2 carries the host as the `:authority` pseudo-header, never as
@@ -609,6 +664,7 @@ async fn route_request(
             path,
             path_params: Default::default(),
             query,
+            query_all,
             headers,
             body,
             route_id: None,
@@ -1222,5 +1278,32 @@ mod tests {
         assert!(!is_plain_request_id("a b"));
         assert!(!is_plain_request_id("<script>"));
         assert!(!is_plain_request_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn https_is_read_from_the_proxys_headers() {
+        let h = |pairs: &[(&'static str, &'static str)]| {
+            let mut m = hyper::HeaderMap::new();
+            for (k, v) in pairs {
+                m.insert(*k, hyper::header::HeaderValue::from_static(v));
+            }
+            m
+        };
+        assert!(!forwarded_https(&h(&[])));
+        assert!(forwarded_https(&h(&[("x-forwarded-proto", "HTTPS")])));
+        assert!(forwarded_https(&h(&[("x-forwarded-proto", "https, http")])), "the first hop counts");
+        assert!(!forwarded_https(&h(&[("x-forwarded-proto", "http")])));
+        assert!(forwarded_https(&h(&[("forwarded", "for=1.2.3.4;proto=\"https\";host=a")])));
+        assert!(!forwarded_https(&h(&[("forwarded", "for=1.2.3.4;proto=http")])));
+    }
+
+    #[test]
+    fn the_connection_refusal_is_a_complete_response() {
+        let text = String::from_utf8(TOO_MANY_CONNECTIONS.clone()).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 503 "));
+        assert!(head.contains(&format!("content-length: {}", body.len())));
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["error"]["code"], "WC218");
     }
 }
