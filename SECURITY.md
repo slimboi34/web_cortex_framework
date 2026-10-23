@@ -294,7 +294,8 @@ request path become a 500; default bind `127.0.0.1`. `cargo audit` and
   `webcortex security` warns about unscoped actuators.
 - **Image URLs returned by tools** are not checked (finding 4 covers caller
   input), and a public name resolving to a private address is not caught.
-- **Proxy responses** are buffered whole. The upstream is the operator's.
+- **Proxy responses** are buffered whole, up to `max_response_bytes` (64 MiB by
+  default); past it the route answers `502` (`WC217`).
 
 ## Review — 2.5.0 (diagnostics)
 
@@ -355,8 +356,8 @@ fixes with a security impact; `tests/test_stress_*.py` holds a regression test f
       no longer pin a task;
     - a behaviour returning a self-referential value no longer overflows the server's
       stack.
-  - Still open: there is no global connection cap, and the proxy buffers upstream
-    responses without a size cap.
+  - Closed in 2.6.1: connections are capped (`max_connections`, `WC218`), and the proxy
+    caps buffered upstream responses (`max_response_bytes`, `WC217`).
 - **Disclosure:** a response that fails to serialise no longer sends its traceback to
   the client.
 
