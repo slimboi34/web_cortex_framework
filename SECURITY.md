@@ -356,7 +356,7 @@ fixes with a security impact; `tests/test_stress_*.py` holds a regression test f
       no longer pin a task;
     - a behaviour returning a self-referential value no longer overflows the server's
       stack.
-  - Closed in 2.6.1: connections are capped (`max_connections`, `WC218`), and the proxy
+  - Closed in 2.7.0: connections are capped (`max_connections`, `WC218`), and the proxy
     caps buffered upstream responses (`max_response_bytes`, `WC217`).
 - **Disclosure:** a response that fails to serialise no longer sends its traceback to
   the client.

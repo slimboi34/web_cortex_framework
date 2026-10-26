@@ -3,7 +3,7 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
-## [Unreleased]
+## [2.7.0] — 2026-10-26
 
 Closes the issues 2.6.0 left open: the connection and proxy caps, session turns, agent
 WebSockets, HSTS, repeated query keys, the WebSocket drain on shutdown, and endless
