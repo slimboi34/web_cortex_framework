@@ -23,4 +23,19 @@ ignore = [
     #   * jsonwebtoken switches to `aws_lc_rs`, which drops the `rsa` crate
     #     entirely and would let this exception be removed.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0387 — timing variability in constant-time operations in
+    # `crypto-bigint` 0.5.x. Fixed in 0.7.6, but 0.5 is what `elliptic-curve`
+    # 0.13 requires, reached as webcortex-core -> jsonwebtoken 11.1 (the latest
+    # release) -> p256/p384 -> elliptic-curve -> crypto-bigint.
+    #
+    # Not exploitable in WebCortex as written, for the reason given above:
+    # the elliptic-curve code only *verifies* ES256/ES384 signatures, and every
+    # input to verification (the public key, the token, its signature) is
+    # public. A timing leak has no secret to reveal. The one `EncodingKey` in
+    # the codebase is an HMAC secret inside `#[cfg(test)]`.
+    #
+    # Re-evaluate when jsonwebtoken moves to elliptic-curve 0.14 (drop this
+    # entry then), or if WebCortex ever signs with an EC private key.
+    "RUSTSEC-2026-0387",
 ]

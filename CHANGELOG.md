@@ -9,6 +9,13 @@ Closes the issues 2.6.0 left open: the connection and proxy caps, session turns,
 WebSockets, HSTS, repeated query keys, the WebSocket drain on shutdown, and endless
 generators.
 
+### Security
+
+- `ctutils` updated to 0.4.6 (RUSTSEC-2026-0385). RUSTSEC-2026-0387 (`crypto-bigint` 0.5,
+  through `jsonwebtoken` 11.1, its latest release) has no compatible fix yet. WebCortex only
+  verifies EC signatures, which uses no secret, so it is listed in `.cargo/audit.toml` with
+  that reasoning.
+
 ### Added
 
 - `WebCortex(max_connections=10_000)`: a ceiling on open connections, WebSockets included.
@@ -57,6 +64,10 @@ generators.
   between turns, so the run kept going, and kept paying for model calls, until the
   model's step came back. Turns sent ahead are queued (up to 8) and answered in order;
   beyond that they get a `WC306` error.
+- **A refused connection gets its 503.** Closing a socket with the request still unread
+  made the kernel send a reset, which could discard the 503 before the client read it.
+  The write side is shut first and the request read for a moment (at most 500 ms, 256
+  connections at a time).
 - **An endless generator no longer runs the server out of memory.** A handler, behaviour or
   tool that returned a generator (sync or async, or one nested in the result) had it collected
   with no bound, so an endless one grew until the process was killed, and kept growing after
@@ -64,6 +75,8 @@ generators.
   or `WEBCORTEX_MAX_RESULT_BYTES` (default 64 MiB) with the new code **WC406**, and stops as
   soon as the caller has gone (504, WC203). Either way the generator is closed, so its
   `finally` blocks run.
+  A behaviour's result is judged by its own caller, not by a finished call's check left
+  on the thread, which on a slow machine had failed it as "could not be serialised".
 
 ## [2.6.0] — 2026-10-22
 

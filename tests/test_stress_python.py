@@ -692,6 +692,63 @@ def test_a_slow_endless_async_generator_stops_once_the_caller_is_gone():
         d.shutdown()
 
 
+def test_a_finished_calls_caller_check_does_not_leak_to_the_next_call_on_the_thread():
+    # The "has the caller gone?" check is set per call and reset after it, so
+    # a reused worker never judges a later call by a finished caller.
+    seen = []
+
+    def handler(req):
+        seen.append(_bridge._ABANDONED.get())
+        return {"ok": True}
+
+    d = Dispatcher([handler], workers=1)
+    try:
+        for _ in range(2):
+            c = FakeCompleter()
+            d.submit(0, dict(RAW), c)
+            assert c.wait()[0] == "complete"
+        gone = _GivesUp(-1)
+        d.submit(0, dict(RAW), gone)
+        gone.wait()
+        # The next call on the same (only) worker thread, from a caller with
+        # no check of its own, must not inherit the gone caller's.
+        later = FakeCompleter()
+        d.submit(0, dict(RAW), later)
+        later.wait()
+        assert seen[-1] is None, "the finished caller's check leaked"
+    finally:
+        d.shutdown()
+    assert _bridge._ABANDONED.get() is None
+
+
+def test_a_behaviour_result_uses_its_own_caller_check(monkeypatch):
+    # A behaviour's result was collected under whatever check the thread
+    # last held. A finished caller's check reported "gone", so on a slow
+    # machine an endless behaviour failed as "could not be serialised"
+    # instead of WC406.
+    import concurrent.futures
+
+    token = _bridge._ABANDONED.set(lambda: True)  # a stale, finished caller
+    try:
+        f = concurrent.futures.Future()
+        f.set_result({"rows": (i for i in range(10))})
+        got = []
+
+        class Behaviour:  # a behaviour's completer: complete(value) / fail(message)
+            complete = got.append
+            fail = got.append
+
+            @staticmethod
+            def abandoned():
+                return False
+
+        monkeypatch.setattr(_bridge, "_CHECK_EVERY", 0)
+        _bridge._settle_behaviour(f, Behaviour())
+        assert got == [{"rows": list(range(10))}], got
+    finally:
+        _bridge._ABANDONED.reset(token)
+
+
 def test_the_result_caps_are_read_from_the_environment():
     code = ("import webcortex._bridge as b; print(b.MAX_RESULT_ITEMS, b.MAX_RESULT_BYTES)")
     env = {**os.environ, "WEBCORTEX_MAX_RESULT_ITEMS": "7", "WEBCORTEX_MAX_RESULT_BYTES": "nope"}

@@ -63,6 +63,8 @@ MAX_RESULT_BYTES = _env_limit("WEBCORTEX_MAX_RESULT_BYTES", 64 * 1024 * 1024)
 
 # The current call's "has the caller gone?" check, so collection deep inside
 # the JSON encoder can stop pulling once nobody is waiting for the answer.
+# How often (seconds) a collection asks whether its caller is still there.
+_CHECK_EVERY = 0.05
 _ABANDONED: contextvars.ContextVar[Callable[[], bool] | None] = contextvars.ContextVar(
     "webcortex_abandoned", default=None)
 
@@ -418,7 +420,7 @@ class _Collector:
                 "whole, so an endless or very large generator cannot be returned")
         if self.abandoned is not None:
             now = time.monotonic()
-            if now - self.checked >= 0.05:
+            if now - self.checked >= _CHECK_EVERY:
                 self.checked = now
                 if self.abandoned():
                     raise _CallerGone()
@@ -672,25 +674,32 @@ async def _drain(value: Any) -> Any:
 
 
 async def _run_async(coro_fn: Callable[[], Any], completer: Any = None) -> Any:
-    _ABANDONED.set(getattr(completer, "abandoned", None))
+    token = _ABANDONED.set(getattr(completer, "abandoned", None))
     try:
         return await _drain(coro_fn())
     except (SystemExit, KeyboardInterrupt) as e:
         raise _HandlerExit(f"handler raised {type(e).__name__}({e})") from e
+    finally:
+        _ABANDONED.reset(token)
 
 
 def _run_sync(handler: Callable[[Any], Any], req: Any, completer: Any = None) -> Any:
-    _ABANDONED.set(getattr(completer, "abandoned", None))
+    # Reset afterwards: worker threads are reused, and a check left behind
+    # would report the *next* call's caller as gone once this one finished.
+    token = _ABANDONED.set(getattr(completer, "abandoned", None))
     try:
-        result = handler(req)
-    except (SystemExit, KeyboardInterrupt) as e:
-        raise _HandlerExit(f"handler raised {type(e).__name__}({e})") from e
-    # A sync callable can still hand back a coroutine — a decorator that
-    # forgot to be async, a callable object with `async def __call__`. Run it
-    # to completion here rather than serialising "<coroutine object …>".
-    if inspect.isawaitable(result) or hasattr(result, "__aiter__"):
-        result = asyncio.run(_drain(result))
-    return result
+        try:
+            result = handler(req)
+        except (SystemExit, KeyboardInterrupt) as e:
+            raise _HandlerExit(f"handler raised {type(e).__name__}({e})") from e
+        # A sync callable can still hand back a coroutine — a decorator that
+        # forgot to be async, a callable object with `async def __call__`. Run it
+        # to completion here rather than serialising "<coroutine object …>".
+        if inspect.isawaitable(result) or hasattr(result, "__aiter__"):
+            result = asyncio.run(_drain(result))
+        return result
+    finally:
+        _ABANDONED.reset(token)
 
 
 def _settle_task(task: asyncio.Task, completer: Any) -> None:
@@ -792,9 +801,10 @@ def _settle_behaviour(future: Any, completer: Any) -> None:
         print(f"[webcortex] behaviour failed:\n{detail}", file=sys.stderr, flush=True)
         _fail(completer, detail if _EXPOSE_TRACEBACKS else "behaviour failed")
         return
+    token = _ABANDONED.set(getattr(completer, "abandoned", None))
     try:
         completer.complete(jsonable(future.result()))
-    except ResultTooLarge as e:
+    except (ResultTooLarge, _CallerGone) as e:
         _fail(completer, f"{e.code}: {e.message}")
     except Exception:
         detail = traceback.format_exc()
@@ -802,6 +812,8 @@ def _settle_behaviour(future: Any, completer: Any) -> None:
               file=sys.stderr, flush=True)
         _fail(completer, detail if _EXPOSE_TRACEBACKS else
               "behaviour returned a value that could not be serialised")
+    finally:
+        _ABANDONED.reset(token)
 
 
 def _fail(completer: Any, message: str) -> None:

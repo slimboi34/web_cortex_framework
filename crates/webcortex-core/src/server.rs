@@ -51,6 +51,39 @@ static TOO_MANY_CONNECTIONS: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock:
 /// connection, and the reset destroys the 413 before the client reads it;
 /// draining a bounded overshoot lets the answer arrive. Past either bound the
 /// connection is cut off, as before.
+/// Refused connections being closed politely at once; past this many the
+/// rest are dropped straight after the write, so a flood stays cheap.
+const MAX_REFUSING: usize = 256;
+static REFUSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Answer a connection over `max_connections` with the 503 and close it.
+///
+/// Closing a socket whose request is still unread makes the kernel send a
+/// reset, and the reset can discard the 503 before the client reads it. So
+/// the write side is shut first and what the client sent is read for a
+/// moment, in a short task with a ceiling of its own.
+fn refuse(stream: tokio::net::TcpStream) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if REFUSING.fetch_add(1, Ordering::Relaxed) >= MAX_REFUSING {
+        REFUSING.fetch_sub(1, Ordering::Relaxed);
+        let _ = stream.try_write(&TOO_MANY_CONNECTIONS);
+        return;
+    }
+    tokio::spawn(async move {
+        let mut stream = stream;
+        let polite = async {
+            stream.write_all(&TOO_MANY_CONNECTIONS).await?;
+            stream.shutdown().await?;
+            let mut sink = [0u8; 4096];
+            while stream.read(&mut sink).await? > 0 {}
+            Ok::<_, std::io::Error>(())
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), polite).await;
+        REFUSING.fetch_sub(1, Ordering::Relaxed);
+    });
+}
+
 const DRAIN_BYTES: usize = 8 * 1024 * 1024;
 const DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(2);
 /// The longest a connection may take to send a request's headers, and the
@@ -136,7 +169,7 @@ where
                 // more than the accept. 2.6.0 had no ceiling at all.
                 let Some(slot) = app.admit_connection() else {
                     tracing::debug!(%peer, max = cfg.max_connections, "connection refused: max_connections open");
-                    let _ = stream.try_write(&TOO_MANY_CONNECTIONS);
+                    refuse(stream);
                     continue;
                 };
                 let app = app.clone();
