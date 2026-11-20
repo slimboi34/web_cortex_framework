@@ -77,6 +77,12 @@ app.agent("name", model="default", system="...", tools=[...], handoffs=[...], co
           scopes=[...], expose_scopes=[...], max_steps=12, token_budget=100_000,
           context_window=None, tool_result_limit=16_384, compact_with="fast", cache=True, max_images=4)
 # agent endpoint also takes "images": [{"media_type": "image/png", "data": "<b64>"} | {"url": "..."}]
+# typed answers (2.8): output=<dataclass | TypedDict | {"type": "object", ...}> -> the agent answers through a
+#   final_answer tool, the RUNTIME validates it (2 corrections, then failed/WC318), result["data"] is the object
+app.agent("triage", system="...", output=Triage)
+# provider request options (2.8): extra body fields; None removes one; model/messages/tools/tool_choice/system/stream are reserved
+app.agent("local", model="ollama/qwen3.5:9b", options={"seed": 7, "keep_alive": "30m"})
+app.request_options("openai", max_tokens=None, max_completion_tokens=8000)   # per provider; agents override
 
 # behaviours: deterministic Python control flow, probabilistic leaves
 @app.behaviour("name", tools=[...], context=[...], scopes=[...], max_steps=50, token_budget=None, model="default")
@@ -97,7 +103,7 @@ Rules the runtime enforces: agent/behaviour/flow scopes are intersected with the
 approval="required" tools suspend a run (resume via POST /_webcortex/approvals/{id});
 max_steps and token_budget are hard limits; nesting is capped at 8; every step is audited;
 actuator=True routes refuse with 423 while the emergency stop is engaged.
-CLI: webcortex check | security | tools | context | evolve "…" | typegen | openapi | sql | dev | halt | release
+CLI: webcortex check | security | tools | context | evolve "…" | typegen | openapi | sql | dev | halt | release | eval | trace
 
 # diagnosing (2.5): every error carries a stable code + hint
 # HTTP error body: {"error": {"status", "message", "code": "WC201", "hint"}}  (+ header x-webcortex-error)
@@ -110,6 +116,21 @@ webcortex explain WC402 | --list         # what a code means and what to do; GET
 # resources webcortex://status and webcortex://errors. Codes: WC1xx config, WC2xx HTTP,
 # WC3xx agents/providers, WC4xx budgets/limits, WC5xx devices/actuators, WC6xx auth.
 # Offline failure test: WEBCORTEX_FAKE_PROVIDER=1 and agent input "fail:anthropic 529: overloaded"
+
+# traces (2.8): every agent/flow/behaviour run is a span tree (run > model calls with tokens > tool calls > nested runs)
+# run result "trace_id" + response header x-webcortex-trace; an incoming W3C traceparent header is joined
+webcortex trace [ID|latest] [--json]     # GET /_webcortex/traces, /traces/{id}; MCP tool webcortex_trace(trace_id?)
+app.tracing(otlp_endpoint="http://collector:4318", otlp_headers_env="OTLP_HEADERS", keep=200)   # OTLP/HTTP JSON export
+# spans hold names, timings, token counts and codes; never prompts, arguments or results
+
+# evals (2.8): regression tests for agent behaviour, run in-process (no port)
+app.eval("refund_goes_to_billing", target="front_desk", input="I was charged twice", scopes=[...],
+         expect={"path": ["front_desk", "billing"], "tools_called": ["lookup_invoice"], "max_tokens": 6000})
+# expect keys: status http_status code output_contains output_not_contains output_matches data tools_called
+#   tools_not_called path max_steps max_tokens max_model_calls;  check=lambda result: ...
+webcortex eval [--record | --replay | --live] [--only NAME] [--json]   # exit 1 when any fails
+# --record writes evals/<name>.json (the model's responses); after that the eval replays them: no key, no tokens,
+# tools still run for real. Changing an agent's system prompt, model, tools or options makes its cassette stale (WC319).
 """
 
 
@@ -199,6 +220,10 @@ def build(app: Any) -> str:
             pol = a.get("policy") or {}
             if pol.get("max_context_tokens"):
                 bits.append(f"context_window={pol['max_context_tokens']}")
+            if a.get("output_schema"):
+                bits.append(f"output={{{_args(a['output_schema'])}}}")
+            if a.get("options"):
+                bits.append(f"options={a['options']}")
             add(f"- **{a['name']}** — {a.get('description') or '(no description)'}")
             add(f"  {'; '.join(bits)}")
             if a.get("system"):
@@ -216,6 +241,8 @@ def build(app: Any) -> str:
                 bits.append(f"context={b['context']}")
             if b.get("token_budget"):
                 bits.append(f"token_budget={b['token_budget']}")
+            if b.get("options"):
+                bits.append(f"options={b['options']}")
             add(f"  {'; '.join(bits)}; input: {_args(b.get('input_schema'))}")
         add("")
 
@@ -256,7 +283,7 @@ def build(app: Any) -> str:
 
     # --- Models ---------------------------------------------------------
     models = m.get("models") or {}
-    if models.get("aliases") or models.get("providers") or models.get("pricing"):
+    if models.get("aliases") or models.get("providers") or models.get("pricing") or models.get("options"):
         add("## Models")
         if models.get("aliases"):
             add("- aliases: " + ", ".join(f"{k}={v}" for k, v in models["aliases"].items()))
@@ -264,6 +291,22 @@ def build(app: Any) -> str:
             add("- providers: " + ", ".join(f"{k}→{v['base_url']}" for k, v in models["providers"].items()))
         if models.get("pricing"):
             add("- priced: " + ", ".join(models["pricing"]))
+        if models.get("options"):
+            add("- options: " + "; ".join(f"{k} {v}" for k, v in models["options"].items()))
+        add("")
+
+    # --- Evals ----------------------------------------------------------
+    cases = getattr(app, "_evals", [])
+    if cases:
+        add(f"## Evals ({len(cases)}; run with `webcortex eval`)")
+        for c in cases:
+            expects = ", ".join(c.expect) + (", check()" if c.check else "") or "completes"
+            add(f"- **{c.name}** → {c.target}: {c.description or expects}")
+        add("")
+
+    tracing = m.get("tracing") or {}
+    if not tracing.get("enabled", True):
+        add("Tracing is off (app.tracing(enabled=False)): run results carry no trace_id.")
         add("")
 
     add(CHEATSHEET.rstrip())

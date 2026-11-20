@@ -271,3 +271,61 @@ def shelve(ctx, input):
     ])
     return {"shelved": len(books), "genres": [g["genre"] for g in genres], "usage": ctx.usage}
 
+
+
+# ---------------------------------------------------------------------------
+# 11. A typed answer (2.8).
+#
+#     `output=` is the shape the answer must have. The agent answers through a
+#     `final_answer` tool and the runtime validates it against the schema: a
+#     mismatch goes back to the model with what was wrong, twice, then the run
+#     fails with WC318. The result carries the object as `data`.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Recommendation:
+    book_id: int
+    title: str
+    reason: str
+
+
+app.agent(
+    "recommender",
+    description="Recommends one stocked book for a request.",
+    system="Recommend exactly one book from the catalogue. Use its real id and title.",
+    tools=["list_books", "books_by_author"],
+    output=Recommendation,
+    scopes=["read"],
+    max_steps=6,
+    token_budget=30_000,
+)
+
+
+# ---------------------------------------------------------------------------
+# 12. Evals (2.8): what this app must keep doing.
+#
+#     `webcortex eval --record` runs these against the model once and keeps
+#     its responses in evals/. After that `webcortex eval` replays them with
+#     no key and no tokens, while the tools, scopes and handoffs run for real.
+#     Change an agent's prompt or tools and its recording goes stale (WC319).
+#     `webcortex trace latest` shows what any run did, span by span.
+# ---------------------------------------------------------------------------
+
+app.eval(
+    "book_questions_reach_the_librarian",
+    target="front_desk",
+    input="Do you stock anything by Ursula K. Le Guin?",
+    scopes=["read", "write"],
+    expect={"path": ["front_desk", "librarian"], "max_tokens": 60_000},
+    description="the front desk hands a catalogue question to the librarian",
+)
+app.eval(
+    "recommendations_are_typed",
+    target="recommender",
+    input="Something short and strange.",
+    scopes=["read"],
+    expect={"status": "completed", "tools_called": ["list_books"]},
+    check=lambda result: isinstance(result["data"]["book_id"], int) or "book_id is not an integer",
+    description="the recommender answers in the declared shape, from the catalogue",
+)

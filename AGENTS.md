@@ -50,7 +50,9 @@ crates/webcortex-core/     Rust runtime: router, server, auth, db, mcp, openapi,
                            templates, typegen, agent loop (agent.rs), providers
                            and model registry (agent/), flows (flow.rs), context
                            providers (context.rs), spend ledger (ledger.rs),
-                           error catalogue (errors.rs), live status view (status.rs)
+                           error catalogue (errors.rs), live status view (status.rs),
+                           run traces and the OTLP exporter (trace.rs), the output
+                           schema checker (schema.rs), cassettes (agent/replay.rs)
 crates/webcortex-py/       PyO3 bindings. Compiles to webcortex._core. The
                            behaviour ctx lives in behaviour.rs
 python/webcortex/          The Python package users import
@@ -60,7 +62,8 @@ python/webcortex/          The Python package users import
   schema.py                  type annotation → JSON Schema
   contextpack.py             `webcortex context`: the app described for a model
   errors.py                  the error catalogue, read from _core (never a second copy)
-  diagnostics.py             `webcortex doctor` and the `webcortex status` client
+  diagnostics.py             `webcortex doctor`, the `webcortex status` and `trace` clients
+  evals.py                   `app.eval`, `webcortex eval`: declared checks, cassettes
   cli.py                     the `webcortex` command
   starters.py                templates used by `webcortex new`
 tests/                     pytest. test_pentest.py and test_security.py are
@@ -335,7 +338,8 @@ Template output is HTML-escaped. `tests/test_fullstack.py` asserts this.
 
 ```python
 app.models(**aliases)                      # e.g. default=..., fast=..., local="ollama/qwen3.5:9b"
-app.provider(name, *, base_url, kind="openai", api_key_env=None)
+app.provider(name, *, base_url, kind="openai", api_key_env=None, options=None)
+app.request_options(provider, **options)   # extra request-body fields per provider (§8c)
 app.pricing(model, *, input_per_mtok, output_per_mtok,
             cache_read_per_mtok=0.0, cache_write_per_mtok=0.0)
 ```
@@ -408,7 +412,8 @@ it would pool their data.
 ```python
 @app.behaviour(name=None, *, description="", tools=(), context=(), scopes=(),
                max_steps=50, token_budget=None, model="default", max_tokens=16_000,
-               temperature=None, reasoning=None, expose_at=None, expose_scopes=None, tool=True)
+               temperature=None, reasoning=None, expose_at=None, expose_scopes=None, tool=True,
+               options=None)
 def handler(ctx, input): ...
 ```
 
@@ -487,7 +492,7 @@ app.agent(name, *, model="default", system="", tools=(), handoffs=(), context=()
           expose_at=None, scopes=(), expose_scopes=None, temperature=None, reasoning=None,
           max_tokens=16_000, cache=True, context_window=None,
           tool_result_limit=16_384, compact_with=None, keep_recent=6,
-          max_images=4, tool=True) -> None
+          max_images=4, tool=True, output=None, options=None) -> None
 ```
 
 `tools` names routes that were declared with `tool=True` — including other
@@ -527,10 +532,12 @@ mean" hint. An agent that lists itself in `handoffs` is rejected, and so is one
 whose `tools` include `transfer_to_<h>` for one of its own handoffs `h`.
 
 Result shape: `run_id, agent, path, status, output, steps, usage,
-pending_approval?, session_id?`. `status` ∈ `completed | max_tokens |
+pending_approval?, session_id?, data?, trace_id?`. `status` ∈ `completed | max_tokens |
 step_limit | budget_exhausted | awaiting_approval | failed` (`max_tokens`: the
 last response was cut off, and no tool call in it was run). Step kinds: `model, tool_call,
-tool_refused, approval_requested, approval_denied, handoff, compaction`.
+tool_refused, approval_requested, approval_denied, handoff, compaction, output`.
+`data` is the validated answer of an agent with `output=`; `trace_id` names the
+run's trace (both §8c).
 HTTP status: 202 for `awaiting_approval`, 502 for `failed`, 200 otherwise.
 A tool call whose arguments are not a JSON object is refused (`tool_refused`,
 WC317) rather than run; tool calls that will not be run (a `max_tokens` cut, a
@@ -675,6 +682,79 @@ No vision model is embedded (DESIGN §5); pixels are carried to the model.
 - **FakeProvider** works unchanged: watcher inputs are echoed with
   ` [saw N image(s)]`.
 
+## 8c. Structured output, request options, traces, evals (2.8)
+
+**Structured output** (`app.agent(output=...)` → `AgentDef.output_schema`). `output` is a
+dataclass, a `TypedDict` or a schema dict; its top-level type must be `"object"`
+(`_output_schema` in app.py, `schema::output_schema_problem` at boot). The agent loop
+(`agent.rs`) then:
+
+- offers one more tool, `FINAL_TOOL = "final_answer"`, with that schema (`specs_for`), and
+  adds a sentence to the system suffix. Both follow the **entry** agent across a handoff;
+- validates a `final_answer` call in `execute_calls` with `schema::validate`. A match is an
+  `output` step, `st.final_answer`, a `tool_result` `{"accepted": true}` (so the session
+  replays cleanly), and the run finishes `completed` at the top of the loop with
+  `RunResult.data` set and `output` holding the same JSON as text;
+- on a mismatch pushes an `output` step with `code: "WC318"` and returns the problems to the
+  model as the tool's error result (`reject_output`). A prose answer is searched for
+  conforming JSON (`recover_json`); failing that the model is corrected and the next call
+  **forces** the tool (`force_final`). After `MAX_OUTPUT_REPAIRS` (2) corrections the run is
+  `failed` with `WC318`;
+- `flow::unwrap_output` hands the next step `data` rather than `output` when a run has it.
+
+`schema.rs` is a deliberate subset of JSON Schema (the keywords `schema.py` emits, plus
+bounds and `anyOf`/`oneOf`/`allOf`); unknown keywords are **ignored**. Do not make it refuse
+them, and do not add a regex dependency for `pattern`.
+
+**Request options** (`options=` on agents and behaviours, `app.request_options` /
+`app.provider(options=)` per provider → `AgentDef.options`, `BehaviourDef.options`,
+`ModelsConfig.options`). `provider::apply_options` writes each key as a top-level field of
+the request body on **both** wire formats, last, so an option overrides a keyword; `null`
+removes a field. `ProviderRegistry::complete` merges the provider's options beneath the
+agent's (`options_for`; the provider name is the model's prefix, else `openai` for
+`gpt-*`/`o1`/`o3`/`o4`, else `anthropic`). `RESERVED_OPTIONS` (`model, messages, tools,
+tool_choice, system, stream`) are refused in Python, in `Manifest::validate`, and skipped
+in `apply_options`. This is a pass-through, not an abstraction: **do not translate,
+rename or validate an option per provider.**
+
+**Traces** (`trace.rs`). `Tracer` on `App` (`app.tracer()`): a mutex-guarded ring of the
+last `tracing.keep` (200) traces, each at most `max_spans` (500) spans. Span kinds: `agent`
+(`AgentRuntime::run`, ended in `finish` or by `CancelGuard`), `model` and `tool` (RAII
+`Scoped` guards in `drive_steps` / `dispatch_call`, cancelled if dropped), `handoff` and
+`output` (zero-length `event`s), `flow` and `behaviour` (`App::run_flow` /
+`run_behaviour`), and the behaviour's own calls (`behaviour.rs`). The context is explicit:
+`WebCortexRequest.trace` and `RunOptions.trace` carry a `TraceCtx`, and
+`App::call_tool_traced` passes the caller's span down. **Any new op that re-enters the
+dispatcher must pass its span as well as `depth + 1` and the budget**, or the nested run
+starts a trace of its own. A root span adopts a valid incoming `traceparent`
+(`RunOptions.traceparent`, `App::span_for`). `RunResult.trace_id`, the flow envelope's
+`trace_id` and the `x-webcortex-trace` response header (depth 0 only) name the trace.
+**A span never holds a prompt, an argument, a result or a credential** — names, timings,
+token counts and codes, the same rule as the recorder. Attribute names follow the
+OpenTelemetry GenAI conventions where one exists. Only model-backed routes open spans;
+keep it that way so plain routes never take the tracer's lock.
+
+Export: `Tracer::export_target` resolves the endpoint (manifest, then
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT` + `/v1/traces`)
+and `start_export` (called in `serve_with_shutdown`) posts OTLP/HTTP **JSON** batches with
+the app's own `reqwest` client. It is lossy by design: a bounded queue, failed batches
+dropped and counted, no retry. Do not add the OpenTelemetry SDK crates for this.
+
+**Evals and cassettes** (`evals.py`, `agent/replay.rs`, `_core.eval_call`). `app.eval`
+appends an `EvalCase` to `app._evals` (never to the manifest). `run_evals` calls
+`_core.eval_call(manifest_json, dispatcher, workers, tool, args_json, scopes, mode,
+cassette_json)` once per eval: it builds a fresh `App` with the Python bridge, swaps the
+provider with `App::with_provider` for `record` (`RecordingProvider` around the registry) or
+`replay` (`ReplayProvider`), calls the tool through `App::tool_response` as principal `eval`,
+and returns `{status, body, error, usage, trace, cassette?, replay?}`. Expectations are
+checked in Python (`check_result`); `tools_called` is read from the trace, so it sees the
+whole tree. Replay is per agent name, in recorded call order, and each call's
+`replay::fingerprint` (agent name, model, system, tools with schemas, forced tool,
+`max_tokens`, `temperature`, `reasoning`, options) must match or the call fails with
+`WC319`. The conversation is deliberately **not** fingerprinted: tool results carry run ids
+and timings. `WC320` is an unreadable cassette or an eval that cannot be run. There is no
+model-graded check, on purpose.
+
 ## 9. Introspection and output
 
 | call | returns |
@@ -687,12 +767,14 @@ No vision model is embedded (DESIGN §5); pixels are carried to the model.
 | `app.security_report()` | public attack surface, `auth_configured` flag, agents, behaviours, flows, memories |
 | `app.context_pack()` | the app described for a coding model (Markdown); `webcortex context` |
 | `app.run()` | hand the manifest to Rust and serve |
+| `app.run_evals(mode="auto", directory="evals", only=None)` | run the declared evals in-process; the report `webcortex eval` prints |
+| `app.traces()` / `app.trace(id="latest")` | the running app's recent traces / one with every span |
 
 Control plane (admin scope once auth is configured): `/health`,
 `/openapi.json`, `/tools`, `/routes`, `/agents`, `/behaviours`, `/flows`,
 `/contexts`, `/models`, `/usage`, `/audit`, `/approvals`,
 `POST /approvals/{id}`, `/security`, `/status`, `/errors`, `/devices`,
-`/halt`, `POST /halt|release`, `POST /mcp`. Only `/health` is open.
+`/traces`, `/traces/{id}`, `/halt`, `POST /halt|release`, `POST /mcp`. Only `/health` is open.
 
 `check()`, `openapi()`, `typescript_client()` and `security_report()` all
 `from . import _core`. They are the first things to fail when the extension is
@@ -743,10 +825,12 @@ webcortex release  [target] [--key K]
 webcortex doctor   [target] [--online] [--json] [--url U] [--key K]
 webcortex status   [target] [--json] [--url U] [--key K]
 webcortex explain  [CODE] [--list] [--json]
+webcortex trace    [TRACE_ID|latest] [--app target] [--json] [--url U] [--key K]
+webcortex eval     [target] [--record | --replay | --live] [--dir D] [--only NAME]... [--list] [--json]
 ```
 
-`doctor` exits 1 when any check fails; `status` and every other command exit 1
-on a coded failure. A CLI failure prints `error[WCnnn]: …` + `hint:` to stderr,
+`doctor` exits 1 when any check fails; `eval` exits 1 when any eval fails;
+`status` and every other command exit 1 on a coded failure. A CLI failure prints `error[WCnnn]: …` + `hint:` to stderr,
 or `{"ok": false, "error": {code, message, hint}}` on stdout with `--json` (and
 always for `check`).
 
@@ -812,7 +896,7 @@ credential into the recorder**; failures record the route *pattern*.
 Throughput with and without it is in `benchmarks/diagnostics/RESULTS.md`; keep
 the request path free of locks and allocation on success.
 
-**MCP built-ins**: `webcortex_status` and `webcortex_explain` tools and the
+**MCP built-ins**: `webcortex_status`, `webcortex_explain` and (2.8) `webcortex_trace` tools and the
 `webcortex://status` / `webcortex://errors` resources, offered only when the
 caller may read the control plane (`mcp::may_observe`). An app tool with the
 same name shadows the built-in.
@@ -984,6 +1068,14 @@ reads.
   `/models`) reachable without `webcortex:admin` once auth is configured.
 - Do not select `FakeProvider` by anything other than
   `WEBCORTEX_FAKE_PROVIDER`; it is a test double and logs a warning when on.
+- Do not put a prompt, a tool argument, a tool result or a header into a span
+  (§8c); traces are exported to third-party collectors.
+- Do not interpret request `options` per provider, and do not let one set a
+  reserved field (§8c). That road ends at a universal LLM abstraction.
+- Do not fingerprint the conversation in a cassette, add a model-graded eval
+  check to the framework, or put evals in the manifest (§8c).
+- Do not retry or queue trace exports without a bound; the exporter is lossy
+  on purpose.
 
 ---
 
@@ -992,7 +1084,11 @@ reads.
 `WEBCORTEX_FAKE_PROVIDER=1` replaces every model call with `FakeProvider`
 (`agent/provider.rs`), which answers from a tiny command language in the last
 user message: `tool:<name> <json>`, `handoff:<agent>`, `json:<object>` (for a
-forced tool), `context?` (echoes the system suffix), anything else is echoed.
+forced tool), `context?` (echoes the system suffix), `options?` (answers with
+the request options the call carries, provider's merged with agent's, as JSON),
+anything else is echoed. `tool:final_answer <json>` is how a test makes an agent
+with `output=` answer. A forced call with no `json:` in the last message answers
+from the newest earlier user message that has one.
 `fail:<message>` fails the call with that message, as a provider error.
 After tool results it summarises them and stops. Input tokens scale with the
 conversation, so compaction is observable. `tests/test_orchestration.py` is

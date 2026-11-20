@@ -41,6 +41,7 @@ pub const MAX_BATCH: usize = 32;
 /// ask what the running app is doing. An app tool of the same name wins.
 pub const STATUS_TOOL: &str = "webcortex_status";
 pub const EXPLAIN_TOOL: &str = "webcortex_explain";
+pub const TRACE_TOOL: &str = "webcortex_trace";
 pub const STATUS_URI: &str = "webcortex://status";
 pub const ERRORS_URI: &str = "webcortex://errors";
 
@@ -267,6 +268,15 @@ fn builtin_tools(app: &App) -> Vec<Value> {
                             "openWorldHint": false, "requiresApproval": false, "actuator": false},
         }));
     }
+    if app.route_for_tool(TRACE_TOOL).is_none() && app.tracer().enabled() {
+        out.push(json!({
+            "name": TRACE_TOOL,
+            "description": "What did a recent agent, flow or behaviour run do? Without arguments, lists the                             recent traces (root run, duration, model and tool calls, tokens, error codes).                             With trace_id (from a run result, the x-webcortex-trace header, or \"latest\"),                             returns every span: each agent, model call, tool call and handoff with its                             parent, duration, tokens and error code.",
+            "inputSchema": {"type": "object", "properties": {"trace_id": {"type": "string"}}},
+            "annotations": {"readOnlyHint": true, "idempotentHint": true, "destructiveHint": false,
+                            "openWorldHint": false, "requiresApproval": false, "actuator": false},
+        }));
+    }
     out
 }
 
@@ -325,6 +335,24 @@ fn call_builtin(app: &App, name: &str, args: &Value) -> Option<Value> {
                                                         "hint": "Codes look like WC201; read webcortex://errors for the list."}},
                         "isError": true,
                     }));
+                }
+            }
+        }
+        TRACE_TOOL if app.tracer().enabled() => {
+            match args.get("trace_id").and_then(|t| t.as_str()).map(str::trim).filter(|t| !t.is_empty()) {
+                None => app.tracer().list(),
+                Some(id) => {
+                    let id = if id == "latest" { app.tracer().latest().unwrap_or_default() } else { id.to_string() };
+                    match app.tracer().get(&id) {
+                        Some(trace) => trace,
+                        None => {
+                            return Some(builtin_error(
+                                "WC219",
+                                format!("no trace {id:?} is held"),
+                                crate::errors::hint("WC219"),
+                            ));
+                        }
+                    }
                 }
             }
         }

@@ -114,6 +114,8 @@ pub static CATALOGUE: &[ErrorInfo] = &[
        "A proxied upstream answered with a body over its max_response_bytes (64 MiB by default). Raise it on app.upstream(..., max_response_bytes=...) or page the upstream's response."),
     e!("WC218", "http", Some(503), "Too many connections",
        "The server already holds max_connections open connections (10,000 by default), WebSockets included. Retry shortly, close idle connections, or raise max_connections on WebCortex(...)."),
+    e!("WC219", "http", Some(404), "Trace not found",
+       "No trace with that id is held. Traces are kept in memory, newest first, up to app.tracing(keep=...) and not across a restart; GET /_webcortex/traces (or `webcortex trace`) lists the ones there are, and \"latest\" names the newest."),
 
     // ---- WC3xx agents and providers -------------------------------------
     e!("WC300", "agent", Some(502), "Agent run failed",
@@ -152,6 +154,12 @@ pub static CATALOGUE: &[ErrorInfo] = &[
        "A watcher's agent run failed; the insight carries the error. GET /_webcortex/status shows the watcher's recent runs."),
     e!("WC317", "agent", None, "Malformed tool call",
        "The model asked for a tool with arguments that are not a JSON object (cut off, garbled, or a bare value), so the tool was not run. The model is told and may retry; a small local model that keeps doing it needs a larger max_tokens or a simpler input schema."),
+    e!("WC318", "agent", Some(502), "Answer does not match the output schema",
+       "The agent has an output schema and its answer still did not match after being corrected twice. The failing steps list what was wrong. Simplify the schema, say in the system prompt what each field means, raise max_tokens if the answer is being cut off, or use a stronger model."),
+    e!("WC319", "agent", Some(502), "No recorded response to replay",
+       "A run replayed from a cassette asked for a model response the cassette does not hold: the agent's system prompt, model, tools or options changed since it was recorded, or the run now takes a different path. If the change is intended, record again with `webcortex eval --record`."),
+    e!("WC320", "agent", None, "Unreadable cassette or eval",
+       "An eval could not be run: its cassette file is not valid JSON or not a cassette this version reads, or the eval names a target that is not a tool. Delete the cassette and record again with `webcortex eval --record`, or fix the target in app.eval(...)."),
 
     // ---- WC4xx budgets and limits ---------------------------------------
     e!("WC401", "limits", Some(429), "Rate limited",

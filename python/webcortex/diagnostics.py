@@ -241,6 +241,13 @@ def doctor(app: Any, *, online: bool = False, url: str | None = None, key: str |
                        f"upstream {name!r} names {env}, which is not set: it will be called unauthenticated",
                        code="WC106"))
 
+    tracing = manifest.get("tracing") or {}
+    headers_env = tracing.get("otlp_headers_env")
+    if tracing.get("enabled", True) and headers_env and not os.environ.get(headers_env):
+        add(_check("tracing", "warn",
+                   f"tracing names {headers_env} for its export headers, which is not set: spans "
+                   f"will be sent without them", code="WC106"))
+
     # -- security posture --------------------------------------------------------
     sec = app.security_report()
     if not sec["auth_configured"]:
@@ -455,4 +462,145 @@ def render_status(s: dict) -> str:
         st = w["stats"]
         out.append(f"  watcher {w['name']}: {st.get('runs', 0)} runs, {st.get('failed', 0)} failed"
                    + (f", last {st['last_status']}" if st.get("last_status") else ""))
+    return "\n".join(out)
+
+
+# ----------------------------------------------------------------------
+# Traces
+# ----------------------------------------------------------------------
+
+
+def fetch_control(app: Any = None, path: str = "/traces", *, url: str | None = None,
+                  key: str | None = None, timeout: float = 5.0) -> dict:
+    """GET a JSON document from the running app's control plane.
+
+    Args:
+        app: The app (for its host, port and control prefix), or ``None`` to
+            use ``url`` with the default prefix.
+        path: The path under the control prefix, e.g. ``"/traces"`` or
+            ``"/traces/latest"``.
+        url: The running app's base URL; overrides the app's own.
+        key: An admin API key or JWT (default ``$WEBCORTEX_API_KEY``, then
+            ``$WEBCORTEX_TOKEN``).
+        timeout: Seconds to wait for the answer.
+
+    Returns:
+        The decoded JSON object.
+
+    Raises:
+        StatusError: with a catalogued code: ``WC108`` when nothing answers (or
+            what answers is not a WebCortex app), otherwise the code of the
+            error body, e.g. ``WC219`` for a trace that is not held.
+
+    Example::
+
+        fetch_control(app, "/traces/latest")["spans"]
+    """
+    prefix = getattr(app, "control_prefix", "/_webcortex") if app is not None else "/_webcortex"
+    base = app_url(app, url) if app is not None else (url or "http://127.0.0.1:8000").rstrip("/")
+    target = f"{base}{prefix}{path}"
+    try:
+        status, body = _get_json(target, operator_credential(key), timeout)
+    except (urllib.error.URLError, OSError) as e:
+        raise StatusError("WC108", f"cannot reach {target}: {getattr(e, 'reason', e)}") from None
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        raise StatusError(err.get("code") or "WC001", f"{target} answered {status}: {err.get('message', body)}",
+                          err.get("hint"))
+    if status != 200 or not isinstance(body, dict):
+        raise StatusError("WC108", f"{target} answered {status}, but not with a WebCortex document",
+                          "Check --url (or WEBCORTEX_HOST/WEBCORTEX_PORT) points at the running WebCortex "
+                          "app, without a path, and that it is version 2.8 or later.")
+    return body
+
+
+def _ms(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "open"
+    return f"{value / 1000:.2f}s" if value >= 1000 else f"{value:.0f}ms"
+
+
+def render_traces(listing: dict) -> str:
+    """The recent-traces table ``webcortex trace`` prints.
+
+    Args:
+        listing: The document from ``GET /_webcortex/traces``
+            (:meth:`WebCortex.traces`).
+
+    Returns:
+        One line per trace, newest first: id, root span, status, duration,
+        model and tool calls, tokens, and any error codes.
+
+    Example::
+
+        print(render_traces(app.traces()))
+    """
+    if not listing.get("enabled", True):
+        return "  tracing is off (app.tracing(enabled=False))"
+    traces = listing.get("traces") or []
+    if not traces:
+        return "  no traces yet: they are recorded when an agent, flow or behaviour runs"
+    out = [f"  {len(traces)} trace(s), newest first (capacity {listing.get('capacity')})"]
+    for t in traces:
+        tokens = t.get("input_tokens", 0) + t.get("output_tokens", 0) + t.get("cache_tokens", 0)
+        errors = f"  errors {','.join(t['errors'])}" if t.get("errors") else ""
+        out.append(f"  {t['trace_id']}  {t.get('name', ''):<28} {t.get('status', ''):<9} "
+                   f"{_ms(t.get('duration_ms')):>8}  {t.get('model_calls', 0)} model  "
+                   f"{t.get('tool_calls', 0)} tool  {tokens} tok{errors}")
+    export = listing.get("export") or {}
+    if export.get("configured"):
+        out.append(f"  export: {export.get('spans_exported', 0)} span(s) sent, "
+                   f"{export.get('spans_failed', 0)} failed, {export.get('spans_dropped', 0)} dropped"
+                   + (f"; last error: {export['last_error']}" if export.get("last_error") else ""))
+    return "\n".join(out)
+
+
+def render_trace(trace: dict) -> str:
+    """One trace as an indented tree, the way ``webcortex trace ID`` prints it.
+
+    Args:
+        trace: The document from ``GET /_webcortex/traces/{id}``
+            (:meth:`WebCortex.trace`).
+
+    Returns:
+        A header line, then one line per span, children indented under their
+        parent in start order: name, duration, tokens for model calls, and the
+        error code of a span that failed.
+
+    Example::
+
+        print(render_trace(app.trace("latest")))
+    """
+    spans = trace.get("spans") or []
+    ids = {s["span_id"] for s in spans}
+    children: dict[Any, list[dict]] = {}
+    for s in spans:
+        parent = s.get("parent_span_id") if s.get("parent_span_id") in ids else None
+        children.setdefault(parent, []).append(s)
+    tokens = trace.get("input_tokens", 0) + trace.get("output_tokens", 0) + trace.get("cache_tokens", 0)
+    out = [f"  trace {trace.get('trace_id')}  {trace.get('status', '')}  {_ms(trace.get('duration_ms'))}  "
+           f"{trace.get('model_calls', 0)} model call(s)  {trace.get('tool_calls', 0)} tool call(s)  "
+           f"{tokens} tokens"]
+    if trace.get("dropped_spans"):
+        out.append(f"  ({trace['dropped_spans']} span(s) past the per-trace limit were dropped)")
+
+    def walk(parent: Any, depth: int) -> None:
+        for s in children.get(parent, []):
+            attrs = s.get("attributes") or {}
+            bits = [_ms(s.get("duration_ms"))]
+            if s.get("kind") == "model" and "gen_ai.usage.input_tokens" in attrs:
+                bits.append(f"{attrs['gen_ai.usage.input_tokens']} in / "
+                            f"{attrs.get('gen_ai.usage.output_tokens', 0)} out")
+            if s.get("kind") == "agent" and attrs.get("webcortex.run.status"):
+                bits.append(str(attrs["webcortex.run.status"]))
+            if s.get("status") == "cancelled":
+                bits.append("cancelled")
+            if s.get("code"):
+                bits.append(f"[{s['code']}]")
+            if s.get("remote_parent"):
+                bits.append("(joined a caller's trace)")
+            out.append(f"  {'  ' * depth}{'└ ' if depth else ''}{s['name']}  " + "  ".join(bits))
+            walk(s["span_id"], depth + 1)
+
+    walk(None, 0)
     return "\n".join(out)

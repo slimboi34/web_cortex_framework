@@ -3,6 +3,97 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.8.0] — 2026-11-20
+
+Evidence: what an agent answered, what a run did, and whether it still does it. Four
+features, each with a docs page: structured output, request options, run traces, and evals
+that replay recorded model responses.
+
+### Security
+
+- `sqlx` 0.9.1 with `libsqlite3-sys` 0.39.1, which bundles SQLite 3.54.1, for
+  RUSTSEC-2026-0459 (CVE-2026-119375: SQLite before 3.54.0 could return uninitialised
+  memory when opening a database beside a crafted `-wal` file). `quinn-udp` 0.5.16 for
+  RUSTSEC-2026-0538. `sqlx` 0.9.1 needs Rust 1.94, so **`rust-version` is now 1.94**; this
+  matters only when building from source, not for the published wheels.
+- Trace and eval surfaces are reviewed in `SECURITY.md` ("Review — 2.8.0"): the trace
+  endpoints need the admin scope, spans hold no content, and the exporter is off unless an
+  endpoint is configured.
+
+### Added
+
+- **Structured output** ([docs](docs/structured-output.md)). `app.agent(..., output=...)`
+  takes a dataclass, a `TypedDict` or a JSON Schema whose top-level type is `object`. The
+  agent answers through a `final_answer` tool and the runtime validates the answer against
+  the schema. A mismatch goes back to the model with the list of problems, at most twice;
+  a third fails the run with the new code **`WC318`**. JSON that conforms is also accepted
+  from a prose answer, and otherwise the next call forces the tool. The result carries the
+  object as `data` (and as JSON text in `output`); a flow hands `data` to the next step as
+  an object; the schema follows the entry agent across a handoff; the route's OpenAPI and
+  TypeScript types describe the typed envelope. New step kind `output`.
+- **Request options** ([docs](docs/request-options.md)). `options={...}` on `app.agent` and
+  `@app.behaviour`, and `app.request_options(provider, **options)` or
+  `app.provider(..., options={...})` per provider, become top-level fields of the request
+  body on both wire formats: `seed`, `top_p`, `keep_alive`, `response_format`, `thinking`,
+  whatever the provider takes. `None` removes a field the runtime would send
+  (`max_tokens=None, max_completion_tokens=8000`). A provider's options sit beneath an
+  agent's. `model`, `messages`, `tools`, `tool_choice`, `system` and `stream` are reserved.
+  Nothing is interpreted or renamed.
+- **Run traces** ([docs](docs/tracing.md)). Every agent, flow and behaviour run records a
+  span tree: the run, each model call with its tokens, each tool call, each handoff, and
+  nested runs under the call that started them.
+  - `GET /_webcortex/traces` and `/traces/{id}` (`latest` works), `webcortex trace [ID]`,
+    the MCP tool `webcortex_trace`, and `app.traces()` / `app.trace(id)`.
+  - Run results and flow envelopes carry `trace_id`; responses carry `x-webcortex-trace`;
+    `/_webcortex/status` lists it on recent runs.
+  - An incoming W3C `traceparent` header is joined.
+  - `app.tracing(otlp_endpoint=..., otlp_headers_env=...)`, or the standard
+    `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` /
+    `OTEL_EXPORTER_OTLP_HEADERS` variables, export finished spans as OTLP/HTTP JSON with
+    OpenTelemetry GenAI attribute names. The exporter is bounded and lossy: failed batches
+    are dropped and counted, never retried.
+  - Spans hold names, timings, token counts and error codes, never a prompt, an argument or
+    a result. `app.tracing(keep=..., max_spans=..., enabled=False)` tune or disable it.
+- **Evals and cassettes** ([docs](docs/evals.md)). `app.eval(name, target=..., input=...,
+  expect={...}, check=...)` declares one call to a tool and what must be true of the
+  result: `status`, `http_status`, `code`, `output_contains`, `output_not_contains`,
+  `output_matches`, `data`, `tools_called`, `tools_not_called`, `path`, `max_steps`,
+  `max_tokens`, `max_model_calls`. `webcortex eval` runs them in-process and exits 1 on a
+  failure. `--record` writes each eval's model responses to `evals/<name>.json`; after that
+  the eval replays them with no key, no network and no tokens while the tools, scopes,
+  handoffs, budgets and flows run for real. A recording is fingerprinted on the agent's
+  system prompt, model, tools and options, and a replay against a changed agent fails with
+  **`WC319`**. `--replay` (for CI), `--live`, `--only`, `--list`, `--json`;
+  `app.run_evals(...)` from Python.
+- Error codes `WC219` (trace not found), `WC318`, `WC319` and `WC320` (unreadable cassette
+  or eval).
+- `webcortex doctor` warns when `app.tracing(otlp_headers_env=...)` names a variable that is
+  not set.
+- The context pack lists each agent's output shape and options, provider options and the
+  declared evals. `GET /_webcortex/agents` lists each agent's `options` and
+  `output_schema`, and `GET /_webcortex/models` the provider options.
+- The `AGENTS.md` every starter writes covers `output=`, `options=`, `webcortex trace` and
+  `webcortex eval`, and the orchestration starter declares an eval.
+- Fake provider: `options?` answers with the request options a call carries, and a forced
+  call answers from the newest earlier message that has `json:`.
+- Rust API: `App::with_provider`, `App::tool_response`, `App::call_tool_traced`,
+  `App::tracer`, the `trace`, `schema` and `agent::replay` modules.
+
+### Changed
+
+- **Run results have two more fields**, `trace_id` and, for agents with `output=`, `data`.
+  A client that rejects unknown fields needs updating; `app.tracing(enabled=False)` removes
+  `trace_id`.
+- **Agent, flow and behaviour responses carry an `x-webcortex-trace` header**, and a flow's
+  envelope a `trace_id`.
+- **MCP `tools/list` has one more built-in**, `webcortex_trace`, for callers who may read
+  the control plane. An app tool of the same name shadows it, as with the other built-ins.
+- **`OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` are now read.**
+  A deployment that already sets them for another library in the same environment will
+  start exporting WebCortex's spans there. `app.tracing(enabled=False)` stops it.
+- `PyBridge::call_behaviour` (Rust) takes the behaviour's span as a last argument, and
+  `flow::run` takes one too.
+
 ## [2.7.0] — 2026-10-26
 
 Closes the issues 2.6.0 left open: the connection and proxy caps, session turns, agent

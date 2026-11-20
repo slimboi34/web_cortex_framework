@@ -67,6 +67,11 @@ directions. Sessions, the audit trail and compaction never see a
 provider-specific structure, and a session started on one model can continue
 on another.
 
+Anything a provider supports that has no keyword here (`seed`, `top_p`,
+`keep_alive`, `response_format`, `thinking`, …) is passed through with
+`options=` on an agent or behaviour, or `app.request_options(provider, ...)`
+for every call to a provider. See [Request options](request-options.md).
+
 A transient failure — a refused connection, or 408, 409, 429, 500, 502, 503,
 504 or 529 — is retried twice, after 0.25 s and 0.5 s (or the provider's
 `retry-after`, when it is 10 s or less), as the official SDKs do. A timeout

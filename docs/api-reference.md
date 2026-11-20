@@ -127,9 +127,23 @@ app.models(default="claude-opus-5", fast="claude-haiku-4-5-20251001", local="oll
 
 `default` and `fast` have built-in values. Aliases may chain.
 
-### `app.provider(name, *, base_url, kind="openai", api_key_env=None)`
+### `app.provider(name, *, base_url, kind="openai", api_key_env=None, options=None)`
 
-Reachable as `<name>/<model>`. `kind` is `"openai"` or `"anthropic"`.
+Reachable as `<name>/<model>`. `kind` is `"openai"` or `"anthropic"`. `options` are extra
+request-body fields for every call to it.
+
+### `app.request_options(provider, **options)`
+
+Extra top-level request-body fields for every call to one provider: a declared one, or the
+built-in `"anthropic"`, `"openai"` or `"ollama"`. `None` removes a field the runtime would
+send; an agent's or behaviour's own `options` override these key by key. `model`, `messages`,
+`tools`, `tool_choice`, `system` and `stream` are reserved (`ValueError`). See
+[Request options](request-options.md).
+
+```python
+app.request_options("ollama", keep_alive="30m")
+app.request_options("openai", max_tokens=None, max_completion_tokens=8000)
+```
 
 ### `app.pricing(model, *, input_per_mtok, output_per_mtok, cache_read_per_mtok=0.0, cache_write_per_mtok=0.0)`
 
@@ -186,10 +200,17 @@ app.agent(
     max_tokens=16_000,
     expose_at=None,          # defaults to /agents/<name-with-hyphens>
     tool=True,
+    output=None,             # a dataclass, TypedDict or object schema the answer must match
+    options=None,            # extra provider request-body fields, e.g. {"seed": 7}
 )
 ```
 
-The route takes `{"input": str, "session_id"?: str, "reset"?: bool}`.
+The route takes `{"input": str, "session_id"?: str, "reset"?: bool, "images"?: [...]}` and
+answers `{run_id, agent, path, status, output, steps, usage, trace_id?, data?, code?, hint?,
+pending_approval?, session_id?}`. With `output=` the agent answers through a `final_answer`
+tool, the runtime validates the answer (two corrections, then `failed` / `WC318`) and `data`
+holds it: see [Structured output](structured-output.md). `trace_id` names the run's
+[trace](tracing.md).
 
 ### `@app.behaviour(name=None, **opts)`
 
@@ -208,6 +229,7 @@ The route takes `{"input": str, "session_id"?: str, "reset"?: bool}`.
     expose_at=None,
     expose_scopes=None,
     tool=True,               # Behaviours are agent tools by default
+    options=None,            # extra provider request-body fields for ctx.ask calls
 )
 def triage(ctx, input): ...
 ```
@@ -260,6 +282,38 @@ value and the original input.
 
 ---
 
+## Traces and evals
+
+### `app.tracing(*, enabled=True, keep=200, max_spans=500, otlp_endpoint=None, otlp_headers_env=None, service_name=None)`
+
+Run traces are on without calling this. `keep` and `max_spans` bound what is held in memory;
+`otlp_endpoint` exports finished spans as OTLP/HTTP JSON (`/v1/traces` is appended), with
+headers from the environment variable `otlp_headers_env` names (`k=v,k2=v2`). When no endpoint
+is declared, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_ENDPOINT` are read.
+See [Traces](tracing.md).
+
+### `app.traces(*, url=None, key=None) -> dict` · `app.trace(trace_id="latest", *, url=None, key=None) -> dict`
+
+The running app's recent traces, and one trace with every span, from the control plane.
+
+### `app.eval(name, *, target, input, expect=None, check=None, scopes=(), description="")`
+
+Declare an eval: one call to a tool and what must be true of the result. `input` is a dict of
+arguments, or a string as shorthand for `{"input": ...}`. `expect` keys: `status`,
+`http_status`, `code`, `output_contains`, `output_not_contains`, `output_matches`, `data`,
+`tools_called`, `tools_not_called`, `path`, `max_steps`, `max_tokens`, `max_model_calls`;
+an unknown key is a `ValueError`. `check` is a function of the result body. See
+[Evals and cassettes](evals.md).
+
+### `app.run_evals(*, mode="auto", directory="evals", only=None) -> dict`
+
+Run the declared evals in-process. `mode` is `auto` (replay a cassette when there is one),
+`replay`, `live` or `record`. Returns `{ok, total, passed, failed, tokens, mode, directory,
+results: [{name, target, mode, ok, failures, status, code, tokens, model_calls, duration_ms,
+trace_id, cassette, result}]}`.
+
+---
+
 ## Introspection
 
 | Method | Returns |
@@ -288,6 +342,8 @@ Mounted under `control_prefix`. Everything but `/health` needs
 | `GET /models` | Aliases, live providers, priced models |
 | `GET /usage` | The spend ledger |
 | `GET /audit` | Recent events |
+| `GET /status` | The live view: requests, recent errors, runs, spend, devices |
+| `GET /traces` · `GET /traces/{id}` | Recent run traces, and one with every span (`latest` works as an id) |
 | `GET /approvals` | Runs waiting on a human |
 | `POST /approvals/{id}` | `{"approve": bool, "note": str}` — continue a run |
 | `GET /security` | Public attack surface |

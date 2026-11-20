@@ -87,6 +87,10 @@ pub struct BehaviourContext {
     budget: Arc<SharedBudget>,
     /// The run's input, so context providers can bind against it.
     input: serde_json::Value,
+    /// Extra request-body fields for `ask` calls (`@app.behaviour(options=...)`).
+    options: webcortex_core::manifest::RequestOptions,
+    /// The behaviour's span; its tool and model calls are children of it.
+    span: Option<webcortex_core::trace::TraceCtx>,
 
     trace: Mutex<Vec<TraceEntry>>,
 }
@@ -119,6 +123,8 @@ impl BehaviourContext {
         depth: u32,
         budget: Arc<SharedBudget>,
         input: serde_json::Value,
+        options: webcortex_core::manifest::RequestOptions,
+        span: Option<webcortex_core::trace::TraceCtx>,
     ) -> Self {
         Self {
             app,
@@ -142,6 +148,8 @@ impl BehaviourContext {
             depth,
             budget,
             input,
+            options,
+            span,
             trace: Mutex::new(Vec::new()),
         }
     }
@@ -297,7 +305,25 @@ impl BehaviourContext {
             context: Vec::new(),
             cache: false,
             policy: Default::default(),
+            options: self.options.clone(),
+            output_schema: None,
         }
+    }
+
+    /// A span for one tool call made by this behaviour.
+    fn tool_span(&self, tool: &str) -> webcortex_core::trace::Scoped<'_> {
+        let mut span = self.app.tracer().scoped(self.span.as_ref(), "tool", &format!("tool {tool}"));
+        span.set("gen_ai.operation.name", serde_json::json!("execute_tool"));
+        span.set("gen_ai.tool.name", serde_json::json!(tool));
+        span
+    }
+
+    /// A span for one model call made by this behaviour.
+    fn model_span(&self, model: &str) -> webcortex_core::trace::Scoped<'_> {
+        let mut span = self.app.tracer().scoped(self.span.as_ref(), "model", &format!("chat {model}"));
+        span.set("gen_ai.operation.name", serde_json::json!("chat"));
+        span.set("gen_ai.request.model", serde_json::json!(model));
+        span
     }
 
     /// Turn a provider response into what `ask` returns: structured output
@@ -336,6 +362,32 @@ impl BehaviourContext {
             elapsed,
         );
         Ok(response.text.into_pyobject(py)?.into_any().unbind())
+    }
+}
+
+/// Close a tool call's span with its outcome.
+fn end_tool_span(span: webcortex_core::trace::Scoped<'_>, result: &Result<serde_json::Value, String>) {
+    match result {
+        Ok(_) => span.ok(),
+        Err(e) => span.fail(webcortex_core::errors::code_in(e).unwrap_or("WC308")),
+    }
+}
+
+/// Close a model call's span with its token counts, or its failure.
+fn end_model_span(
+    mut span: webcortex_core::trace::Scoped<'_>,
+    response: &Result<webcortex_core::agent::ProviderResponse, String>,
+) {
+    match response {
+        Ok(r) => {
+            span.set("gen_ai.response.model", serde_json::json!(r.model));
+            span.set("gen_ai.usage.input_tokens", serde_json::json!(r.input_tokens));
+            span.set("gen_ai.usage.output_tokens", serde_json::json!(r.output_tokens));
+            span.set("webcortex.usage.cache_read_tokens", serde_json::json!(r.cache_read_tokens));
+            span.set("webcortex.usage.cache_write_tokens", serde_json::json!(r.cache_write_tokens));
+            span.ok();
+        }
+        Err(e) => span.fail(webcortex_core::errors::classify_run_error(e)),
     }
 }
 
@@ -401,15 +453,18 @@ impl BehaviourContext {
         let tool_name = tool.to_string();
         let depth = self.depth;
         let budget = self.budget.clone();
+        let span = self.tool_span(tool);
+        let trace = span.ctx().cloned();
 
         // Release the GIL: the tool call may take real time, and other worker
         // threads must keep running while it does.
         let result = py.detach(|| {
             self.handle.block_on(async move {
-                app.call_tool_in_tree(&tool_name, &args, &principal, depth, Some(budget))
+                app.call_tool_traced(&tool_name, &args, &principal, depth, Some(budget), trace)
                     .await
             })
         });
+        end_tool_span(span, &result);
 
         self.settle_call(py, tool, result, started.elapsed().as_millis() as u64)
     }
@@ -447,15 +502,20 @@ impl BehaviourContext {
         let depth = self.depth;
         let budget = self.budget.clone();
         let names: Vec<String> = calls.iter().map(|(n, _)| n.clone()).collect();
+        let spans: Vec<_> = names.iter().map(|n| self.tool_span(n)).collect();
+        let traces: Vec<_> = spans.iter().map(|s| s.ctx().cloned()).collect();
 
         let results: Vec<Result<serde_json::Value, String>> = py.detach(|| {
             self.handle.block_on(async move {
-                let futures = calls.iter().map(|(name, args)| {
-                    app.call_tool_in_tree(name, args, &principal, depth, Some(budget.clone()))
+                let futures = calls.iter().zip(traces).map(|((name, args), trace)| {
+                    app.call_tool_traced(name, args, &principal, depth, Some(budget.clone()), trace)
                 });
                 futures::future::join_all(futures).await
             })
         });
+        for (span, result) in spans.into_iter().zip(&results) {
+            end_tool_span(span, result);
+        }
         let elapsed = started.elapsed().as_millis() as u64;
 
         let list = PyList::empty(py);
@@ -530,6 +590,7 @@ impl BehaviourContext {
 
         let started = std::time::Instant::now();
         let provider = self.provider.clone();
+        let span = self.model_span(&def.model);
         let response = py.detach(|| {
             self.handle.block_on(async {
                 let req = CompletionRequest {
@@ -542,6 +603,7 @@ impl BehaviourContext {
                 provider.complete(&req).await
             })
         });
+        end_model_span(span, &response);
         let elapsed = started.elapsed().as_millis() as u64;
 
         let response = response.map_err(|e| {
@@ -593,6 +655,7 @@ impl BehaviourContext {
         let started = std::time::Instant::now();
         let provider = self.provider.clone();
         let limit = concurrency.clamp(1, 64);
+        let spans: Vec<_> = prompts.iter().map(|_| self.model_span(&def.model)).collect();
         let responses = py.detach(|| {
             self.handle.block_on(async {
                 use futures::StreamExt;
@@ -624,6 +687,9 @@ impl BehaviourContext {
             })
         });
         let elapsed = started.elapsed().as_millis() as u64;
+        for (span, response) in spans.into_iter().zip(&responses) {
+            end_model_span(span, response);
+        }
 
         // Every answer that came back was paid for, so every one is charged
         // before anything is raised. Settling in order and stopping at the

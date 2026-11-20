@@ -204,6 +204,12 @@ A proxied upstream answered with a body over its max_response_bytes (64 MiB by d
 
 The server already holds max_connections open connections (10,000 by default), WebSockets included. Retry shortly, close idle connections, or raise max_connections on WebCortex(...).
 
+### WC219 — Trace not found {#wc219}
+
+*http · HTTP 404*
+
+No trace with that id is held. Traces are kept in memory, newest first, up to app.tracing(keep=...) and not across a restart; GET /_webcortex/traces (or `webcortex trace`) lists the ones there are, and "latest" names the newest.
+
 ## Agents, behaviours, flows and providers (WC3xx)
 
 ### WC300 — Agent run failed {#wc300}
@@ -313,6 +319,24 @@ A watcher's agent run failed; the insight carries the error. GET /_webcortex/sta
 *agent*
 
 The model asked for a tool with arguments that are not a JSON object (cut off, garbled, or a bare value), so the tool was not run. The model is told and may retry; a small local model that keeps doing it needs a larger max_tokens or a simpler input schema.
+
+### WC318 — Answer does not match the output schema {#wc318}
+
+*agent · HTTP 502*
+
+The agent has an output schema and its answer still did not match after being corrected twice. The failing steps list what was wrong. Simplify the schema, say in the system prompt what each field means, raise max_tokens if the answer is being cut off, or use a stronger model.
+
+### WC319 — No recorded response to replay {#wc319}
+
+*agent · HTTP 502*
+
+A run replayed from a cassette asked for a model response the cassette does not hold: the agent's system prompt, model, tools or options changed since it was recorded, or the run now takes a different path. If the change is intended, record again with `webcortex eval --record`.
+
+### WC320 — Unreadable cassette or eval {#wc320}
+
+*agent*
+
+An eval could not be run: its cassette file is not valid JSON or not a cassette this version reads, or the eval names a target that is not a tool. Delete the cassette and record again with `webcortex eval --record`, or fix the target in app.eval(...).
 
 ## Budgets and limits (WC4xx)
 

@@ -184,6 +184,7 @@ impl PyBridge for PythonBridge {
         self.submit(handler, req, Some(gate))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn call_behaviour<'a>(
         &'a self,
         app: Arc<App>,
@@ -192,6 +193,7 @@ impl PyBridge for PythonBridge {
         principal: webcortex_core::auth::Principal,
         depth: u32,
         budget: Arc<webcortex_core::agent::SharedBudget>,
+        trace: Option<webcortex_core::trace::TraceCtx>,
     ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Captured here, on a tokio thread. The behaviour later runs on a Python
@@ -217,6 +219,8 @@ impl PyBridge for PythonBridge {
                 depth,
                 budget,
                 input.clone(),
+                def.options.clone(),
+                trace,
             );
             let completer = Py::new(
                 py,
@@ -456,6 +460,8 @@ fn ask_model(
                 context: Vec::new(),
                 cache: false,
                 policy: Default::default(),
+                options: Default::default(),
+                output_schema: None,
             };
             let conversation = Conversation {
                 messages: vec![Message { role: "user".into(), content: serde_json::json!(prompt) }],
@@ -493,6 +499,119 @@ fn ask_model(
     })
 }
 
+/// Run one eval: build the app, call one of its tools in-process as the
+/// principal `eval` holding `scopes`, and return what happened as JSON.
+///
+/// `mode` chooses where model responses come from: `"live"` asks the app's
+/// providers (or the fake one under `WEBCORTEX_FAKE_PROVIDER`), `"record"`
+/// does the same and returns the responses as a cassette, and `"replay"`
+/// answers from `cassette_json` with no network. Tools always run for real.
+///
+/// Nothing is bound to a port. The result is
+/// `{"status", "body", "error", "duration_ms", "usage", "trace", "cassette"?,
+/// "replay"?}`: `status` and `body` are the HTTP status and JSON body the tool's
+/// route produced, and `error` is set instead when the call could not be made.
+/// An unreadable cassette or an unknown mode raises `ValueError` (`WC320`).
+#[pyfunction]
+#[pyo3(signature = (manifest_json, dispatcher, workers, tool, args_json, scopes, mode = "live", cassette_json = None))]
+#[allow(clippy::too_many_arguments)]
+fn eval_call(
+    py: Python<'_>,
+    manifest_json: &str,
+    dispatcher: Py<PyAny>,
+    workers: usize,
+    tool: &str,
+    args_json: &str,
+    scopes: Vec<String>,
+    mode: &str,
+    cassette_json: Option<&str>,
+) -> PyResult<String> {
+    use webcortex_core::agent::replay::{RecordingProvider, ReplayProvider};
+
+    let manifest: Manifest = serde_json::from_str(manifest_json)
+        .map_err(|e| PyValueError::new_err(format!("invalid manifest: {e}")))?;
+    let args: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|e| PyValueError::new_err(format!("WC320: the eval's input is not JSON: {e}")))?;
+    let replayer = match (mode, cassette_json) {
+        ("replay", Some(text)) => {
+            let cassette: serde_json::Value = serde_json::from_str(text)
+                .map_err(|e| PyValueError::new_err(format!("WC320: the cassette is not valid JSON: {e}")))?;
+            Some(Arc::new(
+                ReplayProvider::from_cassette(&cassette).map_err(|e| PyValueError::new_err(format!("WC320: {e}")))?,
+            ))
+        }
+        ("replay", None) => return Err(PyValueError::new_err("WC320: replay needs a cassette")),
+        ("live" | "record", _) => None,
+        (other, _) => {
+            return Err(PyValueError::new_err(format!(
+                "WC320: unknown eval mode {other:?}; use live, record or replay"
+            )));
+        }
+    };
+    let record = mode == "record";
+    let tool = tool.to_string();
+
+    // Quiet by default: an eval run prints a report, not a server log.
+    webcortex_core::init_tracing("error");
+    let bridge = Arc::new(PythonBridge { dispatcher, workers });
+
+    py.detach(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+        rt.block_on(async move {
+            let app = App::build(manifest, bridge).await.map_err(PyRuntimeError::new_err)?;
+            let recorder = record.then(|| Arc::new(RecordingProvider::new(app.provider().clone())));
+            let app = match (&recorder, &replayer) {
+                (Some(r), _) => app.with_provider(r.clone()),
+                (None, Some(r)) => app.with_provider(r.clone()),
+                (None, None) => app,
+            };
+            let limit = std::time::Duration::from_secs(
+                app.manifest.server.agent_timeout_secs.max(app.manifest.server.request_timeout_secs).max(1),
+            );
+            let app = app.into_arc();
+            let principal = webcortex_core::Principal {
+                id: "eval".into(),
+                kind: webcortex_core::PrincipalKind::ApiKey,
+                scopes,
+                claims: Default::default(),
+            };
+            let started = std::time::Instant::now();
+            let call = app.tool_response(&tool, &args, &principal, 0, None, None);
+            let outcome = match tokio::time::timeout(limit, call).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(format!("the eval did not finish within {} s", limit.as_secs())),
+            };
+            let mut out = serde_json::json!({
+                "duration_ms": started.elapsed().as_millis() as u64,
+                "usage": app.ledger().snapshot(|m| app.registry().price_for(m)),
+                "trace": app.tracer().latest().and_then(|id| app.tracer().get(&id)),
+            });
+            match outcome {
+                Ok(res) => {
+                    out["status"] = serde_json::json!(res.status);
+                    out["body"] = res.json_value();
+                    out["error"] = serde_json::Value::Null;
+                }
+                Err(e) => {
+                    out["status"] = serde_json::Value::Null;
+                    out["body"] = serde_json::Value::Null;
+                    out["error"] = serde_json::json!(e);
+                }
+            }
+            if let Some(r) = &recorder {
+                out["cassette"] = r.cassette();
+            }
+            if let Some(r) = &replayer {
+                out["replay"] = r.stats();
+            }
+            Ok(out.to_string())
+        })
+    })
+}
+
 /// The error catalogue as JSON: `[{code, title, category, status, hint}]`.
 /// The Rust table is the single source; `webcortex explain` reads it here.
 #[pyfunction]
@@ -526,6 +645,7 @@ fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(typescript_client, m)?)?;
     m.add_function(wrap_pyfunction!(generate_api_key, m)?)?;
     m.add_function(wrap_pyfunction!(ask_model, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_call, m)?)?;
     m.add_function(wrap_pyfunction!(error_catalogue, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_models, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

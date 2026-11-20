@@ -361,6 +361,47 @@ fixes with a security impact; `tests/test_stress_*.py` holds a regression test f
 - **Disclosure:** a response that fails to serialise no longer sends its traceback to
   the client.
 
+## Review — 2.8.0
+
+What 2.8 adds to the surface, and how each piece is bounded.
+
+- **Traces.** `GET /_webcortex/traces` and `/traces/{id}` are control-plane routes: they
+  need `webcortex:admin` once any authentication is configured, like `/status` and
+  `/audit`, and the `webcortex_trace` MCP tool is offered only to a caller who may read the
+  control plane. A span holds names (agent, tool, model), timings, token counts and error
+  codes. It never holds a prompt, a tool argument, a tool result, a header or a
+  credential; a test asserts a trace of a run contains none of the tool's arguments or
+  result. Memory is bounded: 200 traces of at most 500 spans by default.
+- **Trace export sends metadata to a third party.** With an OTLP endpoint configured,
+  agent names, tool names, model names, timings and token counts leave the process. That
+  is the purpose, and it is off unless an endpoint is declared or the standard
+  `OTEL_EXPORTER_OTLP_*` variables are set, so check the environment of a deployment that
+  must not export. Export headers are named by environment variable, never embedded. The
+  exporter cannot grow without bound: a 4096-span queue, batches dropped (and counted) on
+  failure, no retry.
+- **`traceparent` is untrusted input.** A caller can choose the trace id its run is filed
+  under. Only a well-formed id is accepted (32 lowercase hex digits, not all zero), and a
+  trace id grants nothing: reading any trace needs the admin scope. A caller that reuses
+  an id already held appends spans to that trace, up to its span limit.
+- **Request options cannot take over the request.** `model`, `messages`, `tools`,
+  `tool_choice`, `system` and `stream` are refused at declaration and again by the core,
+  and skipped when the body is built, so an option cannot replace the conversation or the
+  tool list. Options come from the app's source, never from a request. They are sent to
+  the provider as written: do not put a secret in one, since they are part of the
+  manifest.
+- **Structured output is validated in the runtime**, not trusted from the provider. The
+  validator is a subset of JSON Schema and ignores `pattern`, `format` and `$ref`; do not
+  rely on those keywords as a security control on an agent's answer.
+- **Evals run in-process with the scopes you give them.** `webcortex eval` builds the app
+  and calls its tools for real, as a principal named `eval`, so an eval against a
+  production database changes production data. Run evals against a scratch database. A
+  cassette holds the model's recorded responses, which may quote your eval's input; it
+  holds no credential. Nothing about evals is reachable from a running server.
+
+Not tested: the exporter against a real collector (it is tested against a local HTTP
+endpoint that records what it receives), and trace memory under sustained very high run
+rates.
+
 ## Reporting
 
 Report a vulnerability privately through

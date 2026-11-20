@@ -36,7 +36,9 @@ pub async fn run(
     caller: &Principal,
     depth: u32,
     budget: Option<Arc<SharedBudget>>,
+    span: Option<crate::trace::TraceCtx>,
 ) -> Result<Value, String> {
+    let span = span.as_ref();
     let actor = caller.delegate_to_agent(&def.name, &def.scopes);
     let budget = budget.unwrap_or_else(|| SharedBudget::new(format!("flow:{}", def.name), def.token_budget));
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -57,7 +59,7 @@ pub async fn run(
                     status = "budget_exhausted";
                     break;
                 }
-                let (rec, result) = call_step(app, step, &value, &input, &actor, depth, &budget).await;
+                let (rec, result) = call_step(app, step, &value, &input, &actor, depth, &budget, span).await;
                 records.push(rec);
                 value = match result {
                     Ok(v) => v,
@@ -83,7 +85,7 @@ pub async fn run(
         FlowKind::Parallel { branches, merge } => {
             let futures = branches
                 .iter()
-                .map(|b| call_step(app, b, &input, &input, &actor, depth, &budget));
+                .map(|b| call_step(app, b, &input, &input, &actor, depth, &budget, span));
             let results = futures::future::join_all(futures).await;
             let mut outputs = Vec::with_capacity(results.len());
             let mut first_err = None;
@@ -121,7 +123,7 @@ pub async fn run(
         FlowKind::Route { routes, default, classify_with, classify_prompt } => {
             let labels: Vec<String> = routes.keys().cloned().collect();
             let t = std::time::Instant::now();
-            let label = classify(app, def, &labels, classify_with.as_deref(), classify_prompt.as_deref(), &input, &budget).await;
+            let label = classify(app, def, &labels, classify_with.as_deref(), classify_prompt.as_deref(), &input, &budget, span).await;
             let label = match label {
                 Ok(l) => {
                     records.push(StepRecord { tool: "classify".into(), duration_ms: t.elapsed().as_millis() as u64, ok: true, error: None, label: Some(l.clone()) });
@@ -141,7 +143,7 @@ pub async fn run(
                     return Err(e);
                 }
             };
-            let (rec, result) = call_step(app, step, &input, &input, &actor, depth, &budget).await;
+            let (rec, result) = call_step(app, step, &input, &input, &actor, depth, &budget, span).await;
             records.push(rec);
             match result {
                 Ok(v) => v,
@@ -166,6 +168,7 @@ pub async fn run(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_step(
     app: &App,
     step: &FlowStep,
@@ -174,13 +177,21 @@ async fn call_step(
     actor: &Principal,
     depth: u32,
     budget: &Arc<SharedBudget>,
+    parent: Option<&crate::trace::TraceCtx>,
 ) -> (StepRecord, Result<Value, String>) {
     let started = std::time::Instant::now();
     let args = build_args(app, step, incoming, original);
+    let mut span = app.tracer().scoped(parent, "tool", &format!("tool {}", step.tool));
+    span.set("gen_ai.operation.name", json!("execute_tool"));
+    span.set("gen_ai.tool.name", json!(step.tool));
     let result = app
-        .call_tool_in_tree(&step.tool, &args, actor, depth + 1, Some(budget.clone()))
+        .call_tool_traced(&step.tool, &args, actor, depth + 1, Some(budget.clone()), span.ctx().cloned())
         .await
         .and_then(|v| unwrap_output(&step.tool, v));
+    match &result {
+        Ok(_) => span.ok(),
+        Err(e) => span.fail(crate::errors::code_in(e).unwrap_or("WC315")),
+    }
     let rec = StepRecord {
         tool: step.tool.clone(),
         duration_ms: started.elapsed().as_millis() as u64,
@@ -192,7 +203,9 @@ async fn call_step(
 }
 
 /// What the next step receives. Agent and flow results are envelopes; the
-/// useful part is `output`.
+/// useful part is `output`, or `data` when the agent answered through an
+/// output schema, so a structured answer reaches the next step as an object
+/// rather than as its JSON text.
 fn unwrap_output(tool: &str, v: Value) -> Result<Value, String> {
     let is_envelope = v.get("output").is_some() && (v.get("run_id").is_some() || v.get("flow").is_some());
     if !is_envelope {
@@ -212,7 +225,10 @@ fn unwrap_output(tool: &str, v: Value) -> Result<Value, String> {
             .unwrap_or_default();
         return Err(format!("step {tool:?} failed: {why}"));
     }
-    Ok(v["output"].clone())
+    match v.get("data") {
+        Some(data) if !data.is_null() && v.get("run_id").is_some() => Ok(data.clone()),
+        _ => Ok(v["output"].clone()),
+    }
 }
 
 fn target_kind(app: &App, tool: &str) -> &'static str {
@@ -286,6 +302,7 @@ fn walk(v: &Value, path: &str) -> Value {
     cur.clone()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn classify(
     app: &App,
     def: &FlowDef,
@@ -294,6 +311,7 @@ async fn classify(
     prompt: Option<&str>,
     input: &Value,
     budget: &Arc<SharedBudget>,
+    parent: Option<&crate::trace::TraceCtx>,
 ) -> Result<String, String> {
     let rendered_input = match input {
         Value::String(s) => s.clone(),
@@ -331,6 +349,8 @@ async fn classify(
         context: Vec::new(),
         cache: false,
         policy: Default::default(),
+        options: Default::default(),
+        output_schema: None,
     };
     let tools = vec![ToolSpec {
         name: "choose".into(),
@@ -350,7 +370,22 @@ async fn classify(
             force_tool: Some("choose"),
             system_suffix: "",
         };
-        app.provider().complete(&req).await?
+        let mut span = app.tracer().scoped(parent, "model", &format!("chat {} (classify)", classifier.model));
+        span.set("gen_ai.operation.name", json!("chat"));
+        span.set("gen_ai.request.model", json!(classifier.model));
+        match app.provider().complete(&req).await {
+            Ok(r) => {
+                span.set("gen_ai.response.model", json!(r.model));
+                span.set("gen_ai.usage.input_tokens", json!(r.input_tokens));
+                span.set("gen_ai.usage.output_tokens", json!(r.output_tokens));
+                span.ok();
+                r
+            }
+            Err(e) => {
+                span.fail(crate::errors::classify_run_error(&e));
+                return Err(e);
+            }
+        }
     };
     let _ = budget.charge(response.total_tokens());
     app.ledger().charge(
@@ -419,7 +454,7 @@ mod tests {
     async fn a_failed_pipeline_step_is_audited_like_any_failed_flow() {
         let (app, _) = app(ScriptedProvider::text("x")).await;
         let who = Principal::anonymous();
-        let err = run(&app, flow(&app, "pipe"), json!({}), &who, 0, None).await.unwrap_err();
+        let err = run(&app, flow(&app, "pipe"), json!({}), &who, 0, None, None).await.unwrap_err();
         assert!(err.contains("boom"), "{err}");
         let events = app.audit.recent(50);
         let finished: Vec<_> = events.iter().filter(|e| e.kind == "flow_finished").collect();
@@ -434,13 +469,13 @@ mod tests {
         for name in ["fine", "par", "routed"] {
             let spent = SharedBudget::new("outer", Some(10));
             let _ = spent.charge(10);
-            let out = run(&app, flow(&app, name), json!({"input": "x"}), &who, 0, Some(spent)).await.unwrap();
+            let out = run(&app, flow(&app, name), json!({"input": "x"}), &who, 0, Some(spent), None).await.unwrap();
             assert_eq!(out["status"], "budget_exhausted", "{name}");
             assert!(out["steps"].as_array().unwrap().is_empty(), "{name}: no step ran");
         }
         assert_eq!(provider.calls(), 0, "the classifier was not asked on a spent budget");
         // With budget left, the same flows run.
-        let out = run(&app, flow(&app, "fine"), json!({}), &who, 0, Some(SharedBudget::new("o", Some(10)))).await.unwrap();
+        let out = run(&app, flow(&app, "fine"), json!({}), &who, 0, Some(SharedBudget::new("o", Some(10))), None).await.unwrap();
         assert_eq!(out["status"], "completed");
         assert_eq!(out["steps"].as_array().unwrap().len(), 2);
     }

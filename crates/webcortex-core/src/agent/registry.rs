@@ -13,7 +13,7 @@ use super::provider::{
     AnthropicProvider, CompletionRequest, FakeProvider, ModelProvider, OpenAiCompatProvider,
     ProviderResponse,
 };
-use crate::manifest::{AgentDef, ModelsConfig, Price};
+use crate::manifest::{AgentDef, ModelsConfig, Price, RequestOptions};
 use futures::future::BoxFuture;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -29,6 +29,8 @@ pub struct ProviderRegistry {
     openai: Option<Arc<dyn ModelProvider>>,
     fake: Option<Arc<dyn ModelProvider>>,
     pricing: BTreeMap<String, Price>,
+    /// Request options by provider name, merged beneath each agent's own.
+    options: BTreeMap<String, RequestOptions>,
 }
 
 impl ProviderRegistry {
@@ -122,7 +124,33 @@ impl ProviderRegistry {
             openai,
             fake,
             pricing: cfg.pricing.clone(),
+            options: cfg.options.clone(),
         }
+    }
+
+    /// The name of the provider a concrete model belongs to: its prefix, or
+    /// `openai` / `anthropic` for a bare name, by the same rule [`Self::route`]
+    /// uses. This is the key `app.provider(..., options=...)` and
+    /// `app.request_options(...)` store options under.
+    pub fn provider_name(concrete: &str) -> &str {
+        match concrete.split_once('/') {
+            Some((prefix, _)) => prefix,
+            None if concrete.starts_with("gpt-")
+                || concrete.starts_with("o1")
+                || concrete.starts_with("o3")
+                || concrete.starts_with("o4") => "openai",
+            None => "anthropic",
+        }
+    }
+
+    /// The request options a call to `concrete` carries: the provider's,
+    /// overridden key by key by the agent's.
+    pub fn options_for(&self, concrete: &str, own: &RequestOptions) -> RequestOptions {
+        let mut merged = self.options.get(Self::provider_name(concrete)).cloned().unwrap_or_default();
+        for (k, v) in own {
+            merged.insert(k.clone(), v.clone());
+        }
+        merged
     }
 
     /// Which providers are live, for the startup banner and `/_webcortex/models`.
@@ -134,6 +162,7 @@ impl ProviderRegistry {
             "fake": self.fake.is_some(),
             "prefixes": self.prefixed.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             "priced_models": self.pricing.keys().collect::<Vec<_>>(),
+            "options": self.options,
         })
     }
 
@@ -245,7 +274,8 @@ impl ModelProvider for ProviderRegistry {
             let (provider, wire_name) = self.route(&concrete)?;
             // The provider must see the stripped name; everything else about
             // the request is unchanged.
-            let def = AgentDef { model: wire_name, ..req.agent.clone() };
+            let options = self.options_for(&concrete, &req.agent.options);
+            let def = AgentDef { model: wire_name, options, ..req.agent.clone() };
             let inner = CompletionRequest {
                 agent: &def,
                 conversation: req.conversation,

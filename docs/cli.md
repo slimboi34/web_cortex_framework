@@ -264,6 +264,53 @@ $ webcortex status --json
 $ webcortex status --url https://api.example.com --key "$ADMIN_KEY"
 ```
 
+## `webcortex trace`
+
+What a recent agent, flow or behaviour run did, as a tree of spans: the run, each model call
+with its tokens, each tool call, each handoff, and nested runs under the call that started
+them. Reads `GET {control_prefix}/traces` (admin scope once auth is configured). See
+[Traces](tracing.md).
+
+```console
+$ webcortex trace                      # the recent traces, newest first
+$ webcortex trace latest               # the newest, as a tree
+$ webcortex trace 7d1c0b…e02a --json   # one trace, as the JSON document
+$ webcortex trace --url https://api.example.com --key "$ADMIN_KEY"
+```
+
+| Flag | Default | |
+|---|---|---|
+| `trace_id` | none | A trace id (from a run result's `trace_id` or the `x-webcortex-trace` header) or `latest`; omit to list |
+| `--app` | `api.py` | The app module, for its host, port and control prefix |
+| `--json` | off | The document instead of the table or tree |
+| `--url` | the app's host and port | Where the running instance is |
+| `--key` | `$WEBCORTEX_API_KEY`, then `$WEBCORTEX_TOKEN` | An admin credential |
+
+A trace that is not held exits 1 with `WC219`.
+
+## `webcortex eval`
+
+Run the evals the app declares with `app.eval(...)`, in-process, and exit 1 when any fails.
+With a recorded cassette an eval replays the model's responses: no key, no tokens, the same
+result every time, with the tools running for real. See [Evals and cassettes](evals.md).
+
+```console
+$ webcortex eval                    # replay where a cassette exists, otherwise call the providers
+$ webcortex eval --record           # call the providers, write evals/<name>.json
+$ webcortex eval --replay           # cassettes only; an eval without one fails (use in CI)
+$ webcortex eval --live             # call the providers, ignore cassettes
+$ webcortex eval --only refunds --json
+$ webcortex eval --list
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--record` / `--replay` / `--live` | auto | Where model responses come from; mutually exclusive |
+| `--dir` | `evals` | Where cassettes are read and written |
+| `--only NAME` | all | Run one eval; repeatable |
+| `--list` | off | List the declared evals and whether each has a cassette |
+| `--json` | off | The full report, including each eval's result body |
+
 ## `webcortex explain`
 
 What an error code means and what to do about it. Every error the runtime, the MCP endpoint or

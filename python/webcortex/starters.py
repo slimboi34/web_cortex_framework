@@ -64,6 +64,8 @@ worker pool.
 | `webcortex doctor` | is it ready to run: core version, manifest, provider keys (never their values), security, e-stop, budgets, port. `--online` probes the model providers. Exit 1 on a failure. |
 | `webcortex status` | what the **running** app is doing: requests per route, recent errors with codes and request ids, agent runs in flight and recent, spend, devices. Needs an admin key. |
 | `webcortex explain WCnnn` | what an error code means and what to do about it |
+| `webcortex trace [ID]` | what a recent agent, flow or behaviour run did, as a tree: each model call with its tokens, each tool call, nested runs. `latest` for the newest. Needs an admin key. |
+| `webcortex eval` | run the declared evals (`app.eval(...)`) in-process; exit 1 when one fails. `--record` saves the model's responses to `evals/`, after which evals replay them with no key and no tokens. |
 | `pytest` | the tests; `WEBCORTEX_FAKE_PROVIDER=1` runs agents against an offline provider |
 
 ## When something fails
@@ -93,6 +95,16 @@ handler, raise `HTTPError(status, message, hint="…")` so callers get the same.
 - **Cameras and sensors belong to the device hub.** `app.camera` / `app.sensor` / `app.watch`
   keep frames in Rust and give agents `<name>_snapshot` tools; do not write a Python route that
   stores frames. Device keys get only `devices:ingest`.
+- **Ask for a shape, not for JSON.** `app.agent(..., output=SomeDataclass)` makes the runtime
+  validate the answer against the schema and hand it back as `data`; do not parse prose, and
+  do not ask for JSON in the system prompt.
+- **Pin behaviour down with an eval.** When you add or change an agent, add an
+  `app.eval(name, target=..., input=..., expect={{...}})` saying which tools it should call and
+  where it should hand off, then `webcortex eval --record` and commit `evals/`. Changing a
+  system prompt, a tool or a model makes the recording stale (`WC319`) on purpose: record
+  again and read the diff.
+- **Provider-specific settings go in `options=`** (`{{"seed": 7}}`, `{{"keep_alive": "30m"}}`),
+  not in a new keyword or a wrapper around the provider.
 - **Agents cannot exceed their caller.** Scopes intersect, budgets (`max_steps`,
   `token_budget`) are enforced by the runtime, and a flow shares one budget across its tree.
   Do not try to widen authority from inside an agent.
@@ -131,6 +143,8 @@ webcortex security   # what is reachable without a credential
 webcortex tools      # the agent tool manifest
 webcortex typegen    # generate client/api.ts
 webcortex status     # what the running app is doing (admin key)
+webcortex trace      # what recent agent runs did, span by span (admin key)
+webcortex eval       # run the declared evals, replaying recorded model responses
 ```
 """
 
@@ -755,6 +769,22 @@ def triage(ctx, input):
         "urgent": sum(1 for v in verdicts if v["urgent"]),
         "usage": ctx.usage,
     }}
+
+
+# --- Evals: what this app must keep doing -----------------------------------
+# `webcortex eval --record` runs these against the model once and saves its
+# responses under evals/. After that `webcortex eval` replays them: no key, no
+# tokens, the same answer every time, with the tools and handoffs running for
+# real. Change an agent's prompt or tools and its recording goes stale.
+
+app.eval(
+    "refunds_reach_billing",
+    target="front_desk",
+    input="I was charged twice for my subscription and want a refund.",
+    scopes=["read", "write"],
+    expect={{"path": ["front_desk", "billing"], "max_tokens": 120_000}},
+    description="a refund request is handed to the billing specialist",
+)
 '''
 
 

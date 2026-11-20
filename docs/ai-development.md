@@ -108,6 +108,13 @@ it runs, and the app's own MCP endpoint offers `webcortex_status` and `webcortex
 — so an agent connected with `webcortex mcp-config` can find the request that failed and
 read what to do about its code. See [Diagnostics](diagnostics.md).
 
+Since 2.8 the same endpoint offers `webcortex_trace`: what a run did, span by span, with the
+tokens of every model call in the tree ([Traces](tracing.md)). And a change to an agent can be
+checked without a key or a token: `webcortex eval` replays recorded model responses against
+the app's real tools, and fails with `WC319` when the agent no longer matches its recording
+([Evals and cassettes](evals.md)). For a coding agent that is the missing half of the loop:
+*describe → propose → check → **eval** → run*.
+
 ## Why this shape
 
 A framework is easy for a model to write against when:

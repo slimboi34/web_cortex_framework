@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod provider;
 pub mod registry;
+pub mod replay;
 pub mod session;
 pub mod vision;
 
@@ -67,7 +68,24 @@ pub struct RunResult {
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// The validated answer of an agent declared with an output schema: the
+    /// arguments of its `final_answer` call. `output` holds the same value as
+    /// JSON text. Absent when the agent has no schema or did not complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+    /// The trace this run's spans belong to (`GET /_webcortex/traces/{id}`).
+    /// Absent when tracing is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
+
+/// The tool an agent with an output schema answers through.
+pub const FINAL_TOOL: &str = "final_answer";
+
+/// How many times a run may be told its answer did not match the schema
+/// before it fails with `WC318`. Each correction costs a model call, so the
+/// bound is small: a model that misses three times is not going to hit.
+pub const MAX_OUTPUT_REPAIRS: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +139,9 @@ pub enum StepKind {
     Handoff,
     /// Older turns were summarised to stay inside the context window.
     Compaction,
+    /// The structured answer of an agent with an output schema: accepted
+    /// (`result` holds it) or sent back for correction (`error`, `WC318`).
+    Output,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -267,6 +288,11 @@ pub struct RunOptions {
     /// Receives `{"type": "step", …}` as each step happens, for a client that
     /// wants to watch the run rather than wait for it (the agent WebSocket).
     pub events: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    /// The span this run is a child of, when it was started inside a traced
+    /// request tree (see [`crate::trace`]). `None` starts a new trace.
+    pub trace: Option<crate::trace::TraceCtx>,
+    /// The caller's W3C `traceparent` header, for a run that starts a trace.
+    pub traceparent: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +384,15 @@ struct RunState {
     /// What this run's own model calls cost at the declared prices; `None`
     /// once any of them used an unpriced model (never reported as free).
     cost_usd: Option<f64>,
+    /// This run's span; model and tool calls are its children.
+    span: Option<crate::trace::TraceCtx>,
+    /// The validated answer, once the model has given one that matches the
+    /// entry agent's output schema.
+    final_answer: Option<Value>,
+    /// Answers refused so far for not matching the schema.
+    output_repairs: u32,
+    /// Force the next model call to answer through `final_answer`.
+    force_final: bool,
 }
 
 impl RunState {
@@ -449,12 +484,28 @@ impl AgentRuntime {
             .budget
             .unwrap_or_else(|| SharedBudget::new(format!("agent:{}", def.name), def.token_budget));
 
-        let system_suffix = match self.system_suffix(app, def, &actor, input).await {
+        let span = app.tracer().begin(
+            opts.trace.as_ref(),
+            opts.traceparent.as_deref(),
+            "agent",
+            &format!("agent {}", def.name),
+        );
+        let trace_id = span.as_ref().map(|s| s.trace_id.to_string());
+
+        let system_suffix = match self.system_suffix(app, def, &actor, input, def.output_schema.is_some()).await {
             Ok(s) => s,
             Err(e) => {
                 let ev = AuditEvent::agent_failed(&run_id, &def.name, &e);
                 self.audit.record(ev);
                 let code = crate::errors::code_in(&e).unwrap_or("WC311");
+                if let Some(span) = &span {
+                    app.tracer().end(span, crate::trace::SpanStatus::Error, Some(code), vec![
+                        ("gen_ai.operation.name", json!("invoke_agent")),
+                        ("gen_ai.agent.name", json!(def.name)),
+                        ("webcortex.run.id", json!(run_id)),
+                        ("webcortex.run.status", json!("failed")),
+                    ]);
+                }
                 let result = RunResult {
                     run_id,
                     agent: def.name.clone(),
@@ -477,6 +528,8 @@ impl AgentRuntime {
                     session_id: opts.session_id,
                     code: Some(code.into()),
                     hint: Some(crate::errors::hint(code).into()),
+                    data: None,
+                    trace_id,
                 };
                 app.recorder().run_started(&result.run_id, &def.name, &caller.id, opts.depth);
                 record_finished(app, &result, None);
@@ -509,6 +562,10 @@ impl AgentRuntime {
             events: opts.events,
             emitted: 0,
             cost_usd: Some(0.0),
+            span,
+            final_answer: None,
+            output_repairs: 0,
+            force_final: false,
         };
 
         app.recorder().run_started(&state.run_id, &state.def.name, &caller.id, state.depth);
@@ -539,9 +596,14 @@ impl AgentRuntime {
         };
         rebase_onto_session(app, &mut st);
         app.recorder().run_started(&st.run_id, &st.def.name, &st.caller.id, st.depth);
+        // The span that ended when the run suspended becomes the parent of
+        // the one that continues it, so the trace shows the wait as a gap.
+        if let Some(suspended_span) = st.span.take() {
+            st.span = app.tracer().begin(Some(&suspended_span), None, "agent", &format!("agent {} (resumed)", st.def.name));
+        }
         // The approved call runs before `drive` does; dropped there, the run
         // is cancelled just the same.
-        let mut guard = CancelGuard { app, run_id: Some(st.run_id.clone()) };
+        let mut guard = CancelGuard { app, run_id: Some(st.run_id.clone()), span: st.span.clone() };
 
         if approve {
             self.audit.record(AuditEvent::approval_decided(
@@ -587,7 +649,7 @@ impl AgentRuntime {
         // The future driving a run is dropped when its request times out or
         // its client goes away; the run then never reaches `finish`. The
         // guard takes it out of the status view's in-flight list either way.
-        let mut guard = CancelGuard { app, run_id: Some(st.run_id.clone()) };
+        let mut guard = CancelGuard { app, run_id: Some(st.run_id.clone()), span: st.span.clone() };
         let result = self.drive_steps(app, st).await;
         guard.run_id = None;
         result
@@ -598,6 +660,15 @@ impl AgentRuntime {
 
         loop {
             st.emit();
+            // A structured answer was accepted (in this turn, or in the one an
+            // approval resumed): the run is over.
+            if st.final_answer.is_some() {
+                return self.finish(app, st, RunStatus::Completed, None);
+            }
+            // The last WC318 step is the failing one, and gives the run its code.
+            if st.output_repairs > MAX_OUTPUT_REPAIRS {
+                return self.finish(app, st, RunStatus::Failed, None);
+            }
             if st.usage.steps >= max_steps {
                 return self.finish(app, st, RunStatus::StepLimit, None);
             }
@@ -642,21 +713,35 @@ impl AgentRuntime {
             let dropped = vision::prune(&mut st.conversation.messages, st.entry.policy.max_images);
             st.usage.images_dropped = st.usage.images_dropped.saturating_add(dropped as u32);
 
-            let tools = self.tool_specs(app, &st.def);
+            let tools = self.specs_for(app, &st);
             let started = std::time::Instant::now();
+            let mut span = app.tracer().scoped(st.span.as_ref(), "model", &format!("chat {}", st.def.model));
+            span.set("gen_ai.operation.name", json!("chat"));
+            span.set("gen_ai.request.model", json!(st.def.model));
+            span.set("gen_ai.agent.name", json!(st.def.name));
             let response = {
                 let req = CompletionRequest {
                     agent: &st.def,
                     conversation: &st.conversation,
                     tools: &tools,
-                    force_tool: None,
+                    force_tool: st.force_final.then_some(FINAL_TOOL),
                     system_suffix: &st.system_suffix,
                 };
                 self.provider.complete(&req).await
             };
+            st.force_final = false;
             let response = match response {
-                Ok(r) => r,
+                Ok(r) => {
+                    span.set("gen_ai.response.model", json!(r.model));
+                    span.set("gen_ai.usage.input_tokens", json!(r.input_tokens));
+                    span.set("gen_ai.usage.output_tokens", json!(r.output_tokens));
+                    span.set("webcortex.usage.cache_read_tokens", json!(r.cache_read_tokens));
+                    span.set("webcortex.usage.cache_write_tokens", json!(r.cache_write_tokens));
+                    span.ok();
+                    r
+                }
                 Err(e) => {
+                    span.fail(crate::errors::classify_run_error(&e));
                     st.steps.push(Step {
                         index: st.usage.steps,
                         kind: StepKind::Model,
@@ -714,6 +799,27 @@ impl AgentRuntime {
                 return self.finish(app, st, RunStatus::MaxTokens, None);
             }
             if !runs_tools {
+                // An agent with an output schema that answered in prose: take
+                // the JSON out of it if it is there and conforms (a local
+                // model that ignores tool_choice), otherwise say what was
+                // wrong and require the answer as a call.
+                if let Some(schema) = st.entry.output_schema.clone() {
+                    let candidate = recover_json(&response.text);
+                    let problems = match &candidate {
+                        Some(value) => crate::schema::validate(&schema, value),
+                        None => vec![format!("$: the answer was plain text, not a {FINAL_TOOL} call")],
+                    };
+                    if let (Some(value), true) = (candidate, problems.is_empty()) {
+                        self.accept_output(&mut st, value);
+                        return self.finish(app, st, RunStatus::Completed, None);
+                    }
+                    let correction = self.reject_output(app, &mut st, &problems);
+                    if st.output_repairs <= MAX_OUTPUT_REPAIRS {
+                        st.conversation.messages.push(Message { role: "user".into(), content: json!(correction) });
+                        st.force_final = true;
+                    }
+                    continue;
+                }
                 return self.finish(app, st, RunStatus::Completed, None);
             }
 
@@ -741,11 +847,33 @@ impl AgentRuntime {
         for (i, call) in calls.iter().enumerate().skip(start) {
             let started = std::time::Instant::now();
 
+            // The structured answer. Checked here, by the runtime, because a
+            // provider only asks the model to follow a tool's schema.
+            if call.name == FINAL_TOOL
+                && let Some(schema) = st.entry.output_schema.clone()
+            {
+                let problems = if call.arguments.is_object() {
+                    crate::schema::validate(&schema, &call.arguments)
+                } else {
+                    vec!["$: the arguments were not a JSON object".to_string()]
+                };
+                if problems.is_empty() {
+                    self.accept_output(st, call.arguments.clone());
+                    results.push(tool_result(&call.id, &json!({"accepted": true}), false));
+                } else {
+                    let correction = self.reject_output(app, st, &problems);
+                    results.push(tool_result(&call.id, &json!({"error": correction}), true));
+                }
+                continue;
+            }
+
             // 0. A handoff: swap the agent in control and carry on.
             if let Some(target) = call.name.strip_prefix("transfer_to_")
                 && st.def.handoffs.iter().any(|h| h == target) {
                     match self.handoff(app, st, target, &call.arguments).await {
                         Ok(msg) => {
+                            app.tracer().event(st.span.as_ref(), "handoff", &format!("handoff {target}"), None,
+                                               vec![("gen_ai.agent.name", json!(target))]);
                             st.steps.push(Step {
                                 index: st.usage.steps,
                                 kind: StepKind::Handoff,
@@ -775,6 +903,7 @@ impl AgentRuntime {
                     st.def.tools.join(", ")
                 );
                 st.steps.push(refused(st.usage.steps, call, &msg, started));
+                app.tracer().event(st.span.as_ref(), "tool", &format!("tool {}", call.name), Some("WC307"), vec![]);
                 app.recorder().record_failure("tool", &format!("tool {} (agent {})", call.name, st.def.name), "WC307", &st.run_id);
                 self.audit
                     .record(AuditEvent::tool_refused(&st.run_id, &st.actor, &call.name, &msg));
@@ -794,6 +923,7 @@ impl AgentRuntime {
                     match &shown { Value::String(s) => s.clone(), other => other.to_string() },
                 );
                 st.steps.push(refused(st.usage.steps, call, &msg, started));
+                app.tracer().event(st.span.as_ref(), "tool", &format!("tool {}", call.name), Some("WC317"), vec![]);
                 app.recorder().record_failure("tool", &format!("tool {} (agent {})", call.name, st.def.name), "WC317", &st.run_id);
                 self.audit
                     .record(AuditEvent::tool_refused(&st.run_id, &st.actor, &call.name, &msg));
@@ -825,9 +955,16 @@ impl AgentRuntime {
     async fn dispatch_call(&self, app: &App, st: &mut RunState, call: &ToolCall) -> Value {
         let started = std::time::Instant::now();
         st.usage.tool_calls += 1;
+        let mut span = app.tracer().scoped(st.span.as_ref(), "tool", &format!("tool {}", call.name));
+        span.set("gen_ai.operation.name", json!("execute_tool"));
+        span.set("gen_ai.tool.name", json!(call.name));
         let outcome = app
-            .call_tool_in_tree(&call.name, &call.arguments, &st.actor, st.depth + 1, Some(st.budget.clone()))
+            .call_tool_traced(&call.name, &call.arguments, &st.actor, st.depth + 1, Some(st.budget.clone()), span.ctx().cloned())
             .await;
+        match &outcome {
+            Ok(_) => span.ok(),
+            Err(e) => span.fail(crate::errors::code_in(e).unwrap_or("WC308")),
+        }
         let duration_ms = started.elapsed().as_millis() as u64;
         self.audit.record(AuditEvent::tool_called(
             &st.run_id, &st.actor, &call.name, &call.arguments, outcome.is_ok(), duration_ms,
@@ -893,7 +1030,9 @@ impl AgentRuntime {
         // conversation's first message was used here, which in a session is
         // the first turn ever and after a compaction is the summary.
         let input = st.input.clone();
-        st.system_suffix = self.system_suffix(app, &next, &actor, &input).await?;
+        st.system_suffix = self
+            .system_suffix(app, &next, &actor, &input, st.entry.output_schema.is_some())
+            .await?;
         st.actor = actor;
         st.def = next;
         st.path.push(target.to_string());
@@ -971,6 +1110,8 @@ impl AgentRuntime {
             context: Vec::new(),
             cache: false,
             policy: Default::default(),
+            options: Default::default(),
+            output_schema: None,
         };
         let conversation = Conversation {
             messages: vec![Message {
@@ -979,6 +1120,9 @@ impl AgentRuntime {
             }],
         };
         let started = std::time::Instant::now();
+        let mut span = app.tracer().scoped(st.span.as_ref(), "model", &format!("chat {} (compaction)", summariser.model));
+        span.set("gen_ai.operation.name", json!("chat"));
+        span.set("gen_ai.request.model", json!(summariser.model));
         let response = {
             let req = CompletionRequest {
                 agent: &summariser,
@@ -987,10 +1131,18 @@ impl AgentRuntime {
                 force_tool: None,
                 system_suffix: "",
             };
-            self.provider
-                .complete(&req)
-                .await
-                .map_err(|e| format!("compaction with model {:?} failed: {e}", summariser.model))?
+            match self.provider.complete(&req).await {
+                Ok(r) => {
+                    span.set("gen_ai.usage.input_tokens", json!(r.input_tokens));
+                    span.set("gen_ai.usage.output_tokens", json!(r.output_tokens));
+                    span.ok();
+                    r
+                }
+                Err(e) => {
+                    span.fail(crate::errors::classify_run_error(&e));
+                    return Err(format!("compaction with model {:?} failed: {e}", summariser.model));
+                }
+            }
         };
         self.charge(app, st, "compaction", &response);
         if response.text.is_empty() {
@@ -1042,6 +1194,7 @@ impl AgentRuntime {
         def: &AgentDef,
         actor: &Principal,
         input: &str,
+        structured: bool,
     ) -> Result<String, String> {
         let mut suffix = String::new();
         if !def.context.is_empty() {
@@ -1057,7 +1210,73 @@ impl AgentRuntime {
                  transfer_to_* tool instead of answering it yourself.",
             );
         }
+        if structured {
+            if !suffix.is_empty() {
+                suffix.push_str("\n\n");
+            }
+            suffix.push_str(
+                "Give your final answer by calling the final_answer tool with arguments that \
+                 match its schema. Do not give the final answer as plain text.",
+            );
+        }
         Ok(suffix)
+    }
+
+    /// The tools the model is offered this step: the agent in control's own,
+    /// plus `final_answer` when the entry agent declared an output schema (the
+    /// caller's contract survives a handoff).
+    fn specs_for(&self, app: &App, st: &RunState) -> Vec<ToolSpec> {
+        let mut specs = self.tool_specs(app, &st.def);
+        if let Some(schema) = &st.entry.output_schema {
+            specs.push(ToolSpec {
+                name: FINAL_TOOL.into(),
+                description: "Give the final answer. Call this exactly once, when the work is done; \
+                              its arguments are the answer."
+                    .into(),
+                input_schema: schema.clone(),
+            });
+        }
+        specs
+    }
+
+    /// Record a structured answer that matched the schema.
+    fn accept_output(&self, st: &mut RunState, value: Value) {
+        st.steps.push(Step {
+            index: st.usage.steps,
+            kind: StepKind::Output,
+            tool: Some(FINAL_TOOL.into()),
+            arguments: None,
+            result: Some(value.clone()),
+            error: None,
+            code: None,
+            hint: None,
+            duration_ms: 0,
+        });
+        st.final_answer = Some(value);
+    }
+
+    /// Record an answer that did not match, and return what the model is told.
+    fn reject_output(&self, app: &App, st: &mut RunState, problems: &[String]) -> String {
+        st.output_repairs += 1;
+        let message = format!(
+            "the answer does not match the required output schema (WC318): {}. Call {FINAL_TOOL} \
+             again with arguments that match its schema.",
+            problems.join("; ")
+        );
+        st.steps.push(Step {
+            index: st.usage.steps,
+            kind: StepKind::Output,
+            tool: Some(FINAL_TOOL.into()),
+            arguments: None,
+            result: None,
+            error: Some(message.clone()),
+            code: Some("WC318".into()),
+            hint: None,
+            duration_ms: 0,
+        });
+        app.tracer().event(st.span.as_ref(), "output", "output rejected", Some("WC318"), vec![]);
+        app.recorder().record_failure("tool", &format!("output of agent {}", st.entry.name), "WC318", &st.run_id);
+        message
     }
 
     fn charge(&self, app: &App, st: &mut RunState, kind: &str, response: &ProviderResponse) {
@@ -1199,6 +1418,26 @@ impl AgentRuntime {
             }
         }
         let code = outcome_code(status, &st.steps);
+        let data = if status == RunStatus::Completed { st.final_answer.take() } else { None };
+        if let Some(value) = &data {
+            st.output = value.to_string();
+        }
+        let status_name = serde_json::to_value(status).ok().and_then(|v| v.as_str().map(str::to_string));
+        if let Some(span) = &st.span {
+            let outcome = match status {
+                RunStatus::Failed => crate::trace::SpanStatus::Error,
+                _ => crate::trace::SpanStatus::Ok,
+            };
+            app.tracer().end(span, outcome, code, vec![
+                ("gen_ai.operation.name", json!("invoke_agent")),
+                ("gen_ai.agent.name", json!(st.entry.name)),
+                ("webcortex.run.id", json!(st.run_id)),
+                ("webcortex.run.status", json!(status_name)),
+                ("webcortex.run.steps", json!(st.usage.steps)),
+                ("webcortex.run.tokens", json!(st.usage.total_tokens())),
+                ("webcortex.run.depth", json!(st.depth)),
+            ]);
+        }
         let result = RunResult {
             run_id: st.run_id,
             agent: st.def.name,
@@ -1211,6 +1450,8 @@ impl AgentRuntime {
             session_id: st.session_id,
             code: code.map(str::to_string),
             hint: code.map(|c| crate::errors::hint(c).to_string()),
+            data,
+            trace_id: st.span.as_ref().map(|s| s.trace_id.to_string()),
         };
         record_finished(app, &result, st.cost_usd);
         result
@@ -1261,6 +1502,7 @@ fn outcome_code(status: RunStatus, steps: &[Step]) -> Option<&'static str> {
 struct CancelGuard<'a> {
     app: &'a App,
     run_id: Option<String>,
+    span: Option<crate::trace::TraceCtx>,
 }
 
 impl Drop for CancelGuard<'_> {
@@ -1268,6 +1510,12 @@ impl Drop for CancelGuard<'_> {
         if let Some(run_id) = self.run_id.take() {
             tracing::info!(run_id = %run_id, "agent run cancelled before it finished (timeout or client gone)");
             self.app.recorder().run_cancelled(&run_id);
+            if let Some(span) = &self.span {
+                self.app.tracer().end(span, crate::trace::SpanStatus::Cancelled, None, vec![
+                    ("webcortex.run.id", json!(run_id)),
+                    ("webcortex.run.status", json!("cancelled")),
+                ]);
+            }
         }
     }
 }
@@ -1286,6 +1534,7 @@ fn record_finished(app: &App, r: &RunResult, cost_usd: Option<f64>) {
         tree_tokens: r.usage.tree_tokens,
         cost_usd,
         code: r.code.as_deref(),
+        trace_id: r.trace_id.as_deref(),
     });
 }
 

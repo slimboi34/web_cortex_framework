@@ -82,16 +82,20 @@ nav:
   - Agents:
       - Tools and MCP: agents-tools.md
       - Agents: agents.md
+      - Structured output: structured-output.md
       - Behaviours: behaviours.md
       - Orchestration: orchestration.md
       - Context and memory: context.md
       - Models and token economy: models.md
+      - Request options: request-options.md
+      - Evals and cassettes: evals.md
       - Vision and robotics: vision-and-robotics.md
       - The device hub: device-hub.md
   - Operating:
       - Security: security.md
       - Deployment: deployment.md
       - Diagnostics: diagnostics.md
+      - Traces: tracing.md
       - AI-native development: ai-development.md
 
   - Reference:

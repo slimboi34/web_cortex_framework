@@ -22,9 +22,11 @@ pub mod mcp;
 pub mod middleware;
 pub mod openapi;
 pub mod router;
+pub mod schema;
 pub mod server;
 pub mod status;
 pub mod templates;
+pub mod trace;
 pub mod typegen;
 pub mod ws;
 
@@ -177,8 +179,8 @@ mod tests {
         let tools = res.json_value()["result"]["tools"].clone();
         let names: Vec<&str> = tools.as_array().expect("tools array").iter()
             .filter_map(|t| t["name"].as_str()).collect();
-        // The app's exposed route, then the two built-in observability tools.
-        assert_eq!(names, vec!["a", mcp::STATUS_TOOL, mcp::EXPLAIN_TOOL]);
+        // The app's exposed route, then the three built-in observability tools.
+        assert_eq!(names, vec!["a", mcp::STATUS_TOOL, mcp::EXPLAIN_TOOL, mcp::TRACE_TOOL]);
     }
 
     #[tokio::test]

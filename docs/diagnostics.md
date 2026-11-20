@@ -137,6 +137,9 @@ control-plane route) describes what the running app is doing:
 | `estop` | halted or armed, the halt state, the actuator tools |
 | `devices` | per device: connected, recent fps, frames in, dropped (over `max_fps`) and rejected (not an image, empty, too large), last frame and telemetry age, subscribers; per watcher: runs, failures, last outcome and code |
 
+Each recent run also carries `trace_id`: `webcortex trace <id>` (or `GET /_webcortex/traces/<id>`)
+shows what that run did span by span. See [Traces](tracing.md).
+
 Request ids are the `x-request-id` the client sent (or the one the server assigned and returned),
 so a failure a user reports can be found here. Nothing in the view holds a body, a header, a
 query string or a credential; a failure's route is the route *pattern* (`GET /books/{id}`), not

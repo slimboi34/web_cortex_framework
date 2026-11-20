@@ -53,6 +53,62 @@ pub struct Manifest {
     /// Loops that hand a device's newest frame to an agent and publish what it says.
     #[serde(default)]
     pub watchers: Vec<WatcherDef>,
+    /// Span traces of agent, flow and behaviour runs. See [`crate::trace`].
+    #[serde(default)]
+    pub tracing: TracingConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Traces
+// ---------------------------------------------------------------------------
+
+/// How runs are traced and where the spans go. See [`crate::trace`].
+///
+/// Tracing is on by default and costs nothing on routes that run no model:
+/// only agent, flow and behaviour runs open spans. Spans never hold a prompt,
+/// an argument or a result, only names, timings, token counts and error codes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TracingConfig {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// How many recent traces `GET /_webcortex/traces` keeps in memory.
+    #[serde(default = "default_trace_keep")]
+    pub keep: usize,
+    /// Spans kept per trace; further ones are counted as dropped.
+    #[serde(default = "default_trace_spans")]
+    pub max_spans: usize,
+    /// OTLP/HTTP endpoint to export finished spans to, e.g.
+    /// `http://localhost:4318`. When unset, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+    /// and then `OTEL_EXPORTER_OTLP_ENDPOINT` are read from the environment.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// Environment variable holding the export headers as `k=v,k2=v2` (the
+    /// `OTEL_EXPORTER_OTLP_HEADERS` format). Named, never embedded.
+    #[serde(default)]
+    pub otlp_headers_env: Option<String>,
+    /// `service.name` on exported spans. Defaults to the app's name.
+    #[serde(default)]
+    pub service_name: Option<String>,
+}
+
+fn default_trace_keep() -> usize {
+    200
+}
+fn default_trace_spans() -> usize {
+    500
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep: default_trace_keep(),
+            max_spans: default_trace_spans(),
+            otlp_endpoint: None,
+            otlp_headers_env: None,
+            service_name: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +265,33 @@ pub struct ModelsConfig {
     /// and a stale number is worse than none.
     #[serde(default)]
     pub pricing: BTreeMap<String, Price>,
+    /// `provider name -> request options` merged into every request body sent
+    /// to that provider, beneath the agent's own `options`. The name is a
+    /// declared provider or a built-in one (`anthropic`, `openai`, `ollama`).
+    #[serde(default)]
+    pub options: BTreeMap<String, RequestOptions>,
+}
+
+/// Extra top-level fields for a provider's request body: the pass-through for
+/// whatever a provider supports that WebCortex has no keyword for (`seed`,
+/// `top_p`, `keep_alive`, `response_format`, `thinking`, …). A `null` value
+/// removes a field the runtime would otherwise send. See
+/// [`crate::agent::provider::apply_options`].
+pub type RequestOptions = serde_json::Map<String, serde_json::Value>;
+
+/// Body fields the runtime owns. Setting or removing one through `options`
+/// would break the tool loop (or, for `stream`, the response parser), so it is
+/// a boot error instead.
+pub const RESERVED_OPTIONS: [&str; 6] = ["model", "messages", "tools", "tool_choice", "system", "stream"];
+
+/// Why `options` cannot be used, if they cannot.
+pub fn options_problem(options: &RequestOptions) -> Option<String> {
+    options.keys().find(|k| RESERVED_OPTIONS.contains(&k.as_str())).map(|k| {
+        format!(
+            "option {k:?} is managed by the runtime and cannot be set through options              (reserved: {})",
+            RESERVED_OPTIONS.join(", ")
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,6 +720,9 @@ pub struct BehaviourDef {
     /// Context providers resolved on demand via `ctx.context(name)`.
     #[serde(default)]
     pub context: Vec<String>,
+    /// Extra request-body fields for this behaviour's `ctx.ask` calls.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub options: RequestOptions,
 }
 
 fn default_behaviour_steps() -> u32 {
@@ -1059,6 +1145,17 @@ pub struct AgentDef {
     pub cache: bool,
     #[serde(default)]
     pub policy: ContextPolicy,
+    /// Extra top-level fields for the provider's request body, merged over the
+    /// provider's own (`models.options`). See [`RequestOptions`].
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub options: RequestOptions,
+    /// The JSON Schema the run's answer must match. With one set, the agent
+    /// finishes by calling a `final_answer` tool, the runtime validates what
+    /// it sent (see [`crate::schema`]), and the result carries the value as
+    /// `data`. An answer that still does not match after
+    /// [`crate::agent::MAX_OUTPUT_REPAIRS`] corrections fails the run (WC318).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -1079,6 +1176,39 @@ impl Manifest {
             if !agent_seen.insert(a.name.as_str()) {
                 return Err(format!("duplicate agent name {:?}", a.name));
             }
+            if let Some(problem) = options_problem(&a.options) {
+                return Err(format!("agent {:?}: {problem}", a.name));
+            }
+            if let Some(schema) = &a.output_schema {
+                if let Some(problem) = crate::schema::output_schema_problem(schema) {
+                    return Err(format!("agent {:?} has an output schema that cannot be used: {problem}", a.name));
+                }
+                if a.tools.iter().any(|t| t == crate::agent::FINAL_TOOL) {
+                    return Err(format!(
+                        "agent {:?} has an output schema, so the tool name {:?} is taken by its answer;                          rename the route's tool",
+                        a.name,
+                        crate::agent::FINAL_TOOL
+                    ));
+                }
+            }
+        }
+        for b in &self.behaviours {
+            if let Some(problem) = options_problem(&b.options) {
+                return Err(format!("behaviour {:?}: {problem}", b.name));
+            }
+        }
+        for (provider, options) in &self.models.options {
+            if let Some(problem) = options_problem(options) {
+                return Err(format!("provider {provider:?}: {problem}"));
+            }
+        }
+        if self.tracing.enabled && (self.tracing.keep == 0 || self.tracing.max_spans == 0) {
+            return Err("tracing.keep and tracing.max_spans must be at least 1 (or disable tracing)".into());
+        }
+        if let Some(url) = &self.tracing.otlp_endpoint
+            && !(url.starts_with("http://") || url.starts_with("https://"))
+        {
+            return Err(format!("tracing.otlp_endpoint must start with http:// or https://, got {url:?}"));
         }
 
         let mut device_seen = std::collections::HashSet::new();

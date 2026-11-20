@@ -67,6 +67,8 @@ pub trait PyBridge: Send + Sync + 'static {
     /// object rather than a request: it needs to reach back into the runtime for
     /// tool and model calls, which a plain handler never does. `budget` is the
     /// request tree's; the runtime creates it when the behaviour is outermost.
+    /// `trace` is the behaviour's own span, the parent of what it calls.
+    #[allow(clippy::too_many_arguments)]
     fn call_behaviour<'a>(
         &'a self,
         _app: std::sync::Arc<crate::App>,
@@ -75,6 +77,7 @@ pub trait PyBridge: Send + Sync + 'static {
         _principal: crate::auth::Principal,
         _depth: u32,
         _budget: std::sync::Arc<crate::agent::SharedBudget>,
+        _trace: Option<crate::trace::TraceCtx>,
     ) -> BoxFuture<'a, Result<serde_json::Value, String>> {
         Box::pin(async move {
             Err(format!(

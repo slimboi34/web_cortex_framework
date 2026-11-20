@@ -63,8 +63,8 @@ Everything else in this document is downstream of those five ideas.
 
 ## 2. What exists and has been measured
 
-Working today, with **106 Rust tests and 249 Python tests** passing and clippy
-clean:
+Working today, with **284 Rust tests and 677 Python tests** passing and clippy
+clean (as of 2.8.0):
 
 **Runtime**
 - Manifest IR, boot-time validation, method-partitioned radix router
@@ -102,12 +102,21 @@ clean:
 - Audit trail including refused calls, handoffs, compactions and decisions
 - A deterministic fake provider so the whole stack is tested end to end over
   HTTP with no key
+- Structured agent output: an output schema checked by the runtime, with
+  bounded correction (2.8)
+- Request options: a per-agent and per-provider pass-through into the request
+  body, uninterpreted (2.8)
+- Run traces: a span tree per request tree, joined to a caller's `traceparent`,
+  exported as OTLP/HTTP JSON (2.8)
+- Evals that replay recorded model responses against the real tools, with
+  cassettes that go stale when the agent they were recorded for changes (2.8)
 
 **Developer surface**
 - OpenAPI 3.1, MCP (`initialize`, `tools/list`, `tools/call`, batching,
   notifications), TypeScript client generation
 - `webcortex` CLI: `new`, `dev`, `run`, `check`, `security`, `openapi`, `tools`,
-  `typegen`, `sql`, `keygen`, `context`, `evolve`
+  `typegen`, `sql`, `keygen`, `context`, `evolve`, `doctor`, `status`,
+  `explain`, `trace`, `eval`
 - The context pack and `webcortex evolve`; the scout
 
 
@@ -327,6 +336,40 @@ Ordered by what unblocks the most.
    (codes), recover from (hints) and look up afterwards (the live view) — not
    prose and a log file.
 
+**v2.8 — shipped: evidence**
+✅ Structured output. An agent declared with an output schema answers through a
+   `final_answer` tool and the runtime validates what it sent, corrects it at
+   most twice, and fails the run with a code otherwise. The check is in the
+   core because a provider only *asks* a model to follow a tool's schema. The
+   validator is a deliberate subset of JSON Schema: no `pattern` (that would
+   be a regex engine in the core for one keyword), no `$ref`.
+✅ Request options: `options=` on an agent, a behaviour or a provider becomes
+   top-level fields of the request body, uninterpreted. This is how §5's "no
+   universal LLM abstraction" stays true while a local thinking model's
+   switches, a sampling seed or a provider's newest field stay reachable: the
+   framework carries the field and knows nothing about it. Six fields the tool
+   loop owns are reserved.
+✅ Traces. Every model-backed run is a span tree that follows the request tree
+   through agents, tools, flows and behaviours, by explicit context rather
+   than a task-local (a behaviour re-enters the runtime from a Python thread).
+   Kept in memory, served by the control plane and MCP, exported as OTLP/HTTP
+   JSON with the app's existing HTTP client and no OpenTelemetry SDK. That is
+   most of item 11: token counts leave the process on spans. Ledger *metrics*
+   export is still open. Spans carry no content, which is what makes them
+   safe to send to someone else's collector.
+✅ Evals with cassettes. The model is the probabilistic half of an agent app;
+   the tools, scopes, handoffs, budgets and flows are the deterministic half,
+   and that half deserves tests that cost nothing to run. A cassette replays
+   the model's responses per agent and refuses when the agent's prompt, model,
+   tools or options no longer match the recording, so a prompt change cannot
+   pass on old answers. Deliberately no model-graded checks: a grader is
+   another probabilistic step, and belongs in the application.
+   This is *replay of recorded responses within a test*, not the durable runs
+   of item 12: nothing here survives a restart or resumes a run.
+
+   What 2.8 did not do: item 5's token deltas (SSE) are still deferred, for
+   the reason given in Tier 2 — the response body is still `Bytes`.
+
 **Later, if warranted**
 12. Durable agent runs — only with a real design for exactly-once tool
     execution. Sessions and approvals stay in memory until then, and say so.
@@ -391,6 +434,13 @@ than public authenticated apps; compaction quality depends on a summarisation
 prompt, which is the probabilistic part of an otherwise deterministic loop;
 and a Behaviour holds a worker thread for its whole run, which is fine for
 procedures measured in seconds and wrong for ones measured in hours.
+As of 2.8: traces are held in memory and lost on restart; the trace exporter
+is tested against a local endpoint that records what it receives, not against
+a real collector, and speaks OTLP's JSON encoding only; the cost of tracing a
+run has not been benchmarked; a cassette replays responses in recorded order
+per agent, so two differently-named agents racing each other are matched by
+name rather than by time; and the output-schema validator ignores `pattern`,
+`format` and `$ref`.
 
 
 The largest genuine risk is still not technical, it is scope. A framework that

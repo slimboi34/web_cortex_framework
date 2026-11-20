@@ -160,15 +160,39 @@ app.agent("assistant", context=["policy"], memory="notes",
 
 ---
 
+## Evidence: typed answers, traces, evals
+
+*New in 2.8.* What an agent answered, what a run did, and whether it still does it.
+
+```python
+app.agent("triage", system="Classify the ticket.", output=Triage)     # validated by the runtime
+app.agent("local", model="ollama/qwen3.5:9b", options={"seed": 7})    # provider pass-through
+app.eval("refund_goes_to_billing", target="front_desk", input="I was charged twice",
+         expect={"path": ["front_desk", "billing"], "max_tokens": 6000})
+```
+
+```console
+$ webcortex trace latest        # the run as a span tree: model calls, tokens, tools, nested runs
+$ webcortex eval --record       # keep the model's responses…
+$ webcortex eval --replay       # …and replay them in CI: no key, no tokens, real tools
+```
+
+[Structured output](structured-output.md){ .md-button }
+[Traces](tracing.md){ .md-button }
+[Evals and cassettes](evals.md){ .md-button }
+[Request options](request-options.md){ .md-button }
+
+---
+
 ## Status
 
 !!! warning "Young"
-    v2.7.0, on PyPI as `web-cortex-framework`. Working and tested, but young.
+    v2.8.0, on PyPI as `web-cortex-framework`. Working and tested, but young.
     Read [Deployment](deployment.md#is-it-production-ready) for an honest
     assessment of what it is and is not ready for.
 
-**Verified:** 355 tests (106 Rust, 249 Python, including a 54-test adversarial
-suite and an offline end-to-end suite that drives the whole agent stack over
+**Verified:** 961 tests (284 Rust, 677 Python, including a 54-test adversarial
+suite and offline end-to-end suites that drive the whole agent stack over
 HTTP). Clippy clean. `cargo audit` clean. CI builds wheels for Linux
 (x86_64/aarch64), macOS (arm64/x86_64), and Windows across Python 3.12, 3.13,
 3.14 and free-threaded 3.14 (`3.14t`).

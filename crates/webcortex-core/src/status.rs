@@ -238,6 +238,8 @@ pub struct RunSummary<'a> {
     pub tree_tokens: u64,
     pub cost_usd: Option<f64>,
     pub code: Option<&'a str>,
+    /// The run's trace, so the status view links to `/traces/{id}`.
+    pub trace_id: Option<&'a str>,
 }
 
 pub struct Recorder {
@@ -411,6 +413,7 @@ impl Recorder {
             "cost_usd": s.cost_usd,
             "duration_ms": duration_ms,
             "finished_at_ms": unix_ms(),
+            "trace_id": s.trace_id,
         }));
         drop(book);
         if let Some(code) = s.code
@@ -667,7 +670,7 @@ mod tests {
                                 run_id: &id, agent: "a", path: &path,
                                 status: if i % 4 == 1 { "failed" } else { "completed" },
                                 steps: 1, tool_calls: 0, tokens: 10, tree_tokens: 10, cost_usd: None,
-                                code: (i % 4 == 1).then_some("WC304"),
+                                code: (i % 4 == 1).then_some("WC304"), trace_id: None,
                             });
                         }
                     }
@@ -734,6 +737,7 @@ mod tests {
         r.run_finished(RunSummary {
             run_id: "run1", agent: "desk", path: &["desk".to_string()], status: "budget_exhausted",
             steps: 2, tool_calls: 1, tokens: 40, tree_tokens: 40, cost_usd: None, code: Some("WC402"),
+            trace_id: None,
         });
         let (runs, tallies) = r.runs();
         assert!(runs["in_flight"].as_array().unwrap().is_empty());
@@ -774,6 +778,7 @@ mod tests {
         r.run_finished(RunSummary {
             run_id: "run2", agent: "desk", path: &["desk".to_string()], status: "completed",
             steps: 1, tool_calls: 0, tokens: 5, tree_tokens: 5, cost_usd: None, code: None,
+            trace_id: None,
         });
         r.run_cancelled("run2");
         let (_, tally) = r.runs();

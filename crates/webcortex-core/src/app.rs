@@ -60,6 +60,8 @@ pub struct App {
     devices: crate::devices::DeviceHub,
     /// Request counters, recent failures and agent runs: the live view.
     recorder: crate::status::Recorder,
+    /// Spans of recent agent, flow and behaviour runs.
+    tracer: Arc<crate::trace::Tracer>,
     /// One permit per open connection or WebSocket; `None` when uncapped.
     connections: Option<Arc<tokio::sync::Semaphore>>,
     /// Flipped once at shutdown. Every WebSocket holds a receiver, so "no
@@ -178,6 +180,7 @@ impl App {
         let manifest_max_connections = manifest.server.max_connections;
         let devices = crate::devices::DeviceHub::new(&manifest.devices, client.clone());
         let recorder = crate::status::Recorder::new(&manifest);
+        let tracer = Arc::new(crate::trace::Tracer::new(&manifest.tracing));
 
         Ok(Self {
             manifest,
@@ -218,6 +221,7 @@ impl App {
             shutdown: tokio::sync::watch::Sender::new(false),
             devices,
             recorder,
+            tracer,
         })
     }
 
@@ -355,6 +359,17 @@ impl App {
         &self.recorder
     }
 
+    /// The trace store: spans of recent runs, and the door to the exporter.
+    pub fn tracer(&self) -> &Arc<crate::trace::Tracer> {
+        &self.tracer
+    }
+
+    /// Where a model-backed op's span attaches: under the span of the call
+    /// that reached it, or, at the edge, under the caller's `traceparent`.
+    fn span_for(&self, req: &WebCortexRequest, kind: &'static str, name: &str) -> Option<crate::trace::TraceCtx> {
+        self.tracer.begin(req.trace.as_ref(), req.headers.get("traceparent").map(String::as_str), kind, name)
+    }
+
     /// The live system view: requests, failures, runs, spend, e-stop, devices.
     pub fn status(&self) -> serde_json::Value {
         crate::status::snapshot(self)
@@ -440,6 +455,16 @@ impl App {
 
     pub async fn build_without_python(manifest: Manifest) -> Result<Self, String> {
         Self::build(manifest, Arc::new(NoBridge)).await
+    }
+
+    /// Answer every model call in this app from `provider` instead of the
+    /// registry: a cassette being replayed or recorded (`webcortex eval`), or
+    /// a scripted provider in a test. Agents, behaviours, flow classifiers
+    /// and compaction all go through it.
+    pub fn with_provider(mut self, provider: Arc<dyn crate::agent::ModelProvider>) -> Self {
+        self.agent_runtime = Some(AgentRuntime::new(provider.clone(), self.audit.clone()));
+        self.provider = provider;
+        self
     }
 
     /// Swap in a deterministic provider. Used by tests.
@@ -760,13 +785,32 @@ impl App {
             .ok_or_else(|| format!("unknown flow {name:?}"))?
             .clone();
         let input = req.json_body().unwrap_or(serde_json::Value::Null);
-        match crate::flow::run(self, &def, input, &req.principal, req.depth, req.budget.clone()).await {
-            Ok(value) => Ok(WebCortexResponse::json(200, &value)),
+        let span = self.span_for(&req, "flow", &format!("flow {}", def.name));
+        let outcome = crate::flow::run(self, &def, input, &req.principal, req.depth, req.budget.clone(), span.clone()).await;
+        let mut res = match outcome {
+            Ok(mut value) => {
+                if let Some(span) = &span {
+                    self.tracer.end(span, crate::trace::SpanStatus::Ok, None, vec![
+                        ("webcortex.flow.name", serde_json::json!(def.name)),
+                        ("webcortex.run.status", value["status"].clone()),
+                        ("webcortex.run.tokens", value["usage"]["tree_tokens"].clone()),
+                    ]);
+                    value["trace_id"] = serde_json::json!(&*span.trace_id);
+                }
+                WebCortexResponse::json(200, &value)
+            }
             Err(e) => {
                 let code = if e.contains("token budget") { "WC402" } else { "WC315" };
-                Ok(WebCortexResponse::coded(500, code, e))
+                if let Some(span) = &span {
+                    self.tracer.end(span, crate::trace::SpanStatus::Error, Some(code), vec![
+                        ("webcortex.flow.name", serde_json::json!(def.name)),
+                    ]);
+                }
+                WebCortexResponse::coded(500, code, e)
             }
-        }
+        };
+        trace_header(&mut res, span.as_ref(), req.depth);
+        Ok(res)
     }
 
     /// Refuse an invocation nested deeper than the configured ceiling.
@@ -826,12 +870,22 @@ impl App {
             .budget
             .clone()
             .unwrap_or_else(|| SharedBudget::new(format!("behaviour:{}", def.name), def.token_budget));
-        match self
+        let span = self.span_for(&req, "behaviour", &format!("behaviour {}", def.name));
+        // Ended here whichever way the behaviour ends, including a request
+        // timeout that drops this future mid-run.
+        let mut guard = SpanGuard { tracer: &self.tracer, span: span.clone(), outcome: None };
+        let outcome = self
             .bridge
-            .call_behaviour(app, def.clone(), input, actor.clone(), req.depth + 1, budget)
-            .await
-        {
-            Ok(value) => Ok(WebCortexResponse::json(200, &value)),
+            .call_behaviour(app, def.clone(), input, actor.clone(), req.depth + 1, budget, span.clone())
+            .await;
+        match outcome {
+            Ok(value) => {
+                guard.outcome = Some(None);
+                drop(guard);
+                let mut res = WebCortexResponse::json(200, &value);
+                trace_header(&mut res, span.as_ref(), req.depth);
+                Ok(res)
+            }
             Err(e) => {
                 self.audit.record(crate::audit::AuditEvent {
                     kind: "behaviour_failed".into(),
@@ -844,7 +898,11 @@ impl App {
                 let code = crate::errors::code_in(e.get(..6).unwrap_or_default())
                     .filter(|_| e.as_bytes().get(5) == Some(&b':'))
                     .unwrap_or("WC003");
-                Ok(WebCortexResponse::coded(500, code, e))
+                guard.outcome = Some(Some(code));
+                drop(guard);
+                let mut res = WebCortexResponse::coded(500, code, e);
+                trace_header(&mut res, span.as_ref(), req.depth);
+                Ok(res)
             }
         }
     }
@@ -969,9 +1027,17 @@ impl App {
             reset_session,
             images,
             events: None,
+            traceparent: if req.trace.is_none() { req.headers.get("traceparent").cloned() } else { None },
+            trace: req.trace.clone(),
         };
         let result = runtime.run(self, def, &req.principal, &input, opts).await;
-        Ok(run_result_response(&result))
+        let mut res = run_result_response(&result);
+        if req.depth == 0
+            && let Some(id) = &result.trace_id
+        {
+            res.headers.push(("x-webcortex-trace".into(), id.clone()));
+        }
+        Ok(res)
     }
 
     /// Run an agent directly. Used by the control plane and by tests.
@@ -1153,17 +1219,47 @@ impl App {
         depth: u32,
         budget: Option<Arc<SharedBudget>>,
     ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
-        Box::pin(async move { self.call_tool_inner(tool_name, args, principal, depth, budget).await })
+        self.call_tool_traced(tool_name, args, principal, depth, budget, None)
     }
 
-    async fn call_tool_inner(
+    /// As [`Self::call_tool_in_tree`], naming the span the call is made under
+    /// so a run it starts joins the caller's trace.
+    pub fn call_tool_traced<'a>(
+        &'a self,
+        tool_name: &'a str,
+        args: &'a serde_json::Value,
+        principal: &'a Principal,
+        depth: u32,
+        budget: Option<Arc<SharedBudget>>,
+        trace: Option<crate::trace::TraceCtx>,
+    ) -> futures::future::BoxFuture<'a, Result<serde_json::Value, String>> {
+        Box::pin(async move {
+            let res = self.tool_response(tool_name, args, principal, depth, budget, trace).await?;
+            if res.status >= 400 {
+                return Err(format!(
+                    "tool {tool_name} failed with {}: {}",
+                    res.status,
+                    String::from_utf8_lossy(&res.body)
+                ));
+            }
+            Ok(res.json_value())
+        })
+    }
+
+    /// Call a tool in-process and return the response it produced, whatever
+    /// its status: what [`Self::call_tool_traced`] turns into a value or an
+    /// error string, kept whole for a caller that needs the body of a failure
+    /// (an eval reading the envelope of a failed run). `Err` is only for a
+    /// call that could not be made: an unknown tool, a missing path argument.
+    pub async fn tool_response(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
         principal: &Principal,
         depth: u32,
         budget: Option<Arc<SharedBudget>>,
-    ) -> Result<serde_json::Value, String> {
+        trace: Option<crate::trace::TraceCtx>,
+    ) -> Result<WebCortexResponse, String> {
         let route_id = *self
             .tools_by_name
             .get(tool_name)
@@ -1240,17 +1336,10 @@ impl App {
             principal: principal.clone(),
             depth,
             budget,
+            trace,
         };
 
-        let res = self.dispatch(req).await;
-        if res.status >= 400 {
-            return Err(format!(
-                "tool {tool_name} failed with {}: {}",
-                res.status,
-                String::from_utf8_lossy(&res.body)
-            ));
-        }
-        Ok(res.json_value())
+        Ok(self.dispatch(req).await)
     }
 
     /// Convenience wrapper granting exactly the scopes a route declares.
@@ -1268,6 +1357,38 @@ impl App {
             claims: Default::default(),
         };
         self.call_tool_as(tool_name, args, &principal).await
+    }
+}
+
+/// Ends a span when dropped: as given by `outcome` (`Some(None)` ok,
+/// `Some(Some(code))` failed), or as cancelled when the future holding it was
+/// dropped first.
+struct SpanGuard<'a> {
+    tracer: &'a crate::trace::Tracer,
+    span: Option<crate::trace::TraceCtx>,
+    outcome: Option<Option<&'static str>>,
+}
+
+impl Drop for SpanGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(span) = &self.span {
+            let (status, code) = match self.outcome {
+                Some(None) => (crate::trace::SpanStatus::Ok, None),
+                Some(Some(code)) => (crate::trace::SpanStatus::Error, Some(code)),
+                None => (crate::trace::SpanStatus::Cancelled, None),
+            };
+            self.tracer.end(span, status, code, vec![]);
+        }
+    }
+}
+
+/// Tell an HTTP caller which trace its run produced. Only at the edge: a
+/// nested call's response is a tool result, not something a client reads.
+fn trace_header(res: &mut WebCortexResponse, span: Option<&crate::trace::TraceCtx>, depth: u32) {
+    if depth == 0
+        && let Some(span) = span
+    {
+        res.headers.push(("x-webcortex-trace".into(), span.trace_id.to_string()));
     }
 }
 

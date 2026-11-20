@@ -134,6 +134,17 @@ where
         "webcortex listening"
     );
 
+    // Finished spans leave the process when an OTLP endpoint is configured.
+    let (trace_stop, trace_stopped) = tokio::sync::watch::channel(false);
+    let exporter = app.tracer().export_target(|k| std::env::var(k).ok()).and_then(|target| {
+        tracing::info!(endpoint = %target.url, "exporting run traces (OTLP/HTTP JSON)");
+        let service = (
+            app.manifest.tracing.service_name.clone().unwrap_or_else(|| app.manifest.name.clone()),
+            app.manifest.version.clone(),
+        );
+        app.tracer().start_export(app.http_client().clone(), target, service, trace_stopped)
+    });
+
     // Watchers hand device frames to agents on a timer. They stop with the server.
     let watchers = crate::devices::spawn_watchers(app.clone());
     if !watchers.is_empty() || !app.devices().is_empty() {
@@ -266,6 +277,11 @@ where
             websockets = app.open_sockets(),
             "drain timed out; exiting with connections still open"
         ),
+    }
+    // The runs that just drained ended spans; send them before the process goes.
+    let _ = trace_stop.send(true);
+    if let Some(exporter) = exporter {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(6), exporter).await;
     }
     Ok(())
 }
@@ -704,6 +720,7 @@ async fn route_request(
             principal,
             depth: 0,
             budget: None,
+            trace: None,
         });
         // A handler that hangs must not hold a connection forever.
         match tokio::time::timeout(timeout, dispatch).await {
@@ -980,6 +997,17 @@ async fn control_plane(
         // The live view: what is this app doing right now.
         ("GET", "/status") => WebCortexResponse::json(200, &app.status()),
 
+        // What recent runs did, as spans: agents, model calls, tool calls.
+        ("GET", "/traces") => WebCortexResponse::json(200, &app.tracer().list()),
+        ("GET", path) if path.starts_with("/traces/") => {
+            let id = path.trim_start_matches("/traces/").trim_end_matches('/');
+            let id = if id == "latest" { app.tracer().latest().unwrap_or_default() } else { id.to_string() };
+            match app.tracer().get(&id) {
+                Some(trace) => WebCortexResponse::json(200, &trace),
+                None => WebCortexResponse::coded(404, "WC219", format!("no trace {id:?} is held")),
+            }
+        }
+
         // The error catalogue, so a client can explain a code it received.
         ("GET", "/errors") => WebCortexResponse::json(
             200,
@@ -1147,6 +1175,8 @@ async fn control_plane(
                     "scopes": a.scopes,
                     "cache": a.cache,
                     "policy": a.policy,
+                    "options": a.options,
+                    "output_schema": a.output_schema,
                 })).collect::<Vec<_>>()
             }),
         ),

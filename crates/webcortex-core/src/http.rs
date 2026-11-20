@@ -35,6 +35,9 @@ pub struct WebCortexRequest {
     /// The token ceiling shared by every model-backed op in this request tree.
     /// `None` at the edge; set once an agent, behaviour or flow starts one.
     pub budget: Option<std::sync::Arc<crate::agent::SharedBudget>>,
+    /// The span this request is a child of, when it is an in-process call made
+    /// inside a traced run. `None` at the edge. See [`crate::trace`].
+    pub trace: Option<crate::trace::TraceCtx>,
 }
 
 impl WebCortexRequest {
@@ -51,6 +54,7 @@ impl WebCortexRequest {
             principal: crate::auth::Principal::anonymous(),
             depth: 0,
             budget: None,
+            trace: None,
         }
     }
 

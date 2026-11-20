@@ -373,7 +373,29 @@ pub fn anthropic_body(req: &CompletionRequest<'_>) -> Value {
             body["tool_choice"] = json!({"type": "tool", "name": name});
         }
     }
+    apply_options(&mut body, &agent.options);
     body
+}
+
+/// Merge an agent's request options into a provider request body.
+///
+/// Each key becomes a top-level field of the body, replacing whatever the
+/// runtime put there; a `null` value removes the field instead (how
+/// `max_tokens` is swapped for `max_completion_tokens` on models that insist).
+/// The fields the tool loop depends on ([`crate::manifest::RESERVED_OPTIONS`])
+/// are skipped here as well as refused at boot, so no path can clobber them.
+pub fn apply_options(body: &mut Value, options: &crate::manifest::RequestOptions) {
+    let Some(map) = body.as_object_mut() else { return };
+    for (key, value) in options {
+        if crate::manifest::RESERVED_OPTIONS.contains(&key.as_str()) {
+            continue;
+        }
+        if value.is_null() {
+            map.remove(key);
+        } else {
+            map.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 pub fn parse_anthropic(payload: &Value, model: &str) -> Result<ProviderResponse, String> {
@@ -537,6 +559,7 @@ pub fn openai_body(req: &CompletionRequest) -> Value {
             body["tool_choice"] = json!({"type": "function", "function": {"name": name}});
         }
     }
+    apply_options(&mut body, &agent.options);
     body
 }
 
@@ -1003,6 +1026,8 @@ impl ModelProvider for ScriptedProvider {
 /// * `json:<object>`        — when a tool is being forced, answer with it
 /// * `context?`             — answer with the resolved system suffix, so a
 ///   test can see what context providers injected
+/// * `options?`             — answer with the request options the call
+///   carries (the provider's merged with the agent's), as JSON
 /// * anything else          — answered as text, prefixed by the agent name
 ///
 /// After tool results come back the fake answers with a text summary of them,
@@ -1061,7 +1086,18 @@ impl ModelProvider for FakeProvider {
 
             // A forced tool: structured output.
             if let Some(forced) = req.force_tool {
-                let prompt = last_text.clone().unwrap_or_default();
+                let mut prompt = last_text.clone().unwrap_or_default();
+                // A forced call that follows a correction (structured output
+                // being repaired) answers from the newest earlier message that
+                // carries `json:`, as a model would answer the original ask.
+                if !prompt.contains("json:")
+                    && let Some(earlier) = req.conversation.messages.iter().rev().find_map(|m| {
+                        let text = crate::agent::message_text(&m.content);
+                        (m.role == "user" && text.contains("json:")).then_some(text)
+                    })
+                {
+                    prompt = earlier;
+                }
                 // The first JSON value after `json:`, ignoring whatever follows
                 // it — a flow's classifier appends the input after the prompt.
                 let args = prompt
@@ -1113,6 +1149,16 @@ impl ModelProvider for FakeProvider {
 
             if text.trim() == "context?" {
                 let reply = format!("{}|{}", req.agent.system, req.system_suffix);
+                return done(
+                    reply.clone(),
+                    Vec::new(),
+                    json!([{"type": "text", "text": reply}]),
+                    StopReason::EndTurn,
+                );
+            }
+
+            if text.trim() == "options?" {
+                let reply = Value::Object(req.agent.options.clone()).to_string();
                 return done(
                     reply.clone(),
                     Vec::new(),

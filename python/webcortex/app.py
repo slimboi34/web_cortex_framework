@@ -63,6 +63,54 @@ def _reasoning(value: str | None, who: str) -> str | None:
     return value
 
 
+# Request-body fields the runtime owns; `options=` may not set or remove them.
+RESERVED_OPTIONS = ("model", "messages", "tools", "tool_choice", "system", "stream")
+
+# The tool an agent declared with `output=` answers through.
+FINAL_TOOL = "final_answer"
+
+
+def _options(value: dict | None, who: str) -> dict:
+    """Validate `options=` on an agent, behaviour or provider and return a copy.
+
+    Options are extra top-level fields for the provider's request body; a value of
+    ``None`` removes a field the runtime would otherwise send. The fields the tool
+    loop depends on (:data:`RESERVED_OPTIONS`) are refused here, at declaration.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not all(isinstance(k, str) and k for k in value):
+        raise ValueError(f"{who}: options must be a dict with string keys, e.g. {{'seed': 7}}")
+    reserved = sorted(k for k in value if k in RESERVED_OPTIONS)
+    if reserved:
+        raise ValueError(
+            f"{who}: option {reserved[0]!r} is managed by the runtime and cannot be set through "
+            f"options (reserved: {', '.join(RESERVED_OPTIONS)})"
+        )
+    try:
+        return json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{who}: options must be JSON-serialisable ({e})") from None
+
+
+def _output_schema(output: Any, who: str) -> dict | None:
+    """`output=` on an agent: a JSON Schema dict, or a type to derive one from.
+
+    The answer is delivered as a tool call, and a tool's arguments are an object on
+    both wire formats, so the schema's top-level type must be ``"object"``: a
+    dataclass, a ``TypedDict``, or a dict schema with ``"type": "object"``.
+    """
+    if output is None:
+        return None
+    schema = dict(output) if isinstance(output, dict) else _schema.json_schema_for(output)
+    if schema.get("type") != "object":
+        raise ValueError(
+            f"{who}: output must describe a JSON object (a dataclass, a TypedDict, or a schema "
+            f"with \"type\": \"object\"), got {output!r}; wrap a list or scalar in an object field"
+        )
+    return schema
+
+
 class WebCortex:
     def __init__(
         self,
@@ -123,7 +171,9 @@ class WebCortex:
         self._memories: list[dict] = []
         self._devices: list[dict] = []
         self._watchers: list[dict] = []
-        self._models: dict = {"aliases": {}, "providers": {}, "pricing": {}}
+        self._models: dict = {"aliases": {}, "providers": {}, "pricing": {}, "options": {}}
+        self._tracing: dict = {"enabled": True}
+        self._evals: list = []
         self._resources: list[Resource] = []
         self._schema_sql: list[str] = []
         self._next_id = 0
@@ -733,6 +783,7 @@ class WebCortex:
         base_url: str,
         kind: str = "openai",
         api_key_env: str | None = None,
+        options: dict | None = None,
     ) -> None:
         """Declare a model endpoint reachable as `<name>/<model>`.
 
@@ -740,6 +791,20 @@ class WebCortex:
         LM Studio, Groq, OpenRouter, a second Ollama host. `kind="anthropic"`
         is a Messages-API gateway. As everywhere else, the credential is named
         by environment variable, never embedded.
+
+        Args:
+            name: The prefix models of this provider are named with.
+            base_url: Where requests go; must start with ``http://`` or ``https://``.
+            kind: ``"openai"`` or ``"anthropic"``, the wire format.
+            api_key_env: The environment variable holding the key, if one is needed.
+            options: Extra request-body fields sent with every call to this
+                provider, beneath any agent's own ``options`` (see
+                :meth:`request_options`).
+
+        Example::
+
+            app.provider("vllm", base_url="http://gpu-box:8000/v1",
+                         options={"chat_template_kwargs": {"enable_thinking": False}})
         """
         if kind not in ("openai", "anthropic"):
             raise ValueError("provider(): kind must be 'openai' or 'anthropic'")
@@ -749,6 +814,95 @@ class WebCortex:
             "kind": kind,
             "base_url": base_url,
             "api_key_env": api_key_env,
+        }
+        if options is not None:
+            self.request_options(name, **options)
+
+    def request_options(self, provider: str, **options: Any) -> None:
+        """Send extra request-body fields with every call to one provider.
+
+        The pass-through for whatever a provider supports that WebCortex has no
+        keyword for. Each option becomes a top-level field of the request body;
+        ``None`` removes a field the runtime would otherwise send. An agent's or
+        behaviour's own ``options=`` override these key by key.
+
+        Args:
+            provider: A declared provider's name, or a built-in one:
+                ``"anthropic"`` (bare ``claude-*`` names and ``anthropic/…``),
+                ``"openai"`` (``gpt-*``, ``o1``/``o3``/``o4`` and ``openai/…``) or
+                ``"ollama"``.
+            **options: The fields. ``model``, ``messages``, ``tools``,
+                ``tool_choice``, ``system`` and ``stream`` belong to the runtime
+                and raise ``ValueError``.
+
+        Returns:
+            None. Calling it again for the same provider merges the new options
+            over the earlier ones.
+
+        Example::
+
+            app.request_options("ollama", keep_alive="30m")
+            # newer OpenAI models take max_completion_tokens instead of max_tokens
+            app.request_options("openai", max_tokens=None, max_completion_tokens=8000)
+        """
+        if not isinstance(provider, str) or not provider:
+            raise ValueError("request_options(): provider must be a provider name")
+        merged = {**self._models["options"].get(provider, {}),
+                  **_options(options, f"request_options({provider!r})")}
+        self._models["options"][provider] = merged
+
+    def tracing(
+        self,
+        *,
+        enabled: bool = True,
+        keep: int = 200,
+        max_spans: int = 500,
+        otlp_endpoint: str | None = None,
+        otlp_headers_env: str | None = None,
+        service_name: str | None = None,
+    ) -> None:
+        """Configure run traces: how many are kept, and where spans are exported.
+
+        Tracing is on without calling this. Every agent, flow and behaviour run
+        records a span tree (the run, each model call with its tokens, each tool
+        call, each handoff, nested runs under the call that started them), served
+        by ``GET /_webcortex/traces`` and ``webcortex trace``. Spans hold names,
+        timings, token counts and error codes: never a prompt, an argument or a
+        result.
+
+        Args:
+            enabled: ``False`` turns tracing off; run results then carry no
+                ``trace_id``.
+            keep: How many recent traces are kept in memory.
+            max_spans: Spans kept per trace; further ones are counted as dropped.
+            otlp_endpoint: An OTLP/HTTP collector, e.g. ``"http://localhost:4318"``
+                (``/v1/traces`` is appended). Finished spans are posted there as
+                JSON, in batches. When unset, the standard
+                ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` and
+                ``OTEL_EXPORTER_OTLP_ENDPOINT`` environment variables are read.
+            otlp_headers_env: The *name* of an environment variable holding export
+                headers as ``k=v,k2=v2`` (default ``OTEL_EXPORTER_OTLP_HEADERS``).
+                Named, never embedded, like every other credential.
+            service_name: ``service.name`` on exported spans; defaults to the
+                app's name.
+
+        Returns:
+            None.
+
+        Example::
+
+            app.tracing(otlp_endpoint="https://otlp.example.com",
+                        otlp_headers_env="OTLP_HEADERS", keep=500)
+        """
+        if otlp_endpoint is not None and not otlp_endpoint.startswith(("http://", "https://")):
+            raise ValueError("tracing(): otlp_endpoint must start with http:// or https://")
+        self._tracing = {
+            "enabled": bool(enabled),
+            "keep": _positive_int("tracing", "keep", keep),
+            "max_spans": _positive_int("tracing", "max_spans", max_spans),
+            "otlp_endpoint": otlp_endpoint,
+            "otlp_headers_env": otlp_headers_env,
+            "service_name": service_name,
         }
 
     def pricing(
@@ -1105,6 +1259,7 @@ class WebCortex:
         expose_at: str | None = None,
         expose_scopes: Sequence[str] | None = None,
         tool: bool = True,
+        options: dict | None = None,
     ) -> Callable:
         """Declare a Behaviour: a procedure whose control flow is real Python.
 
@@ -1157,7 +1312,12 @@ class WebCortex:
         behaviours and behaviours can compose with each other. `max_steps` caps
         total leaf operations and `token_budget` caps spend — both enforced by
         the runtime, so a runaway loop costs a bounded amount.
+
+        `options` are extra request-body fields for this behaviour's `ctx.ask`
+        calls (`{"seed": 7}`), merged over the provider's own; see
+        :meth:`request_options`.
         """
+        behaviour_options = _options(options, "behaviour()")
 
         def decorator(fn: Callable) -> Callable:
             behaviour_name = name or fn.__name__
@@ -1182,6 +1342,7 @@ class WebCortex:
                     "reasoning": _reasoning(reasoning, f"behaviour {behaviour_name!r}"),
                     "input_schema": input_schema,
                     "context": list(context),
+                    "options": behaviour_options,
                 }
             )
 
@@ -1240,6 +1401,8 @@ class WebCortex:
         keep_recent: int = 6,
         max_images: int = 4,
         tool: bool = True,
+        output: Any = None,
+        options: dict | None = None,
     ) -> None:
         """Declare an agent that lives inside the application.
 
@@ -1286,9 +1449,45 @@ class WebCortex:
         themselves. Passing `expose_scopes=[]` makes the endpoint public — which
         `webcortex security` will report.
 
+        **Structured output.** `output` is the shape the answer must have: a
+        dataclass, a `TypedDict`, or a JSON Schema dict whose top-level type is
+        `"object"`. The agent then finishes by calling a `final_answer` tool,
+        and the *runtime* checks what it sent against the schema, because a
+        provider only asks the model to follow one. A mismatch is sent back to
+        the model with the list of problems, up to twice; after that the run
+        fails with `WC318`. The result carries the validated value as `data`
+        (and as JSON text in `output`), and a flow passes it to the next step
+        as an object::
+
+            @dataclass
+            class Triage:
+                category: Literal["bug", "billing", "other"]
+                urgency: int
+
+            app.agent("triage", system="Classify the ticket.", output=Triage)
+            # POST /agents/triage {"input": "..."} -> {"status": "completed",
+            #   "data": {"category": "billing", "urgency": 3}, ...}
+
+        **Request options.** `options` are extra top-level fields for the
+        provider's request body, for whatever the provider supports that has no
+        keyword here: `{"seed": 7}`, `{"top_p": 0.9}`, Ollama's
+        `{"keep_alive": "30m"}`, Anthropic's `{"thinking": {...}}`. `None`
+        removes a field the runtime would send
+        (`{"max_tokens": None, "max_completion_tokens": 8000}`). They are merged
+        over the provider's own (:meth:`request_options`); `model`, `messages`,
+        `tools`, `tool_choice`, `system` and `stream` are the runtime's and
+        raise `ValueError`.
+
         A typo in `tools`, `handoffs` or `context` is a boot error, not a
         runtime surprise.
         """
+        agent_options = _options(options, f"agent {name!r}")
+        output_schema = _output_schema(output, f"agent {name!r}")
+        if output_schema is not None and FINAL_TOOL in tools:
+            raise ValueError(
+                f"agent {name!r} declares output=, so the tool name {FINAL_TOOL!r} is taken by its "
+                f"answer; give the route another tool_name"
+            )
         if max_images < 1:
             raise ValueError("agent(): max_images must be at least 1")
         if keep_recent < 1:
@@ -1340,6 +1539,8 @@ class WebCortex:
                     "keep_recent": int(keep_recent),
                     "max_images": int(max_images),
                 },
+                "options": agent_options,
+                **({"output_schema": output_schema} if output_schema is not None else {}),
             }
         )
 
@@ -1380,6 +1581,22 @@ class WebCortex:
                 "required": ["input"],
                 "additionalProperties": False,
             },
+            # The envelope a caller reads; `data` is typed when the agent is.
+            output_schema=(
+                {
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string"},
+                        "status": {"type": "string"},
+                        "output": {"type": "string"},
+                        "data": output_schema,
+                        "trace_id": {"type": "string"},
+                    },
+                    "required": ["run_id", "status", "output"],
+                }
+                if output_schema is not None
+                else None
+            ),
             tool=tool, tool_name=name,
             read_only=False, idempotent=False,
             scopes=guard,
@@ -1647,6 +1864,7 @@ class WebCortex:
             "devices": self._devices,
             "watchers": self._watchers,
             "models": self._models,
+            "tracing": self._tracing,
         }
 
     def manifest_json(self) -> str:
@@ -1807,6 +2025,143 @@ class WebCortex:
         from .diagnostics import fetch_status
 
         return fetch_status(self, url=url, key=key)
+
+    def traces(self, *, url: str | None = None, key: str | None = None) -> dict:
+        """The running app's recent traces, from ``GET {control_prefix}/traces``.
+
+        Args:
+            url: The running app's base URL (default: ``WEBCORTEX_HOST``/``PORT``
+                or the app's own host and port).
+            key: An admin API key or JWT (default: ``$WEBCORTEX_API_KEY``, then
+                ``$WEBCORTEX_TOKEN``).
+
+        Returns:
+            ``{"enabled", "kept", "capacity", "traces": [...], "export": {...}}``,
+            newest trace first. Each entry has ``trace_id``, ``name``, ``status``,
+            ``duration_ms``, ``spans``, ``model_calls``, ``tool_calls``,
+            ``input_tokens``, ``output_tokens`` and ``errors``.
+
+        Example::
+
+            for t in app.traces()["traces"][:5]:
+                print(t["name"], t["duration_ms"], t["input_tokens"] + t["output_tokens"])
+        """
+        from .diagnostics import fetch_control
+
+        return fetch_control(self, "/traces", url=url, key=key)
+
+    def trace(self, trace_id: str = "latest", *, url: str | None = None, key: str | None = None) -> dict:
+        """One trace of the running app, with every span.
+
+        Args:
+            trace_id: The id from a run result's ``trace_id``, the
+                ``x-webcortex-trace`` response header, or ``"latest"``.
+            url: The running app's base URL, as for :meth:`traces`.
+            key: An admin credential, as for :meth:`traces`.
+
+        Returns:
+            The trace summary plus ``"spans"``: each with ``span_id``,
+            ``parent_span_id``, ``kind`` (``agent | model | tool | flow |
+            behaviour | handoff | output``), ``name``, ``start_ms``,
+            ``duration_ms``, ``status``, ``code`` when it failed, and
+            ``attributes``. Raises :class:`webcortex.diagnostics.StatusError`
+            (``WC219``) when the trace is not held.
+
+        Example::
+
+            run = httpx.post(url + "/agents/desk", json={"input": "hi"}).json()
+            for span in app.trace(run["trace_id"])["spans"]:
+                print(span["name"], span["duration_ms"])
+        """
+        from .diagnostics import fetch_control
+
+        return fetch_control(self, f"/traces/{trace_id}", url=url, key=key)
+
+    # ------------------------------------------------------------------
+    # Evals
+    # ------------------------------------------------------------------
+
+    def eval(
+        self,
+        name: str,
+        *,
+        target: str,
+        input: Any,
+        expect: dict | None = None,
+        check: Callable[[dict], Any] | None = None,
+        scopes: Sequence[str] = (),
+        description: str = "",
+    ) -> None:
+        """Declare an eval: one call to a tool, and what must be true of the result.
+
+        ``webcortex eval`` runs every declared eval in-process (no port is
+        bound) and exits 1 if any fails. With a recorded cassette the model's
+        responses are replayed, so the eval costs no tokens, needs no key and
+        gives the same answer every time, while the tools, scopes, handoffs,
+        budgets and flows around the model run for real. See
+        :func:`webcortex.evals.run_evals` for the modes.
+
+        Args:
+            name: Unique; also the cassette's file name (``evals/<name>.json``).
+            target: The tool to call: an agent, flow, behaviour or route exposed
+                with ``tool=True``.
+            input: The arguments, as a dict. A string is shorthand for
+                ``{"input": <string>}``, which is what an agent takes.
+            expect: Deterministic checks on the result, all optional:
+                ``status`` (default ``"completed"`` for a run), ``code``,
+                ``output_contains`` / ``output_not_contains`` (a string or a
+                list), ``output_matches`` (a regular expression), ``data`` (a
+                subset the structured answer must contain), ``tools_called`` (an
+                ordered subsequence of the tools called), ``tools_not_called``,
+                ``path`` (the agents a run passed through), ``max_steps``,
+                ``max_tokens`` (a ceiling on the request tree's tokens),
+                ``max_model_calls``.
+            check: A function called with the result; raising, or returning
+                ``False`` or a string, fails the eval (the string is the reason).
+            scopes: The scopes the eval's caller (principal ``eval``) holds.
+            description: One line for the report.
+
+        Returns:
+            None.
+
+        Example::
+
+            app.eval("refund_goes_to_billing", target="front_desk",
+                     input="I was charged twice",
+                     expect={"path": ["front_desk", "billing"],
+                             "tools_called": ["lookup_invoice"],
+                             "max_tokens": 6000})
+        """
+        from .evals import declare
+
+        self._evals.append(declare(self, name, target=target, input=input, expect=expect,
+                                   check=check, scopes=scopes, description=description))
+
+    def run_evals(self, *, mode: str = "auto", directory: str = "evals",
+                  only: Sequence[str] | None = None) -> dict:
+        """Run the declared evals and return the report ``webcortex eval`` prints.
+
+        Args:
+            mode: ``"auto"`` (replay when a cassette exists, else live),
+                ``"replay"`` (a missing cassette fails the eval), ``"live"``
+                (always ask the providers) or ``"record"`` (ask the providers and
+                write each cassette).
+            directory: Where cassettes are read from and written to.
+            only: Run just these evals, by name.
+
+        Returns:
+            ``{"ok", "passed", "failed", "total", "tokens", "results": [...]}``;
+            each result has ``name``, ``target``, ``mode``, ``ok``, ``failures``,
+            ``status``, ``tokens``, ``duration_ms`` and ``trace_id``.
+
+        Example::
+
+            report = app.run_evals(mode="replay")
+            assert report["ok"], report["results"]
+        """
+        from .evals import run_evals
+
+        return run_evals(self, mode=mode, directory=directory, only=only)
 
     def run(self) -> None:
         """Boot the runtime and serve. Blocks."""

@@ -256,6 +256,60 @@ app.pricing("claude-opus-5", input_per_mtok=5, output_per_mtok=25)
   flow and model, and dollars where you declared prices — `null`, not zero,
   where you did not.
 
+## Evidence: typed answers, traces, evals
+
+New in 2.8: what an agent answered, what a run did, and whether it still does it.
+
+```python
+@dataclass
+class Triage:
+    category: Literal["bug", "billing", "other"]
+    urgency: int
+
+app.agent("triage", system="Classify the ticket.", output=Triage)
+app.agent("local", model="ollama/qwen3.5:9b", options={"seed": 7, "keep_alive": "30m"})
+
+app.eval("refund_goes_to_billing", target="front_desk", input="I was charged twice",
+         expect={"path": ["front_desk", "billing"], "tools_called": ["lookup_invoice"],
+                 "max_tokens": 6000})
+```
+
+- **Structured output.** `output=` is a dataclass, a `TypedDict` or a JSON Schema. The agent
+  answers through a `final_answer` tool and the *runtime* validates it: a mismatch goes back
+  to the model with the list of problems, twice, then the run fails with `WC318`. The result
+  carries the object as `data`, and a flow hands it to the next step as an object.
+  [docs](docs/structured-output.md)
+- **Request options.** `options=` passes provider-specific fields straight into the request
+  body (`seed`, `top_p`, `keep_alive`, `thinking`, …) per agent, per behaviour or per
+  provider, without a keyword for each. `None` removes a field. Still not a universal LLM
+  abstraction: nothing is interpreted or renamed. [docs](docs/request-options.md)
+- **Traces.** Every agent, flow and behaviour run is a span tree: the run, each model call
+  with its tokens, each tool call, nested runs under the call that started them. `webcortex
+  trace`, `GET /_webcortex/traces`, the `webcortex_trace` MCP tool, and OTLP/HTTP export to
+  the collector you already run. An incoming W3C `traceparent` is joined. Spans hold names,
+  timings, token counts and error codes, never prompts or results. [docs](docs/tracing.md)
+- **Evals with cassettes.** `webcortex eval --record` keeps the model's responses;
+  afterwards evals replay them in-process with no key and no tokens, while your tools,
+  scopes, handoffs, budgets and flows run for real. Change an agent's prompt, model, tools or
+  options and its recording goes stale (`WC319`) instead of passing on old answers.
+  [docs](docs/evals.md)
+
+```
+$ webcortex trace latest
+  trace 7d1c…e02a  ok  2.41s  4 model call(s)  2 tool call(s)  1830 tokens
+  agent front_desk  2.41s  completed
+    └ chat default  0.61s  412 in / 38 out
+    └ tool billing  1.52s
+      └ agent billing  1.52s  completed
+        └ chat default  0.58s  390 in / 41 out
+        └ tool lookup_invoice  3ms
+        └ chat default  0.90s  455 in / 96 out
+    └ chat default  0.27s  362 in / 36 out
+```
+
+(The tree's shape is what the command prints; the timings and token counts above are an
+illustration, not a measurement.)
+
 ## Context and memory
 
 ```python
@@ -473,6 +527,8 @@ webcortex keygen          mint an API key
 webcortex doctor          check the app is ready to run (exit 1 on a failure)
 webcortex status          the running app's live view: requests, errors, runs, spend, devices
 webcortex explain CODE    what an error code means; --list for all of them
+webcortex trace [ID]      what a recent run did, as a span tree; `latest` for the newest
+webcortex eval            run the declared evals; --record | --replay | --live
 webcortex halt | release  the emergency stop for actuators
 ```
 
@@ -499,7 +555,7 @@ tested, the known limits, and what v2 added to the surface.
 
 ## Status
 
-v2.7.0. Working and tested: the manifest IR, router, native ops (static /
+v2.8.0. Working and tested: the manifest IR, router, native ops (static /
 query / proxy / page / files / flow), the free-threaded Python bridge,
 authentication and scopes, rate limiting, CORS, security headers, graceful
 shutdown, Behaviours with concurrent leaves, the agent runtime with handoffs,
@@ -509,11 +565,13 @@ OpenAI-compatible, which covers local models), prompt caching, the spend
 ledger, the audit trail, OpenAPI, the MCP server, TypeScript generation, the
 context pack and `evolve`, images in and out of agent runs and MCP, actuators
 and the emergency stop, the device hub (cameras, sensors, watchers, WebSocket
-ingest and streams, agents over WebSocket), and diagnostics (stable error codes
+ingest and streams, agents over WebSocket), diagnostics (stable error codes
 with hints on every failure, `webcortex doctor`, the live `/_webcortex/status`
-view and its MCP tool). **490 tests** (155 Rust, 335 Python, including a
-54-test adversarial suite and offline end-to-end suites that drive the whole
-agent stack over HTTP), clippy clean.
+view and its MCP tool), and, new in 2.8, structured agent output validated by
+the runtime, provider request options, run traces with OTLP export, and evals
+that replay recorded model responses. **961 tests** (284 Rust, 677 Python,
+including a 54-test adversarial suite and offline end-to-end suites that drive
+the whole agent stack over HTTP), clippy clean.
 
 Not yet: Postgres, token-level SSE streaming, durable agent runs that survive a
 restart. See [DESIGN.md](DESIGN.md) for the roadmap, honest risk grading, and —

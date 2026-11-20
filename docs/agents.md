@@ -138,7 +138,13 @@ they are the interesting events.
 
 `path` lists every agent the run passed through; `agent` is the one that
 answered. Step kinds are `model`, `tool_call`, `tool_refused`,
-`approval_requested`, `approval_denied`, `handoff` and `compaction`.
+`approval_requested`, `approval_denied`, `handoff`, `compaction` and, for an
+agent declared with `output=`, `output`.
+
+Since 2.8 the result also carries `trace_id`, the id of the run's
+[trace](tracing.md) (the span tree of this run and everything it called), and,
+for an agent with an [output schema](structured-output.md), `data`: the
+validated answer as an object.
 
 ## Approval gates
 
@@ -240,6 +246,11 @@ a gate that can never fire is dead configuration giving false confidence.
 | `max_tokens` | `16000` | Per response, thinking included |
 | `expose_at` | `/agents/<name-with-hyphens>` | The POST route |
 | `tool` | `True` | Expose under the agent's own name |
+| `output` | `None` | A dataclass, `TypedDict` or object schema the answer must match; the validated value is `data` in the result. See [Structured output](structured-output.md) |
+| `options` | `None` | Extra request-body fields for the provider, e.g. `{"seed": 7}`. See [Request options](request-options.md) |
+
+Every run records a [trace](tracing.md) (its id is `trace_id` in the result), and an agent's
+behaviour can be pinned down with [evals](evals.md) that replay recorded model responses.
 
 ## Providers
 

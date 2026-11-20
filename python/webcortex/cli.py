@@ -436,6 +436,7 @@ def _parser() -> argparse.ArgumentParser:
         ("release", "release the emergency stop on the running app"),
         ("doctor", "check the app is ready to run: versions, manifest, provider keys, security, e-stop, port"),
         ("status", "what the running app is doing: requests, recent errors, agent runs, spend, devices"),
+        ("eval", "run the app's declared evals in-process, replaying recorded model responses when present"),
     ]:
         p = sub.add_parser(name, help=help_text)
         if name == "evolve":
@@ -461,6 +462,19 @@ def _parser() -> argparse.ArgumentParser:
             p.add_argument("--url", default=None,
                            help="the running app's base URL (default: WEBCORTEX_HOST/PORT or the app's own)")
             p.add_argument("--key", default=None, help="admin API key or JWT bearer token (default: $WEBCORTEX_API_KEY, then $WEBCORTEX_TOKEN)")
+        if name == "eval":
+            how = p.add_mutually_exclusive_group()
+            how.add_argument("--record", action="store_true",
+                             help="call the real providers and write each eval's cassette")
+            how.add_argument("--replay", action="store_true",
+                             help="replay cassettes only; an eval without one fails (use in CI)")
+            how.add_argument("--live", action="store_true",
+                             help="always call the providers, ignoring cassettes")
+            p.add_argument("--dir", default="evals", help="where cassettes live (default: evals)")
+            p.add_argument("--only", action="append", default=None, metavar="NAME",
+                           help="run just this eval; may be repeated")
+            p.add_argument("--list", action="store_true", help="list the declared evals and exit")
+            p.add_argument("--json", action="store_true", help="machine-readable output")
         if name == "doctor":
             p.add_argument("--online", action="store_true",
                            help="also probe each model provider's endpoint (3 s timeout)")
@@ -470,6 +484,18 @@ def _parser() -> argparse.ArgumentParser:
             p.add_argument("--out", "-o", default=None, help="write the proposal to a file")
             p.add_argument("--json", action="store_true",
                            help="ask for {summary, code, notes} as JSON")
+
+    trace = sub.add_parser("trace", help="what a recent agent, flow or behaviour run did, as a span tree")
+    trace.add_argument("trace_id", nargs="?", default=None,
+                       help="a trace id (from a run result or the x-webcortex-trace header) or 'latest'; "
+                            "omit to list the recent traces")
+    trace.add_argument("--app", dest="target", default=DEFAULT_MODULE,
+                       help="module path or module:attr (default: api.py)")
+    trace.add_argument("--json", action="store_true", help="machine-readable output")
+    trace.add_argument("--url", default=None,
+                       help="the running app's base URL (default: WEBCORTEX_HOST/PORT or the app's own)")
+    trace.add_argument("--key", default=None,
+                       help="admin API key or JWT bearer token (default: $WEBCORTEX_API_KEY, then $WEBCORTEX_TOKEN)")
 
     explain = sub.add_parser("explain", help="explain an error code (WCnnn), or list them all")
     explain.add_argument("code", nargs="?", default=None)
@@ -539,6 +565,53 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_trace(args: argparse.Namespace) -> int:
+    """`webcortex trace [ID]`: list the running app's recent traces, or print one."""
+    from .diagnostics import StatusError, fetch_control, render_trace, render_traces
+
+    app = None
+    if not (args.url and args.target == DEFAULT_MODULE and not Path(DEFAULT_MODULE).exists()):
+        app = _load_app(args.target)
+    path = f"/traces/{args.trace_id}" if args.trace_id else "/traces"
+    try:
+        document = fetch_control(app, path, url=args.url, key=args.key)
+    except StatusError as e:
+        raise CLIError(e.code, e.message, e.hint) from None
+    if args.json:
+        print(json.dumps(document, indent=2))
+    else:
+        print(render_trace(document) if args.trace_id else render_traces(document))
+    return 0
+
+
+def _cmd_eval(app: Any, args: argparse.Namespace) -> int:
+    """`webcortex eval`: run the declared evals; exit 1 when any fails."""
+    from .evals import cassette_path, render_report, run_evals
+
+    if args.list:
+        cases = [{"name": c.name, "target": c.target, "description": c.description,
+                  "expect": c.expect, "cassette": cassette_path(args.dir, c.name).exists()}
+                 for c in app._evals]
+        if args.json:
+            print(json.dumps({"evals": cases}, indent=2))
+        else:
+            for c in cases:
+                print(f"  {c['name']:<32} → {c['target']}  "
+                      f"{'cassette' if c['cassette'] else 'no cassette'}  {c['description']}")
+            if not cases:
+                print("  no evals declared")
+        return 0
+    mode = "record" if args.record else "replay" if args.replay else "live" if args.live else "auto"
+    try:
+        report = run_evals(app, mode=mode, directory=args.dir, only=args.only)
+    except ValueError as e:
+        if str(e).startswith(("invalid application", "invalid manifest")):
+            raise
+        raise CLIError("WC320", str(e), "`webcortex eval --list` shows the declared evals.") from None
+    print(json.dumps(report, indent=2, default=str) if args.json else render_report(report))
+    return 0 if report["ok"] else 1
+
+
 def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.command == "new":
         return _cmd_new(args)
@@ -557,7 +630,12 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return _cmd_doctor(args)
     if args.command == "status":
         return _cmd_status(args)
+    if args.command == "trace":
+        return _cmd_trace(args)
     app = _load_app(args.target)
+
+    if args.command == "eval":
+        return _cmd_eval(app, args)
 
     if args.command in ("dev", "run"):
         # An explicit flag wins over WEBCORTEX_HOST/PORT, which the manifest
