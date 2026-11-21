@@ -205,7 +205,8 @@ accepted, so read **Changed** before upgrading. `SECURITY.md` has the review ("R
   - `app.query(...)` routes without `input_schema=` advertise one derived from `params` (MCP
     `tools/list`, OpenAPI, the TypeScript client and agents saw an empty object), and default
     their description to `summary`, else the SQL's first line.
-  - A deeply nested JSON body to a Python handler answers 400 `WC205`, not 500 `WC002`.
+  - A deeply nested JSON body to a Python handler answers 400 `WC205`, not 500 `WC002`. The limit is
+    explicit, 512 levels, so Python 3.14 (whose parser goes much deeper) gives the same answer.
   - `app.request_options(provider, /, **options)` takes the provider positionally only, so an
     option may itself be called `provider`; the OpenRouter example in the docs raised
     `TypeError`.

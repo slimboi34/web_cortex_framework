@@ -48,6 +48,9 @@ pyo3::create_exception!(
     "A behaviour was stopped by the runtime rather than by its own logic."
 );
 
+/// How far a behaviour's own deadline sits past its route's timeout.
+const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// True when a tool call failed on the runtime's nesting ceiling, a deliberate
 /// stop rather than a handler fault. Matched on the status `call_tool_in_tree`
 /// reports: a bare "508" also matches a handler's own message, and the phrase
@@ -168,7 +171,12 @@ impl BehaviourContext {
             input,
             options,
             span,
-            deadline: tokio::time::Instant::now() + limit,
+            // A little past the route's own timeout, so that while a caller is
+            // waiting the route's 504 always wins: with equal deadlines a busy
+            // runtime could deliver the behaviour's `halted` result first and
+            // answer 200. The caller-gone branch of `wait` still stops the
+            // behaviour the moment the route gives up.
+            deadline: tokio::time::Instant::now() + limit + DEADLINE_GRACE,
             limit,
             caller,
             trace: Mutex::new(Vec::new()),

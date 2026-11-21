@@ -403,13 +403,20 @@ class Request:
         if self._json is _UNSET:
             raw = self._raw["body"]
             try:
-                self._json = json.loads(raw) if raw else None
+                parsed = json.loads(raw) if raw else None
             except ValueError as e:  # JSONDecodeError and UnicodeDecodeError
                 raise InvalidJSON(f"request body is not valid JSON: {e}") from None
             except RecursionError:
                 # `[[[[…]]]]` nested past the interpreter's stack: the client's
                 # fault, so a 400 like any other unparseable body, not a 500.
                 raise InvalidJSON("request body is not valid JSON: it is nested too deeply") from None
+            if _nested_too_deeply(raw, parsed):
+                # Python 3.14's json parses far deeper than 3.12/3.13 recurse, so
+                # the limit is explicit: the same body gets the same answer on
+                # every interpreter, and handlers never see a 10,000-level list.
+                raise InvalidJSON(f"request body is not valid JSON: it is nested more than "
+                                  f"{MAX_JSON_DEPTH} levels deep") from None
+            self._json = parsed
         return self._json
 
     def get(self, name: str, default: Any = None) -> Any:
@@ -482,6 +489,34 @@ class HTTPError(Exception):
         self.message = message
         self.code = code
         self.hint = hint
+
+
+#: The deepest nesting a request body may have (`[[1]]` is 2 levels). Below the
+#: point where json.loads on Python 3.12/3.13 runs out of recursion.
+MAX_JSON_DEPTH = 512
+
+
+def _nested_too_deeply(raw: Any, parsed: Any, limit: int = MAX_JSON_DEPTH) -> bool:
+    """Whether a parsed body nests more than ``limit`` levels.
+
+    A body cannot nest deeper than it has opening brackets, so most bodies are
+    cleared by two C-speed counts; only the rest are walked, iteratively."""
+    if not raw or not isinstance(parsed, (dict, list)):
+        return False
+    if isinstance(raw, str):
+        brackets = raw.count("[") + raw.count("{")
+    else:
+        brackets = bytes(raw).count(b"[") + bytes(raw).count(b"{")
+    if brackets <= limit:
+        return False
+    stack = [(parsed, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if depth > limit:
+            return True
+        children = item.values() if isinstance(item, dict) else item
+        stack.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
+    return False
 
 
 class InvalidJSON(HTTPError, ValueError):

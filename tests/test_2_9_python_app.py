@@ -872,6 +872,20 @@ def test_deeply_nested_json_is_invalid_json_not_a_crash():
     assert isinstance(caught.value, ValueError)
 
 
+def test_the_json_depth_limit_is_the_same_on_every_interpreter():
+    from webcortex._bridge import MAX_JSON_DEPTH
+
+    assert MAX_JSON_DEPTH == 512
+    ok = Request(_request(b"[" * 512 + b"]" * 512))
+    assert isinstance(ok.json(), list)                       # 512 levels: accepted
+    deep = Request(_request(b"[" * 513 + b"]" * 513))
+    with pytest.raises(InvalidJSON, match="more than 512 levels"):
+        deep.json()                                           # 3.14 parses it; refused anyway
+    wide = Request(_request(json.dumps([{"a": [1]}] * 5_000).encode()))
+    assert len(wide.json()) == 5_000                          # many brackets, shallow: accepted
+    assert Request(_request(b'{"s": "' + b"[" * 2_000 + b'"}')).json()["s"].startswith("[[")  # brackets in a string
+
+
 def test_deep_json_to_a_python_handler_answers_400(tmp_path):
     source = """
 from webcortex import WebCortex
