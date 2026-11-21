@@ -1622,6 +1622,33 @@ pub fn tool_result_with_images(id: &str, content: &Value, is_error: bool, images
     result
 }
 
+/// The turns that send a rejected structured answer back to a model, outside
+/// the agent loop (a behaviour's `ctx.ask(schema=...)`): the model's own turn
+/// as it is replayed, then what it is told — `correction` as the result of
+/// every tool call it made, or as a user message when it answered in text.
+/// Every call gets a result, which both wire formats require.
+pub fn correction_turns(response: &ProviderResponse, correction: &str) -> Vec<Message> {
+    let has_tool_use = |c: &Value| {
+        c.as_array().is_some_and(|bs| bs.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use")))
+    };
+    // Tool results answer the calls only when the replayed turn carries them;
+    // otherwise the calls are dropped from it and the model is told in text.
+    let replay_calls = !response.tool_calls.is_empty() && has_tool_use(&response.raw_content);
+    let mut turns = Vec::with_capacity(2);
+    if let Some(content) = replayable(&response.raw_content, replay_calls) {
+        turns.push(Message { role: "assistant".into(), content });
+    }
+    let told = if replay_calls {
+        Value::Array(
+            response.tool_calls.iter().map(|c| tool_result(&c.id, &json!({"error": correction}), true)).collect(),
+        )
+    } else {
+        json!(correction)
+    };
+    turns.push(Message { role: "user".into(), content: told });
+    turns
+}
+
 /// An assistant turn as it is kept in the conversation: without `tool_use`
 /// blocks when its calls will not be run, and `None` when nothing is left.
 fn replayable(content: &Value, keep_tool_use: bool) -> Option<Value> {
@@ -1857,6 +1884,41 @@ mod tests {
         let app = build(ScriptedProvider::tool_then_text("purge", json!({}), "done")).await;
         let out = run(&app, "admin", &caller(&["read", "admin"]), "purge it").await;
         assert_eq!(out.status, RunStatus::AwaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_answer_is_replayed_with_a_result_for_every_call() {
+        let tool_answer = ProviderResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall { id: "c1".into(), name: "respond".into(), arguments: json!({"n": "x"}) }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            model: "m".into(),
+            raw_content: json!([{"type": "tool_use", "id": "c1", "name": "respond", "input": {"n": "x"}}]),
+        };
+        let turns = correction_turns(&tool_answer, "fix it");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "assistant");
+        assert_eq!(turns[1].content[0]["type"], "tool_result");
+        assert_eq!(turns[1].content[0]["tool_use_id"], "c1");
+        assert!(turns[1].content[0]["content"].as_str().unwrap().contains("fix it"));
+        // An answer in prose is told in prose.
+        let prose = ProviderResponse {
+            text: "n is x".into(),
+            tool_calls: vec![],
+            stop_reason: StopReason::EndTurn,
+            raw_content: json!([{"type": "text", "text": "n is x"}]),
+            ..tool_answer.clone()
+        };
+        let turns = correction_turns(&prose, "fix it");
+        assert_eq!(turns[1].content, json!("fix it"));
+        // A call the replayed turn does not carry gets no orphan result.
+        let bare = ProviderResponse { raw_content: json!("n is x"), ..tool_answer };
+        let turns = correction_turns(&bare, "fix it");
+        assert_eq!(turns.last().unwrap().content, json!("fix it"));
     }
 
     #[tokio::test]
