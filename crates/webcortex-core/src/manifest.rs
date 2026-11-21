@@ -1646,20 +1646,19 @@ impl Manifest {
     /// Routes reachable without any credential. Surfaced by `webcortex check` so an
     /// operator can see their public attack surface on one screen.
     ///
-    /// A route is public when no authentication is configured at all, or when
-    /// every scope it requires (its own and its tool's; for an agent, a
-    /// behaviour or a flow that is its `expose_scopes`) is one that
-    /// `anonymous_scopes` grants. Through 2.8.0 only routes declaring no scope
-    /// were listed, so a write route opened by `anonymous_scopes("write")`
-    /// was missing from the very report meant to show it.
+    /// A route is public when every scope it requires (its own and its
+    /// tool's; for an agent, a behaviour or a flow that is its
+    /// `expose_scopes`) is one that `anonymous_scopes` grants, `"*"` granting
+    /// all. Through 2.8.0 only routes declaring no scope were listed, so a
+    /// write route opened by `anonymous_scopes("write")` was missing from the
+    /// very report meant to show it. With no authentication configured, a
+    /// route requiring a scope that anonymous callers lack answers 401 to
+    /// everyone, so it is unreachable rather than public and is not listed.
+    /// `WebCortex.security_report()` in Python applies the same rule.
     pub fn public_routes(&self) -> Vec<&Route> {
-        let auth_off = self.auth.api_keys.is_empty() && self.auth.jwt.is_none();
         let anonymous = &self.auth.anonymous_scopes;
         let granted = |scope: &String| anonymous.iter().any(|a| a == scope || a == "*");
-        self.routes
-            .iter()
-            .filter(|r| auth_off || r.scopes.iter().chain(&r.tool.scopes).all(granted))
-            .collect()
+        self.routes.iter().filter(|r| r.scopes.iter().chain(&r.tool.scopes).all(granted)).collect()
     }
 }
 
@@ -1825,8 +1824,9 @@ mod tests {
         let mut star = keys;
         star["anonymous_scopes"] = serde_json::json!(["*"]);
         assert_eq!(public(&m(star)).len(), 4);
-        // With no authentication configured, every route is open to everyone.
-        assert_eq!(public(&m(serde_json::json!({}))).len(), 4);
+        // With no authentication configured, a scoped route answers 401 to
+        // everyone: unreachable, not public.
+        assert_eq!(public(&m(serde_json::json!({}))), vec!["GET /open"]);
     }
 
     #[test]

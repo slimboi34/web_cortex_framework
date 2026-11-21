@@ -671,8 +671,24 @@ def test_a_handoff_target_may_not_list_a_final_answer_tool():
     app.agent("specialist", tools=["final_answer"])
     app.agent("desk", handoffs=["specialist"],
               output={"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]})
-    with pytest.raises(ValueError, match='"specialist"'):
+    # app.manifest() refuses it first (the Python half of the same rule).
+    with pytest.raises(ValueError, match="specialist"):
         app.check()
+
+
+def test_the_core_refuses_the_handoff_final_answer_clash_on_its_own():
+    # A manifest that did not come through app.py's check still fails in the core.
+    from webcortex import _core
+    app = WebCortex("h")
+    app.static("POST", "/final_answer", {"filed": True}, tool=True, tool_name="final_answer")
+    app.agent("specialist", tools=["final_answer"])
+    app.agent("desk", output={"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]})
+    manifest = app.manifest()
+    for agent in manifest["agents"]:
+        if agent["name"] == "desk":
+            agent["handoffs"] = ["specialist"]
+    with pytest.raises(ValueError, match='"specialist"'):
+        _core.inspect_manifest(json.dumps(manifest))
 
 
 # =========================================================== timeouts and traces (L18, L28)

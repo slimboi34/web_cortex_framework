@@ -5,9 +5,9 @@ in-process; dispatch is driven directly through ``Dispatcher`` where that is
 enough to show the property, and through a real server (the deterministic
 fake provider, no network, no key) where only the whole path shows it.
 
-Tests marked ``AFTER_MERGE_A`` / ``AFTER_MERGE_B`` need a Rust change from
-another 2.9.0 batch (A: core runtime, B: core data). They are skipped until
-that batch is merged; remove the mark then.
+Two tests need a Rust change from another 2.9.0 batch: the runtime's
+``/_webcortex/security`` (core runtime) and the validator resolving ``$ref``
+into ``$defs`` (core data).
 """
 
 from __future__ import annotations
@@ -36,12 +36,6 @@ import pytest
 from webcortex import WebCortex
 from webcortex._bridge import Dispatcher, InvalidJSON, Request
 from webcortex.schema import coerce, json_schema_for, output_schema_for
-
-AFTER_MERGE_A = pytest.mark.skip(
-    reason="needs the 2.9.0 core-runtime batch (A); remove this mark after the merge")
-AFTER_MERGE_B = pytest.mark.skip(
-    reason="needs the 2.9.0 core-data batch (B): the validator resolving $ref into $defs; "
-           "remove this mark after the merge")
 
 KEY = "batch-c-test-key-0123456789abcdef"
 
@@ -424,7 +418,6 @@ def test_without_anonymous_scopes_only_unscoped_routes_are_public():
     assert open_app.security_report()["public_routes"] == ["GET /"]
 
 
-@AFTER_MERGE_A
 def test_the_runtime_security_endpoint_agrees_with_security_report(tmp_path):
     source = """
 from webcortex import WebCortex
@@ -784,7 +777,6 @@ def test_a_correct_deep_recursive_answer_is_accepted(tmp_path, fake):
     assert report["ok"], [(r["name"], r["failures"]) for r in report["results"]]
 
 
-@AFTER_MERGE_B
 def test_a_wrong_type_three_levels_down_is_refused(tmp_path, fake):
     app = WebCortex("t")
     app.agent("tree", output=Node)

@@ -36,19 +36,6 @@ ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 KEY = "wcx_docs-test-key-0123456789abcdefghijklmnop"
 
-# Passed only by the 2.9.0 core (batch A, L36: a gated call the run could never
-# make is refused at once instead of becoming an approval). Strict, so the merge
-# that brings the fix turns this into an unexpected pass and the marker comes off.
-NEEDS_2_9_CORE = pytest.mark.xfail(
-    strict=True, reason="needs the 2.9.0 core: WC602 before an approval is created")
-# The same for the Python halves that batches C and D add. Only a missing name
-# counts as the expected failure; a wrong number in a page still fails.
-NEEDS_BATCH_C = pytest.mark.xfail(
-    strict=True, raises=AttributeError, reason="needs batch C: webcortex._bridge.behaviour_limit")
-NEEDS_BATCH_D = pytest.mark.xfail(
-    strict=True, raises=AttributeError, reason="needs batch D: webcortex.cli.route_table")
-
-
 # ---------------------------------------------------------------- helpers
 
 
@@ -193,7 +180,10 @@ def test_step_2_banner_matches_the_app(tutorial):
 
 
 def test_what_you_built_counts_match_the_finished_app(tutorial):
-    report = tutorial["step7"].check()
+    # check() loads the page templates as boot does, relative to the app's directory.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.chdir(tutorial["dir"])
+        report = tutorial["step7"].check()
     native, routes = map(int, re.search(r"A REST API where (\d+) of (\d+) routes never touch Python",
                                         tutorial["doc"]).groups())
     assert (routes, native) == (report["routes"], report["native_routes"])
@@ -316,7 +306,6 @@ def test_the_approval_flow_in_step_6_works(tutorial):
     assert report["ok"], report["results"][0]["failures"]
 
 
-@NEEDS_2_9_CORE
 def test_a_read_only_caller_cannot_even_propose_a_purge(tutorial):
     app = tutorial["step7"]
     app.eval("reader_cannot_propose", target="assistant",
@@ -357,6 +346,12 @@ def cli_tool_name(route: dict) -> str:
     return _derive_tool_name(route["method"], route["path"])
 
 
+class _UseCaseApps(dict):
+    """The use-case apps by name, plus the directory holding their templates."""
+
+    dir: Path
+
+
 @pytest.fixture(scope="module")
 def use_case_apps(tmp_path_factory):
     doc = _read("use-cases.md")
@@ -367,7 +362,8 @@ def use_case_apps(tmp_path_factory):
         m = re.search(r'title="templates/([^"]+)"', attrs)
         if m:
             (workdir / "templates" / m.group(1)).write_text(body)
-    apps = {}
+    apps = _UseCaseApps()
+    apps.dir = workdir
     complete = [body for _, body in _blocks(doc, "python") if body.startswith("from webcortex import")]
     assert len(complete) == 4, "a use case was added or lost its imports; update this test"
     with pytest.MonkeyPatch.context() as mp:
@@ -381,13 +377,24 @@ def use_case_apps(tmp_path_factory):
             path.write_text(body)
             app = _load(path)
             apps[app.name] = app
+    # The page shows some templates and leaves the rest to the reader. Boot and
+    # check load every page template, so stand in for the ones it leaves out.
+    named = {"base.html"} | {r["op"]["template"] for app in apps.values()
+                             for r in app.manifest()["routes"] if r["op"].get("template")}
+    for name in named:
+        stub = workdir / "templates" / name
+        if not stub.exists():
+            stub.write_text("<!-- written by the reader -->\n")
     return apps
 
 
 def test_every_complete_use_case_boots(use_case_apps):
     assert set(use_case_apps) == {"deployhub", "marketdata", "gateway", "admin"}
-    for name, app in use_case_apps.items():
-        app.check()  # raises on an invalid app, as `webcortex check` would
+    # check() loads the page templates as boot does, relative to the app's directory.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.chdir(use_case_apps.dir)
+        for name, app in use_case_apps.items():
+            app.check()  # raises on an invalid app, as `webcortex check` would
 
 
 def test_admin_panel_detail_page_does_not_collide_with_the_resource(use_case_apps):
@@ -433,7 +440,6 @@ def test_api_reference_names_every_public_parameter():
     assert not missing, f"docs/api-reference.md does not mention: {missing}"
 
 
-@NEEDS_BATCH_D
 def test_check_route_table_sample_is_what_check_prints(tutorial):
     section = _section(_read("cli.md"), "## `webcortex check`")
     claimed = [json.loads(line.strip().rstrip(","))
@@ -448,7 +454,6 @@ def test_check_route_table_sample_is_what_check_prints(tutorial):
         assert by_route[(row["method"], row["path"])] == row
 
 
-@NEEDS_BATCH_C
 def test_behaviour_pool_limit_is_what_the_pages_say(monkeypatch):
     for page in ("behaviours.md", "security.md", "deployment.md"):
         doc = _read(page)
