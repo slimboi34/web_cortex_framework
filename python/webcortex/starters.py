@@ -33,8 +33,11 @@ client/
 
 ENV_EXAMPLE = """\
 # Copy to .env and fill in. Never commit the real file.
-WEBCORTEX_API_KEY=replace-me-run-webcortex-keygen
-WEBCORTEX_JWT_SECRET=replace-me-at-least-32-bytes-long-abcdefgh
+# Each secret is empty on purpose: generate it with `webcortex keygen`, e.g.
+#   WEBCORTEX_API_KEY=<the output of webcortex keygen>
+# An empty key authenticates nobody, and `webcortex doctor` fails on each one the app uses until it is set.
+WEBCORTEX_API_KEY=
+WEBCORTEX_JWT_SECRET=
 # Hosted models. Either is enough; a model name picks its provider by prefix.
 # ANTHROPIC_API_KEY=sk-ant-...
 # OPENAI_API_KEY=sk-...
