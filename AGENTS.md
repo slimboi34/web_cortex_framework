@@ -307,10 +307,11 @@ app.anonymous_scopes(*scopes)
 ```
 Grants scopes to callers with no credential. Empty by default. This is the single
 most common way a route someone believed was protected becomes public. A route
-is public when auth is off, or when every scope it requires (route and tool
-scopes; `expose_scopes` for agents, behaviours and flows) is in
-`anonymous_scopes`; `security_report()["public_routes"]` lists exactly those
-(2.9: it used to list only unscoped routes). An agent, behaviour or flow in that
+is public when every scope it requires (route and tool scopes; `expose_scopes`
+for agents, behaviours and flows) is in `anonymous_scopes` (`"*"` grants all);
+`security_report()["public_routes"]` and `/_webcortex/security` list exactly
+those (2.9: they used to list only unscoped routes). With no auth configured, a
+scoped route answers 401 to everyone, so it is not listed. An agent, behaviour or flow in that
 list can be started anonymously, so give it a `token_budget`.
 
 ```python

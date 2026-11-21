@@ -184,7 +184,7 @@ The request conflicts with the current state of the resource; re-read it and ret
 
 *http · HTTP 503*
 
-A subsystem this route needs is not running in this process (for example the agent runtime). Check the server log at boot.
+A subsystem this route needs is not running in this process (for example the agent runtime), or has no room: at most max(32, workers × 8) behaviour runs go at once, and a run past that is refused rather than queued. Check the server log at boot; for behaviours, retry shortly or raise WEBCORTEX_MAX_BEHAVIOURS.
 
 ### WC216 — Request body too slow {#wc216}
 
