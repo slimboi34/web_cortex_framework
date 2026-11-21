@@ -88,6 +88,8 @@ struct Entry {
     conversation: Conversation,
     touched: Instant,
     revision: u64,
+    /// The root principal the session belongs to, for its quota.
+    owner: String,
 }
 
 /// Held for the length of one turn on a session; see [`SessionStore::lock_turn`].
@@ -149,7 +151,27 @@ impl SessionStore {
         TurnGuard { _guard: lock.lock_owned().await }
     }
 
-    pub fn save(&self, key: String, mut conversation: Conversation) {
+    /// Save a session, owned by the principal named in its key (see
+    /// [`Self::key`]). The agent loop uses [`Self::save_for`], which names
+    /// the root principal explicitly.
+    pub fn save(&self, key: String, conversation: Conversation) {
+        let owner = key.split('\u{1}').nth(1).unwrap_or(&key).to_string();
+        self.save_for(key, &owner, conversation);
+    }
+
+    /// The most sessions one owner may hold: a tenth of the store, at least
+    /// one. The store's own capacity still applies across everyone.
+    pub fn quota(&self) -> usize {
+        (self.capacity / 10).max(1)
+    }
+
+    /// Save a session belonging to `owner`, the root principal behind it.
+    ///
+    /// Room is made among the owner's own sessions first: one at its quota
+    /// loses its own least recently used session. Through 2.8.0 the store
+    /// evicted the least recently used session of anyone's, so one caller
+    /// opening a thousand sessions wiped every other caller's conversation.
+    pub fn save_for(&self, key: String, owner: &str, mut conversation: Conversation) {
         let dropped = bound(&mut conversation);
         if dropped > 0 {
             tracing::debug!(dropped, "session over its size bound; the oldest turns were dropped");
@@ -157,18 +179,26 @@ impl SessionStore {
         let mut map = self.lock();
         let now = Instant::now();
         map.retain(|_, e| now.duration_since(e.touched) <= self.ttl);
-        if map.len() >= self.capacity && !map.contains_key(&key) {
-            // Evict the least recently touched entry.
-            if let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, e)| e.touched)
-                .map(|(k, _)| k.clone())
-            {
+        if !map.contains_key(&key) {
+            let least_recent = |owned_only: bool| {
+                map.iter()
+                    .filter(|(_, e)| !owned_only || e.owner == owner)
+                    .min_by_key(|(_, e)| e.touched)
+                    .map(|(k, _)| k.clone())
+            };
+            let evict = if map.values().filter(|e| e.owner == owner).count() >= self.quota() {
+                least_recent(true)
+            } else if map.len() >= self.capacity {
+                least_recent(false)
+            } else {
+                None
+            };
+            if let Some(oldest) = evict {
                 map.remove(&oldest);
             }
         }
         let revision = self.revisions.fetch_add(1, Ordering::Relaxed) + 1;
-        map.insert(key, Entry { conversation, touched: now, revision });
+        map.insert(key, Entry { conversation, touched: now, revision, owner: owner.to_string() });
     }
 
     pub fn forget(&self, key: &str) -> bool {
@@ -297,5 +327,27 @@ mod tests {
         assert!(s.load("b").is_none(), "b was the least recently touched");
         assert!(s.load("a").is_some());
         assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn one_owner_at_its_quota_evicts_its_own_sessions_not_anothers() {
+        // Through 2.8.0 one caller opening sessions evicted everyone's.
+        let s = SessionStore::new(30, 60);
+        assert_eq!(s.quota(), 3);
+        s.save_for(SessionStore::key("a", "alice", "s1"), "alice", conv(1));
+        for i in 0..50 {
+            s.save_for(SessionStore::key("a", "mallory", &format!("m{i}")), "mallory", conv(1));
+        }
+        assert!(s.load(&SessionStore::key("a", "alice", "s1")).is_some(), "alice's session survived");
+        assert_eq!(s.len(), 4, "mallory holds her quota, no more");
+        assert!(s.load(&SessionStore::key("a", "mallory", "m49")).is_some(), "the newest is kept");
+        assert!(s.load(&SessionStore::key("a", "mallory", "m0")).is_none());
+        // Saving an existing session never evicts.
+        s.save_for(SessionStore::key("a", "mallory", "m49"), "mallory", conv(2));
+        assert_eq!(s.len(), 4);
+        // `save` reads the owner from the key.
+        s.save(SessionStore::key("a", "mallory", "x"), conv(1));
+        assert_eq!(s.len(), 4);
+        assert!(s.load(&SessionStore::key("a", "alice", "s1")).is_some());
     }
 }

@@ -104,6 +104,14 @@ pub enum Reply {
     File { head: WebCortexResponse, file: std::fs::File, len: u64 },
 }
 
+/// Most runs waiting on a human at once, across every caller.
+const MAX_APPROVALS: usize = 1000;
+
+/// Most of those one root principal (the human or service behind a chain of
+/// agents) may hold. Past it the principal's own oldest is evicted, never
+/// another principal's.
+pub(crate) const MAX_APPROVALS_PER_PRINCIPAL: usize = 100;
+
 /// A connection's place under `max_connections`, released on drop.
 pub struct ConnectionSlot(#[allow(dead_code)] Option<tokio::sync::OwnedSemaphorePermit>);
 
@@ -352,14 +360,23 @@ impl App {
         let ttl = Duration::from_secs(self.manifest.server.approval_ttl_secs);
         let mut map = self.approvals.lock().unwrap_or_else(|p| p.into_inner());
         map.retain(|_, r| r.created.elapsed() <= ttl);
-        if map.len() >= 1000
-            && let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, r)| r.created)
-                .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
-            }
+        // One caller's runs make room among themselves. Through 2.8.0 the
+        // store evicted the oldest approval of anyone's, so one principal
+        // that suspended a thousand runs threw away every other principal's
+        // pending approvals (and their runs) and filled the approver's queue.
+        let owner = run.root().to_string();
+        let mine = map.values().filter(|r| r.root() == owner).count();
+        let evict = if mine >= MAX_APPROVALS_PER_PRINCIPAL {
+            map.iter().filter(|(_, r)| r.root() == owner).min_by_key(|(_, r)| r.created).map(|(k, _)| k.clone())
+        } else if map.len() >= MAX_APPROVALS {
+            map.iter().min_by_key(|(_, r)| r.created).map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+        if let Some(oldest) = evict {
+            tracing::warn!(approval = %oldest, principal = %owner, "pending approval evicted to make room");
+            map.remove(&oldest);
+        }
         map.insert(run.approval_id.clone(), run);
     }
 

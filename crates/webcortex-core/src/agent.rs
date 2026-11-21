@@ -315,6 +315,12 @@ pub struct SuspendedRun {
 }
 
 impl SuspendedRun {
+    /// The root principal whose run this is: the human or service behind
+    /// any chain of agents. Approval quotas are counted per root.
+    pub fn root(&self) -> &str {
+        self.state.caller.root_id()
+    }
+
     pub fn summary(&self) -> Value {
         json!({
             "approval_id": self.approval_id,
@@ -1453,7 +1459,7 @@ impl AgentRuntime {
         app.ledger().count_run();
         if status != RunStatus::AwaitingApproval
             && let Some(key) = &st.session_key {
-                app.sessions().save(key.clone(), st.conversation.clone());
+                app.sessions().save_for(key.clone(), st.caller.root_id(), st.conversation.clone());
             }
         for step in &mut st.steps {
             if let (Some(code), None) = (&step.code, &step.hint) {
@@ -1884,6 +1890,28 @@ mod tests {
         let app = build(ScriptedProvider::tool_then_text("purge", json!({}), "done")).await;
         let out = run(&app, "admin", &caller(&["read", "admin"]), "purge it").await;
         assert_eq!(out.status, RunStatus::AwaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn one_caller_flooding_approvals_evicts_only_its_own() {
+        // Through 2.8.0 the store evicted the oldest approval of anyone's, so
+        // a thousand suspended runs from one caller threw away everyone else's.
+        let (app, _, _) = app_with(ScriptedProvider::always_tool("danger", json!({}))).await;
+        let who = |id: &str| Principal {
+            id: id.into(),
+            kind: crate::auth::PrincipalKind::ApiKey,
+            scopes: vec![],
+            claims: Default::default(),
+        };
+        let alice = run(&app, "a", &who("alice"), "x").await;
+        let alice_id = alice.pending_approval.expect("suspended").approval_id;
+        for _ in 0..(crate::app::MAX_APPROVALS_PER_PRINCIPAL + 20) {
+            assert_eq!(run(&app, "a", &who("mallory"), "x").await.status, RunStatus::AwaitingApproval);
+        }
+        let pending = app.pending_approvals();
+        assert!(pending.iter().any(|p| p["approval_id"] == json!(alice_id)), "alice's approval survived");
+        let mallory = pending.iter().filter(|p| p["caller"] == "mallory").count();
+        assert_eq!(mallory, crate::app::MAX_APPROVALS_PER_PRINCIPAL);
     }
 
     #[tokio::test]
