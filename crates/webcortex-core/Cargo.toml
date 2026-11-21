@@ -44,3 +44,8 @@ version = "0.9"
 optional = true
 default-features = false
 features = ["runtime-tokio", "sqlite"]
+
+[dev-dependencies]
+# Property-based tests (tests/proptest_fuzz.rs). No fork/timeout features:
+# nothing here needs a subprocess per case.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
