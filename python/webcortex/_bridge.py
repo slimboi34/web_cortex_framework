@@ -4,7 +4,7 @@ The Rust side hands us ``(handler_id, request, completer)`` and expects the
 completer to be called exactly once, from any thread, whenever the handler is
 done. How we get there is entirely Python's business.
 
-Two pools, chosen by handler kind:
+Three pools, chosen by handler kind:
 
 * **async handlers** go to one of N worker threads, each running its own
   asyncio event loop. On a free-threaded interpreter those loops execute
@@ -12,6 +12,15 @@ Two pools, chosen by handler kind:
   code is correct either way — just slower.
 * **sync handlers** go to a thread pool, so a blocking call can never stall an
   event loop that other requests are sharing.
+* **behaviours** go to a pool of their own. A behaviour blocks its thread
+  while `ctx.call` runs a tool, and that tool is often a sync handler: sharing
+  one pool let N behaviours hold every thread while the handlers they were
+  waiting for queued behind them, forever. Behaviour runs are capped at the
+  pool's size and the excess is refused (``WC215``) rather than queued, so a
+  behaviour that calls another behaviour cannot wedge the pool either.
+
+Every worker thread is a daemon: a handler stuck past the shutdown drain
+deadline must not keep the process alive after SIGTERM.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ import itertools
 import json
 import math
 import os
+import queue
 import re
 import sys
 import threading
@@ -35,7 +45,6 @@ import time
 import traceback
 import uuid
 from collections.abc import Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Sequence
 
 __all__ = ["Dispatcher", "free_threaded", "default_worker_count"]
@@ -118,6 +127,101 @@ class _LoopWorker:
         self.loop.call_soon_threadsafe(self.loop.stop)
 
 
+class _Pool:
+    """A thread pool whose threads are daemons, started as work arrives.
+
+    ``concurrent.futures.ThreadPoolExecutor`` joins its threads when the
+    interpreter exits, so one handler blocked forever kept the process alive
+    after SIGTERM no matter what the drain deadline said. These threads are
+    daemons: once the runtime has drained (or given up), the process exits.
+
+    ``limit`` caps how many tasks may be admitted at once (queued or running);
+    :meth:`try_submit` refuses past it instead of queueing. ``None`` queues
+    without bound, as an executor does. With ``limit <= size`` every admitted
+    task has a thread of its own the moment it is admitted, which is what
+    lets a task wait on another task of the same pool without deadlocking.
+    (The executor's idle accounting overcounts, so a task could sit queued
+    behind a busy thread while the pool was below its size.)
+    """
+
+    def __init__(self, size: int, name: str, *, limit: int | None = None) -> None:
+        self._size = max(1, int(size))
+        self._name = name
+        self._limit = limit
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        # Threads waiting for work that no admitted task has claimed yet.
+        self._idle = 0
+        self._threads: list[threading.Thread] = []
+        self._admitted = 0
+        self._closed = False
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def admitted(self) -> int:
+        """Tasks accepted and not yet finished."""
+        return self._admitted
+
+    def try_submit(self, task: Callable[[], None]) -> bool:
+        """Queue ``task``; False when the pool is closed or at its limit."""
+        with self._lock:
+            if self._closed:
+                return False
+            if self._limit is not None and self._admitted >= self._limit:
+                return False
+            self._admitted += 1
+            # Claim an idle thread for this task, or start one, up to size;
+            # past size (unlimited pools only) the task waits its turn.
+            if self._idle > 0:
+                self._idle -= 1
+            elif len(self._threads) < self._size:
+                t = threading.Thread(target=self._work, daemon=True,
+                                     name=f"{self._name}-{len(self._threads)}")
+                self._threads.append(t)
+                t.start()
+            self._queue.put(task)
+        return True
+
+    def _work(self) -> None:
+        while True:
+            task = self._queue.get()
+            if task is None:
+                return
+            try:
+                task()
+            except BaseException:  # pragma: no cover - tasks settle their own errors
+                traceback.print_exc()
+            finally:
+                with self._lock:
+                    self._admitted -= 1
+                    self._idle += 1
+
+    def shutdown(self) -> None:
+        """Refuse new work and let idle threads end. Never waits: a thread
+        still running a handler is a daemon and does not hold the process."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            count = len(self._threads)
+        for _ in range(count):
+            self._queue.put(None)
+
+
+def behaviour_limit(workers: int) -> int:
+    """How many behaviour runs may be in progress at once.
+
+    ``$WEBCORTEX_MAX_BEHAVIOURS`` when set to a positive int; otherwise eight
+    per worker, and never fewer than 32. A behaviour's thread spends most of
+    its life blocked in ``ctx.call`` or ``ctx.ask`` with the GIL released, so
+    the cap is about bounding work in flight, not CPU.
+    """
+    return _env_limit("WEBCORTEX_MAX_BEHAVIOURS", max(32, workers * 8))
+
+
 class Dispatcher:
     """Routes handler invocations onto the appropriate pool.
 
@@ -134,10 +238,15 @@ class Dispatcher:
         self._loops = [_LoopWorker(i) for i in range(count)] if self._needs_loops else []
         self._counter = itertools.count()
 
-        self._threads = ThreadPoolExecutor(
-            max_workers=count * 4,
-            thread_name_prefix="webcortex-sync",
-        )
+        # Sync handlers queue, as they always have: a sync handler never waits
+        # on another pool task, so the queue always drains.
+        self._threads = _Pool(count * 4, "webcortex-sync")
+        # Behaviours get their own threads, so a sync tool a behaviour calls
+        # never waits behind behaviours. Admission is capped, not queued: a
+        # behaviour that calls a behaviour while every slot is taken is refused
+        # at once instead of waiting for a slot its own caller holds.
+        limit = behaviour_limit(count)
+        self._behaviour_threads = _Pool(limit, "webcortex-behaviour", limit=limit)
 
     # Called from Rust.
     def submit(self, handler_id: int, request: dict, completer: Any, gate: Any = None) -> None:
@@ -155,16 +264,21 @@ class Dispatcher:
         if self._is_async[handler_id]:
             worker = self._loops[next(self._counter) % len(self._loops)]
             worker.submit(lambda: handler(req), completer)
-        else:
-            future = self._threads.submit(_run_sync, handler, req, completer)
-            future.add_done_callback(lambda f: _settle_future(f, completer))
+        elif not self._threads.try_submit(lambda: _sync_task(handler, req, completer)):
+            _deliver_exception(
+                HTTPError(503, "the server is shutting down; the handler was not started", code="WC215"),
+                completer)
 
     def submit_behaviour(self, handler_id: int, ctx: Any, payload: Any, completer: Any) -> None:
-        """Run a Behaviour on a worker thread.
+        """Run a Behaviour on a behaviour worker thread.
 
-        Behaviours always run on the thread pool, never on an event loop:
-        `ctx.call` and `ctx.ask` block while the Rust runtime does the work, and
-        blocking an event loop that other requests share would stall them.
+        Behaviours always run on threads, never on an event loop: `ctx.call`
+        and `ctx.ask` block while the Rust runtime does the work, and blocking
+        an event loop that other requests share would stall them. They do not
+        share the sync handlers' threads either (see the module docstring).
+
+        Past :func:`behaviour_limit` runs in progress, the run is refused at
+        once with ``WC215`` rather than queued.
         """
         try:
             handler = self._handlers[handler_id]
@@ -180,13 +294,17 @@ class Dispatcher:
                 result = asyncio.run(_drain(result))
             return result
 
-        future = self._threads.submit(run)
-        future.add_done_callback(lambda f: _settle_behaviour(f, completer))
+        pool = self._behaviour_threads
+        if not pool.try_submit(lambda: _behaviour_task(run, completer)):
+            _fail(completer,
+                  f"WC215: {pool.size} behaviour runs are already in progress, the most this "
+                  "process runs at once; retry shortly (WEBCORTEX_MAX_BEHAVIOURS raises the limit)")
 
     def shutdown(self) -> None:
         for w in self._loops:
             w.shutdown()
-        self._threads.shutdown(wait=False)
+        self._threads.shutdown()
+        self._behaviour_threads.shutdown()
 
 
 def _gated(handler: Callable[..., Any], gate: Any, completer: Any, is_async: bool) -> Callable[..., Any]:
@@ -288,6 +406,10 @@ class Request:
                 self._json = json.loads(raw) if raw else None
             except ValueError as e:  # JSONDecodeError and UnicodeDecodeError
                 raise InvalidJSON(f"request body is not valid JSON: {e}") from None
+            except RecursionError:
+                # `[[[[…]]]]` nested past the interpreter's stack: the client's
+                # fault, so a 400 like any other unparseable body, not a 500.
+                raise InvalidJSON("request body is not valid JSON: it is nested too deeply") from None
         return self._json
 
     def get(self, name: str, default: Any = None) -> Any:
@@ -721,6 +843,26 @@ def _settle_future(future: Any, completer: Any) -> None:
     _deliver(future.result(), completer)
 
 
+def _sync_task(handler: Callable[[Any], Any], req: Any, completer: Any) -> None:
+    """One sync handler call on a pool thread, settled on that thread."""
+    try:
+        result = _run_sync(handler, req, completer)
+    except BaseException as exc:  # what an executor's future would have held
+        _deliver_exception(exc, completer)
+        return
+    _deliver(result, completer)
+
+
+def _behaviour_task(run: Callable[[], Any], completer: Any) -> None:
+    """One behaviour run on a behaviour thread, settled on that thread."""
+    try:
+        result = run()
+    except BaseException as exc:
+        _behaviour_failed(exc, completer)
+        return
+    _behaviour_result(result, completer)
+
+
 def _encode_for(value: Any, completer: Any) -> tuple[int, bytes, str, list]:
     token = _ABANDONED.set(getattr(completer, "abandoned", None))
     try:
@@ -781,29 +923,37 @@ def _deliver_exception(exc: BaseException, completer: Any) -> None:
 
 
 def _settle_behaviour(future: Any, completer: Any) -> None:
-    """Deliver a behaviour's return value, or its failure."""
+    """Deliver a behaviour's return value, or its failure, from a future."""
     exc = future.exception()
     if exc is not None:
-        # A halt is the runtime stopping the behaviour on purpose (budget
-        # exhausted, approval required). It is reported as a structured result
-        # rather than a crash, because the caller usually wants to act on it.
-        if type(exc).__name__ == "BehaviourHalted":
-            try:
-                completer.complete({"halted": True, "reason": str(exc)})
-                return
-            except Exception:
-                traceback.print_exc()
-                return
-        if isinstance(exc, ResultTooLarge):
-            _fail(completer, f"{exc.code}: {exc.message}")
-            return
-        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        print(f"[webcortex] behaviour failed:\n{detail}", file=sys.stderr, flush=True)
-        _fail(completer, detail if _EXPOSE_TRACEBACKS else "behaviour failed")
+        _behaviour_failed(exc, completer)
         return
+    _behaviour_result(future.result(), completer)
+
+
+def _behaviour_failed(exc: BaseException, completer: Any) -> None:
+    # A halt is the runtime stopping the behaviour on purpose (budget
+    # exhausted, approval required). It is reported as a structured result
+    # rather than a crash, because the caller usually wants to act on it.
+    if type(exc).__name__ == "BehaviourHalted":
+        try:
+            completer.complete({"halted": True, "reason": str(exc)})
+            return
+        except Exception:
+            traceback.print_exc()
+            return
+    if isinstance(exc, ResultTooLarge):
+        _fail(completer, f"{exc.code}: {exc.message}")
+        return
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    print(f"[webcortex] behaviour failed:\n{detail}", file=sys.stderr, flush=True)
+    _fail(completer, detail if _EXPOSE_TRACEBACKS else "behaviour failed")
+
+
+def _behaviour_result(value: Any, completer: Any) -> None:
     token = _ABANDONED.set(getattr(completer, "abandoned", None))
     try:
-        completer.complete(jsonable(future.result()))
+        completer.complete(jsonable(value))
     except (ResultTooLarge, _CallerGone) as e:
         _fail(completer, f"{e.code}: {e.message}")
     except Exception:

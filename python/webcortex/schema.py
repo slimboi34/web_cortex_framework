@@ -25,7 +25,7 @@ import typing
 import uuid
 from typing import Any
 
-__all__ = ["json_schema_for", "schema_from_signature", "coerce", "PRIMITIVES"]
+__all__ = ["json_schema_for", "output_schema_for", "schema_from_signature", "coerce", "PRIMITIVES"]
 
 PRIMITIVES: dict[Any, dict] = {
     str: {"type": "string"},
@@ -52,6 +52,55 @@ _STRING_FORMATS: dict[Any, dict] = {
 _BARE_CONTAINERS = {list: "array", set: "array", frozenset: "array", tuple: "array", dict: "object"}
 
 
+class _Gen:
+    """How one schema is being generated.
+
+    ``closed``: a dataclass or ``TypedDict`` object refuses keys it does not
+    declare (``additionalProperties: false``). ``refs``: a class that contains
+    itself is described once under ``$defs`` at the root and referenced with
+    ``{"$ref": "#/$defs/<Name>"}`` where it recurs, instead of the loose
+    ``{"type": "object"}`` that stops validation one level down.
+
+    Both are for a typed answer (``output=``), which the runtime validates.
+    Route schemas are advertisement for OpenAPI, the TypeScript client and
+    tool lists, and keep their established shape.
+    """
+
+    __slots__ = ("closed", "refs", "defs", "names", "recursive")
+
+    def __init__(self, *, closed: bool = False, refs: bool = False) -> None:
+        self.closed = closed
+        self.refs = refs
+        self.defs: dict[str, dict] = {}
+        self.names: dict[Any, str] = {}
+        self.recursive: set = set()
+
+    def def_name(self, cls: Any) -> str:
+        """A ``$defs`` key for ``cls``: its name, made unique per schema."""
+        name = self.names.get(cls)
+        if name is None:
+            base = "".join(c if c.isalnum() or c == "_" else "_"
+                           for c in getattr(cls, "__name__", "") or "") or "Type"
+            taken = set(self.names.values())
+            name, n = base, 2
+            while name in taken:
+                name, n = f"{base}_{n}", n + 1
+            self.names[cls] = name
+        return name
+
+    def recursion_point(self, cls: Any) -> dict:
+        """What to emit where ``cls`` occurs inside its own schema."""
+        if self.refs:
+            self.recursive.add(cls)
+            return {"$ref": f"#/$defs/{self.def_name(cls)}"}
+        return {"type": "object", "title": cls.__name__}
+
+    def finish(self, cls: Any, schema: dict) -> dict:
+        if self.refs and cls in self.recursive:
+            self.defs[self.def_name(cls)] = schema
+        return schema
+
+
 def json_schema_for(annotation: Any) -> dict:
     """Best-effort JSON Schema for a type annotation.
 
@@ -59,18 +108,58 @@ def json_schema_for(annotation: Any) -> dict:
     a handler with an exotic signature should still serve traffic, it just
     won't advertise as precise a tool schema.
     """
-    return _schema(annotation, ())
+    return _schema(annotation, (), _Gen())
 
 
-def _schema(annotation: Any, active: tuple) -> dict:
+def output_schema_for(annotation: Any) -> dict:
+    """JSON Schema for a typed answer: ``app.agent(output=...)``.
+
+    The same rules as :func:`json_schema_for`, plus two that only matter to a
+    schema the runtime validates against:
+
+    - a dataclass, and a ``TypedDict`` not declared open (PEP 728
+      ``closed=False`` / ``extra_items=``), refuses keys it does not declare
+      (``additionalProperties: false``), at every level; ``dict[str, X]``
+      stays open;
+    - a recursive type (``children: list["Node"]``) is described once under
+      ``$defs`` at the root, and each recursion point is
+      ``{"$ref": "#/$defs/Node"}``. A type that does not recur has no
+      ``$defs`` and keeps its inline shape.
+    """
+    gen = _Gen(closed=True, refs=True)
+    out = _schema(annotation, (), gen)
+    # A class whose schema failed part-way (and degraded to `{}`) never got
+    # its `$defs` entry; a `$ref` to it would point at nothing.
+    dangling = {gen.def_name(c) for c in gen.recursive} - set(gen.defs)
+    if dangling:
+        out = _loosen_refs(out, dangling)
+        gen.defs = {k: _loosen_refs(v, dangling) for k, v in gen.defs.items()}
+    if gen.defs and out:
+        out = {**out, "$defs": dict(gen.defs)}
+    return out
+
+
+def _loosen_refs(schema: Any, names: set[str]) -> Any:
+    """``schema`` with each ``#/$defs/<name>`` for ``names`` a loose object."""
+    if isinstance(schema, list):
+        return [_loosen_refs(s, names) for s in schema]
+    if not isinstance(schema, dict):
+        return schema
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/$defs/") and ref[len("#/$defs/"):] in names:
+        return {"type": "object", "title": ref[len("#/$defs/"):]}
+    return {k: _loosen_refs(v, names) for k, v in schema.items()}
+
+
+def _schema(annotation: Any, active: tuple, gen: _Gen) -> dict:
     try:
-        return _schema_inner(annotation, active)
+        return _schema_inner(annotation, active, gen)
     except Exception:
         # A schema is advertisement, never a reason to refuse to boot.
         return {}
 
 
-def _schema_inner(annotation: Any, active: tuple) -> dict:
+def _schema_inner(annotation: Any, active: tuple, gen: _Gen) -> dict:
     if annotation is inspect.Parameter.empty or annotation is None:
         return {}
 
@@ -85,48 +174,52 @@ def _schema_inner(annotation: Any, active: tuple) -> dict:
     args = typing.get_args(annotation)
 
     if origin is typing.Annotated:
-        return _schema(args[0], active)
+        return _schema(args[0], active, gen)
 
     # `UserId = NewType("UserId", int)` is its supertype on the wire.
     supertype = getattr(annotation, "__supertype__", None)
     if supertype is not None:
-        return _schema(supertype, active)
+        return _schema(supertype, active, gen)
 
     # Optional[X] / X | None
     if origin in (typing.Union, types.UnionType):
         non_none = [a for a in args if a is not type(None)]
         if len(non_none) == 1 and len(args) == 2:
-            inner = _schema(non_none[0], active)
+            inner = _schema(non_none[0], active, gen)
             if not inner:
                 return {}
+            if "$ref" in inner:
+                # `parent: Node | None` at a recursion point. A sibling of
+                # `$ref` may be ignored by whoever resolves it; anyOf is not.
+                return {"anyOf": [inner, {"type": "null"}]}
             out = {**inner, "nullable": True}
             if "enum" in out and None not in out["enum"]:
                 out["enum"] = [*out["enum"], None]
             return out
-        return {"anyOf": [_schema(a, active) for a in args]}
+        return {"anyOf": [_schema(a, active, gen) for a in args]}
 
     if origin is tuple:
         if len(args) == 2 and args[1] is Ellipsis:
-            return {"type": "array", "items": _schema(args[0], active)}
+            return {"type": "array", "items": _schema(args[0], active, gen)}
         if args == ((),):  # tuple[()]
             return {"type": "array", "maxItems": 0}
         if args:
             # A fixed-length tuple is positional: `tuple[int, str]` is not a
             # list of ints.
-            return {"type": "array", "prefixItems": [_schema(a, active) for a in args],
+            return {"type": "array", "prefixItems": [_schema(a, active, gen) for a in args],
                     "minItems": len(args), "maxItems": len(args)}
         return {"type": "array"}
 
     if origin in (list, set, frozenset) or (
         isinstance(origin, type) and origin is not dict and _is_sequence_abc(origin)
     ):
-        out = {"type": "array", "items": _schema(args[0], active) if args else {}}
+        out = {"type": "array", "items": _schema(args[0], active, gen) if args else {}}
         if origin in (set, frozenset) or origin is getattr(typing, "AbstractSet", None):
             out["uniqueItems"] = True
         return out
 
     if origin is dict or (isinstance(origin, type) and _is_mapping_abc(origin)):
-        value = _schema(args[1], active) if len(args) == 2 else {}
+        value = _schema(args[1], active, gen) if len(args) == 2 else {}
         return {"type": "object", "additionalProperties": value or True}
 
     if origin is typing.Literal:
@@ -145,10 +238,10 @@ def _schema_inner(annotation: Any, active: tuple) -> dict:
         return out
 
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
-        return _dataclass_schema(annotation, active)
+        return _dataclass_schema(annotation, active, gen)
 
     if _is_typeddict(annotation):
-        return _typeddict_schema(annotation, active)
+        return _typeddict_schema(annotation, active, gen)
 
     # Pydantic and anything else exposing the standard hook.
     for attr in ("model_json_schema", "schema"):
@@ -199,14 +292,25 @@ def _literal_value(value: Any) -> Any:
 
 def _is_typeddict(annotation: Any) -> bool:
     is_td = getattr(typing, "is_typeddict", None)
-    return bool(is_td and is_td(annotation))
+    if is_td and is_td(annotation):
+        return True
+    # typing_extensions.TypedDict (how PEP 728's closed=/extra_items= are
+    # spelled before Python 3.15) has its own metaclass. Only consulted when
+    # the app already imported it.
+    te = sys.modules.get("typing_extensions")
+    te_is_td = getattr(te, "is_typeddict", None)
+    return bool(te_is_td and te_is_td(annotation))
 
 
-def _class_hints(cls: Any) -> dict:
+def _class_hints(cls: Any, *, include_extras: bool = False) -> dict:
     """`get_type_hints`, falling back per field when one forward reference
-    does not resolve (so the others still do)."""
+    does not resolve (so the others still do).
+
+    ``include_extras`` keeps ``Annotated``, ``Required``, ``NotRequired`` and
+    ``ReadOnly``; the per-field fallback always keeps them (it evaluates the
+    annotation text as written)."""
     try:
-        return typing.get_type_hints(cls)
+        return typing.get_type_hints(cls, include_extras=include_extras)
     except Exception:
         pass
     module = sys.modules.get(getattr(cls, "__module__", ""), None)
@@ -234,17 +338,18 @@ def _resolve(value: Any, globalns: dict) -> Any:
     return value
 
 
-def _dataclass_schema(cls: Any, active: tuple) -> dict:
+def _dataclass_schema(cls: Any, active: tuple, gen: _Gen) -> dict:
     if cls in active:
-        # A recursive type (`children: list["Node"]`): describe the inner
-        # occurrence loosely instead of recursing until the stack runs out.
-        return {"type": "object", "title": cls.__name__}
+        # A recursive type (`children: list["Node"]`): a `$ref` for a typed
+        # answer, otherwise a loose object, instead of recursing until the
+        # stack runs out.
+        return gen.recursion_point(cls)
     active = (*active, cls)
     props: dict[str, dict] = {}
     required: list[str] = []
     hints = _class_hints(cls)
     for f in dataclasses.fields(cls):
-        props[f.name] = _schema(hints.get(f.name, f.type), active)
+        props[f.name] = _schema(hints.get(f.name, f.type), active, gen)
         has_default = (
             f.default is not dataclasses.MISSING
             or f.default_factory is not dataclasses.MISSING  # type: ignore[misc]
@@ -254,28 +359,117 @@ def _dataclass_schema(cls: Any, active: tuple) -> dict:
     out: dict = {"type": "object", "title": cls.__name__, "properties": props}
     if required:
         out["required"] = required
-    return out
+    if gen.closed:
+        out["additionalProperties"] = False
+    return gen.finish(cls, out)
 
 
-def _typeddict_schema(cls: Any, active: tuple) -> dict:
+def _typeddict_schema(cls: Any, active: tuple, gen: _Gen) -> dict:
     if cls in active:
-        return {"type": "object", "title": cls.__name__}
+        return gen.recursion_point(cls)
     active = (*active, cls)
-    hints = _class_hints(cls)
-    props = {name: _schema(_strip_required(t), active) for name, t in hints.items()}
-    required = [k for k in hints if k in getattr(cls, "__required_keys__", hints.keys())]
+    props: dict[str, dict] = {}
+    required: list[str] = []
+    for name, (annotation, is_required) in typeddict_fields(cls).items():
+        props[name] = _schema(annotation, active, gen)
+        if is_required:
+            required.append(name)
     out: dict = {"type": "object", "title": cls.__name__, "properties": props}
     if required:
         out["required"] = required
+    if gen.closed:
+        extra = _typeddict_extra_items(cls)
+        if extra is None:
+            out["additionalProperties"] = False
+        elif extra is True:
+            out["additionalProperties"] = True
+        else:
+            out["additionalProperties"] = _schema(extra, active, gen) or True
+    return gen.finish(cls, out)
+
+
+def typeddict_fields(cls: Any) -> dict[str, tuple[Any, bool]]:
+    """``{key: (annotation, required)}`` for a ``TypedDict``, qualifiers removed.
+
+    ``cls.__required_keys__`` is wrong under ``from __future__ import
+    annotations``: the qualifiers are still strings when the class is built,
+    so ``NotRequired[str]`` counts as required in a total class and
+    ``Required[int]`` as optional in a ``total=False`` one. The qualifiers
+    are read here from the resolved hints instead. A key with neither
+    qualifier is required when the class that declared it is total, which is
+    the one thing ``__required_keys__`` does get right in that case.
+    """
+    hints = _class_hints(cls, include_extras=True)
+    declared = getattr(cls, "__required_keys__", None)
+    total = bool(getattr(cls, "__total__", True))
+    out: dict[str, tuple[Any, bool]] = {}
+    for name, annotation in hints.items():
+        inner, qualifiers = _unwrap_typeddict_field(annotation)
+        if "Required" in qualifiers:
+            is_required = True
+        elif "NotRequired" in qualifiers:
+            is_required = False
+        elif declared is not None:
+            is_required = name in declared
+        else:
+            is_required = total
+        out[name] = (inner, is_required)
     return out
 
 
-def _strip_required(annotation: Any) -> Any:
-    origin = typing.get_origin(annotation)
-    if origin in (getattr(typing, "Required", None), getattr(typing, "NotRequired", None),
-                  getattr(typing, "ReadOnly", None)) and origin is not None:
-        return typing.get_args(annotation)[0]
-    return annotation
+_QUALIFIER_NAMES = ("Required", "NotRequired", "ReadOnly")
+
+
+def _qualifier(origin: Any) -> str | None:
+    """``"Required"``, ``"NotRequired"`` or ``"ReadOnly"`` when ``origin`` is
+    that qualifier from ``typing`` or (when loaded) ``typing_extensions``."""
+    if origin is None:
+        return None
+    for module in (typing, sys.modules.get("typing_extensions")):
+        for name in _QUALIFIER_NAMES:
+            if module is not None and getattr(module, name, None) is origin:
+                return name
+    return None
+
+
+def _unwrap_typeddict_field(annotation: Any) -> tuple[Any, set[str]]:
+    """``Annotated[Required[ReadOnly[int]], …]`` → ``(int, {"Required", "ReadOnly"})``.
+
+    Metadata on ``Annotated`` is dropped; the schema never used it."""
+    qualifiers: set[str] = set()
+    for _ in range(8):
+        origin = typing.get_origin(annotation)
+        if origin is typing.Annotated:
+            annotation = typing.get_args(annotation)[0]
+        elif (name := _qualifier(origin)) is not None:
+            qualifiers.add(name)
+            annotation = typing.get_args(annotation)[0]
+        elif isinstance(annotation, str) and annotation.endswith("]") and \
+                annotation.split("[", 1)[0].rsplit(".", 1)[-1] in _QUALIFIER_NAMES:
+            # An annotation that never resolved (a typo elsewhere in it): its
+            # qualifier is still readable, and the rest stays a string.
+            head, rest = annotation.split("[", 1)
+            qualifiers.add(head.rsplit(".", 1)[-1])
+            annotation = rest[:-1]
+        else:
+            break
+    return annotation, qualifiers
+
+
+def _typeddict_extra_items(cls: Any) -> Any:
+    """What extra keys a ``TypedDict`` allows: ``None`` (none: it is closed),
+    ``True`` (any) or a type, from PEP 728's ``closed=`` / ``extra_items=``.
+
+    A ``TypedDict`` that says neither is treated as closed: it lists the
+    keys the answer has, and a typed answer with keys nobody declared is the
+    mistake the check exists to catch."""
+    extra = getattr(cls, "__extra_items__", None)
+    # typing_extensions spells "no extra_items= given" as a NoExtraItems sentinel.
+    if extra is not None and "NoExtraItems" not in repr(extra):
+        return extra
+    if getattr(cls, "__closed__", None) is False:
+        return True
+    return None
 
 
 def type_hints(fn: Any) -> dict:
@@ -524,8 +718,8 @@ def _coerce(value: Any, annotation: Any, depth: int) -> Any:
             return value
 
     if _is_typeddict(annotation) and isinstance(value, dict):
-        hints = _class_hints(annotation)
-        return {k: _coerce(v, _strip_required(hints[k]), depth + 1) if k in hints else v
+        fields = typeddict_fields(annotation)
+        return {k: _coerce(v, fields[k][0], depth + 1) if k in fields else v
                 for k, v in value.items()}
 
     return value

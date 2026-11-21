@@ -422,7 +422,9 @@ def test_an_agent_calls_a_rust_tool_in_process(server):
     assert status == 200
     kinds = [s["kind"] for s in out["steps"]]
     assert kinds == ["model", "tool_call", "model"]
-    assert out["steps"][1]["result"][0]["body"] == "first ticket"
+    # A resource lists newest first (2.9.0; before, oldest first under a
+    # "newest first" description).
+    assert [t["body"] for t in out["steps"][1]["result"]] == ["second ticket", "first ticket"]
     assert out["output"].startswith("front_desk says:")
 
 

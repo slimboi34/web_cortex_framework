@@ -1047,13 +1047,19 @@ impl App {
                     tool: Some(name.to_string()),
                     detail: serde_json::json!({"error": &e}),
                 });
-                // A failure the bridge already coded ("WC406: …") keeps its code.
+                // A failure the bridge already coded ("WC406: …") keeps its code,
+                // and its catalogued status when that is a server-side one: a
+                // run refused because every behaviour slot is taken is WC215, 503.
                 let code = crate::errors::code_in(e.get(..6).unwrap_or_default())
                     .filter(|_| e.as_bytes().get(5) == Some(&b':'))
                     .unwrap_or("WC003");
+                let status = crate::errors::lookup(code)
+                    .and_then(|info| info.status)
+                    .filter(|s| *s >= 500)
+                    .unwrap_or(500);
                 guard.outcome = Some(Some(code));
                 drop(guard);
-                let mut res = WebCortexResponse::coded(500, code, e);
+                let mut res = WebCortexResponse::coded(status, code, e);
                 trace_header(&mut res, span.as_ref(), req.depth);
                 Ok(res)
             }

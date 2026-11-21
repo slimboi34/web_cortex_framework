@@ -69,6 +69,9 @@ RESERVED_OPTIONS = ("model", "messages", "tools", "tool_choice", "system", "stre
 # The tool an agent declared with `output=` answers through.
 FINAL_TOOL = "final_answer"
 
+# The most rows one page of a resource's list route returns.
+MAX_PAGE_SIZE = 1000
+
 
 def _options(value: dict | None, who: str) -> dict:
     """Validate `options=` on an agent, behaviour or provider and return a copy.
@@ -99,16 +102,82 @@ def _output_schema(output: Any, who: str) -> dict | None:
     The answer is delivered as a tool call, and a tool's arguments are an object on
     both wire formats, so the schema's top-level type must be ``"object"``: a
     dataclass, a ``TypedDict``, or a dict schema with ``"type": "object"``.
+
+    A type is converted with :func:`webcortex.schema.output_schema_for`: its
+    objects refuse undeclared keys, and a recursive type is described under
+    ``$defs`` so every level of it is checked. A dict schema is used as given.
     """
     if output is None:
         return None
-    schema = dict(output) if isinstance(output, dict) else _schema.json_schema_for(output)
+    schema = dict(output) if isinstance(output, dict) else _schema.output_schema_for(output)
     if schema.get("type") != "object":
         raise ValueError(
             f"{who}: output must describe a JSON object (a dataclass, a TypedDict, or a schema "
             f"with \"type\": \"object\"), got {output!r}; wrap a list or scalar in an object field"
         )
     return schema
+
+
+def _inline_local_refs(schema: Any) -> Any:
+    """``schema`` without ``$defs``, each local ``$ref`` a loose object.
+
+    For a typed agent's route envelope, which embeds the answer's schema
+    under ``data``. The envelope is advertisement (OpenAPI, the TypeScript
+    client), and inside those documents ``#/$defs/...`` would point at their
+    own root, where nothing is defined. The validated schema keeps its refs.
+    """
+    if isinstance(schema, list):
+        return [_inline_local_refs(s) for s in schema]
+    if not isinstance(schema, dict):
+        return schema
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        return {"type": "object", "title": ref.rsplit("/", 1)[-1]}
+    out: dict = {}
+    for key, value in schema.items():
+        if key == "$defs":
+            continue
+        if key in ("enum", "const", "default", "examples"):
+            out[key] = value  # data, not schemas
+        elif key in ("properties", "patternProperties") and isinstance(value, dict):
+            out[key] = {name: _inline_local_refs(s) for name, s in value.items()}
+        else:
+            out[key] = _inline_local_refs(value)
+    return out
+
+
+def _typed_handoff_conflicts(agents: Sequence[dict]) -> list[str]:
+    """Agents reachable by handoff from a typed agent that list a ``final_answer`` tool.
+
+    After a handoff the specialist is offered the typed agent's ``final_answer``
+    tool too, so a route of that name in its ``tools=`` would be a second tool
+    with the same name: providers refuse the request, and the route could never
+    run (the runtime takes every ``final_answer`` call as the answer).
+    """
+    by_name = {a["name"]: a for a in agents}
+    problems: list[str] = []
+    for root in agents:
+        if root.get("output_schema") is None:
+            continue
+        seen = {root["name"]}
+        chain = {root["name"]: [root["name"]]}
+        pending = [root["name"]]
+        while pending:
+            current = pending.pop(0)
+            for target in by_name.get(current, {}).get("handoffs", []):
+                if target in seen or target not in by_name:
+                    continue  # an undeclared target is the runtime's boot error
+                seen.add(target)
+                chain[target] = [*chain[current], target]
+                pending.append(target)
+                if FINAL_TOOL in by_name[target].get("tools", []):
+                    problems.append(
+                        f"agent {target!r} lists the tool {FINAL_TOOL!r}, but it is reached by handoff "
+                        f"({' -> '.join(chain[target])}) from agent {root['name']!r}, which declares "
+                        f"output=, so {FINAL_TOOL!r} is taken by the typed answer; give the route "
+                        f"another tool_name"
+                    )
+    return problems
 
 
 class WebCortex:
@@ -129,7 +198,16 @@ class WebCortex:
         shutdown_timeout: int = 25,
         start_halted: bool = False,
         max_connections: int = 10_000,
+        api_key_header: str = "x-api-key",
     ) -> None:
+        """Describe an application.
+
+        ``api_key_header`` names the request header an API key is read from
+        (``x-api-key`` by default). It must be a valid header name and is
+        matched case-insensitively; ``authorization``, ``cookie`` and other
+        headers that clients, browsers or proxies already use for something
+        else are refused with ``ValueError``.
+        """
         self.name = name
         self.description = description
         self.version = version
@@ -153,7 +231,7 @@ class WebCortex:
         # relaxing it is what costs a line of code, not tightening it.
         self._auth: dict = {
             "api_keys": {},
-            "api_key_header": "x-api-key",
+            "api_key_header": _api_key_header(api_key_header),
             "jwt": None,
             "anonymous_scopes": [],
         }
@@ -352,6 +430,15 @@ class WebCortex:
         `params` names the values bound to each `?` in order; each is resolved
         from the path, then the query string, then the JSON body. The request
         never reaches Python, so this is the fastest kind of route WebCortex has.
+
+        Without an explicit `input_schema=`, one is derived from `params`, so
+        the tool an agent sees names its arguments: one property per distinct
+        name (``@principal`` and other ``@`` names are bound by the runtime and
+        left out), required when it is a ``{name}`` in the path. A name that
+        is a field of a resource whose table the SQL names gets that field's
+        type; otherwise a path or query-string value is a string, and a body
+        value of a POST, PUT or PATCH may be any JSON value. `description`
+        defaults to `summary`, else the first line of the SQL.
         """
         if returns not in ("many", "one", "affected"):
             raise ValueError("returns must be 'many', 'one', or 'affected'")
@@ -360,12 +447,49 @@ class WebCortex:
                 f"query route {method} {path} needs a database; "
                 "pass database=... to WebCortex()"
             )
+        if kw.get("input_schema") is None:
+            kw["input_schema"] = self._query_input_schema(method, path, sql, params)
+        if not kw.get("description"):
+            first_line = next((line.strip() for line in sql.strip().splitlines() if line.strip()), "")
+            kw["description"] = kw.get("summary") or first_line
         return self._add_route(
             method,
             path,
             {"kind": "query", "sql": sql, "params": list(params), "returns": returns},
             **kw,
         )
+
+    def _query_input_schema(self, method: str, path: str, sql: str, params: Sequence[str]) -> dict:
+        """The tool schema a query route advertises when it was given none."""
+        in_path = set(_path_params(path))
+        has_body = method.upper() in ("POST", "PUT", "PATCH")
+        # Field types of the resources this SQL reads or writes, where every
+        # such resource agrees on a name's type.
+        known: dict[str, dict] = {}
+        clashes: set[str] = set()
+        for res in self._resources:
+            if not re.search(rf"(?<![\w.]){re.escape(res.table)}(?!\w)", sql, re.IGNORECASE):
+                continue
+            for field_name, typ in res.fields.items():
+                schema = _schema.json_schema_for(typ)
+                if field_name in known and known[field_name] != schema:
+                    clashes.add(field_name)
+                known.setdefault(field_name, schema)
+        props: dict[str, dict] = {}
+        for name in params:
+            if not isinstance(name, str) or name.startswith("@") or name in props:
+                continue
+            if name in known and name not in clashes and known[name]:
+                props[name] = dict(known[name])
+            elif name in in_path or not has_body:
+                props[name] = {"type": "string"}
+            else:
+                props[name] = {}  # a JSON body value of any type binds
+        schema: dict = {"type": "object", "properties": props}
+        required = [n for n in props if n in in_path]
+        if required:
+            schema["required"] = required
+        return schema
 
     def upstream(
         self,
@@ -467,11 +591,29 @@ class WebCortex:
         list_schema = {
             "type": "object",
             "properties": {
-                "limit": {"type": "integer", "default": 50},
-                "offset": {"type": "integer", "default": 0},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": MAX_PAGE_SIZE},
+                "offset": {"type": "integer", "default": 0, "minimum": 0},
             },
             "additionalProperties": False,
         }
+        # Newest first. An INTEGER key is SQLite's rowid, so it is insertion
+        # order; a table this resource creates has a rowid whatever its key;
+        # a table it did not create may not (WITHOUT ROWID, a view), so that
+        # one is ordered by its key.
+        if generated_key:
+            order, newest = primary_key, "newest first"
+        elif create_table:
+            order, newest = "rowid", "newest first"
+        else:
+            order, newest = primary_key, f"by {primary_key}, descending"
+        # The page size is clamped in SQL, not trusted: SQLite reads a
+        # negative LIMIT as "no limit". CAST so a non-numeric value cannot
+        # compare above every integer (SQLite orders TEXT after INTEGER).
+        list_sql = (
+            f"SELECT * FROM {table} ORDER BY {order} DESC "
+            f"LIMIT MIN(MAX(COALESCE(CAST(? AS INTEGER), 50), 1), {MAX_PAGE_SIZE}) "
+            f"OFFSET MAX(COALESCE(CAST(? AS INTEGER), 0), 0)"
+        )
         pk_schema = {
             "type": "object",
             "properties": {primary_key: props[primary_key]},
@@ -486,10 +628,13 @@ class WebCortex:
         res.route_ids.append(
             self.query(
                 "GET", f"/{name}",
-                f"SELECT * FROM {table} LIMIT COALESCE(?, 50) OFFSET COALESCE(?, 0)",
+                list_sql,
                 params=["limit", "offset"], returns="many",
                 summary=f"List {name}",
-                description=f"Return a page of {name} rows, newest first by insertion order.",
+                description=(
+                    f"Return a page of {name} rows, {newest}: `limit` rows (default 50, at most "
+                    f"{MAX_PAGE_SIZE}) after skipping `offset`."
+                ),
                 input_schema=list_schema,
                 output_schema={"type": "array", "items": body_schema(True, [])},
                 tool_name=f"list_{name}", scopes=reads, **common,
@@ -584,7 +729,21 @@ class WebCortex:
         here rather than inherited because the underlying library defaults to
         60 seconds, and an expired token staying valid for a further minute
         should be a decision, not a surprise.
+
+        `algorithm` is one of :data:`JWT_ALGORITHMS` (``HS256``/``384``/``512``,
+        ``RS256``/``384``/``512``, ``ES256``, ``ES384``, ``EdDSA``), spelled
+        exactly so; anything else raises ``ValueError`` here rather than
+        failing at boot. For the asymmetric ones `secret_env` holds the
+        public key in PEM.
         """
+        if algorithm not in JWT_ALGORITHMS:
+            near = next((a for a in JWT_ALGORITHMS
+                         if isinstance(algorithm, str) and a.lower() == algorithm.lower()), None)
+            hint = f"; did you mean {near!r}?" if near else ""
+            raise ValueError(
+                f"jwt(): algorithm {algorithm!r} is not supported; use one of "
+                f"{', '.join(JWT_ALGORITHMS)}{hint}"
+            )
         self._auth["jwt"] = {
             "secret_env": secret_env,
             "algorithm": algorithm,
@@ -818,7 +977,7 @@ class WebCortex:
         if options is not None:
             self.request_options(name, **options)
 
-    def request_options(self, provider: str, **options: Any) -> None:
+    def request_options(self, provider: str, /, **options: Any) -> None:
         """Send extra request-body fields with every call to one provider.
 
         The pass-through for whatever a provider supports that WebCortex has no
@@ -830,7 +989,8 @@ class WebCortex:
             provider: A declared provider's name, or a built-in one:
                 ``"anthropic"`` (bare ``claude-*`` names and ``anthropic/…``),
                 ``"openai"`` (``gpt-*``, ``o1``/``o3``/``o4`` and ``openai/…``) or
-                ``"ollama"``.
+                ``"ollama"``. Positional-only, so an option may itself be
+                called ``provider`` (OpenRouter's routing preferences are).
             **options: The fields. ``model``, ``messages``, ``tools``,
                 ``tool_choice``, ``system`` and ``stream`` belong to the runtime
                 and raise ``ValueError``.
@@ -1589,7 +1749,7 @@ class WebCortex:
                         "run_id": {"type": "string"},
                         "status": {"type": "string"},
                         "output": {"type": "string"},
-                        "data": output_schema,
+                        "data": _inline_local_refs(output_schema),
                         "trace_id": {"type": "string"},
                     },
                     "required": ["run_id", "status", "output"],
@@ -1821,6 +1981,11 @@ class WebCortex:
         return [*self._routes, default]
 
     def manifest(self) -> dict:
+        # Checks that need the whole app: a handoff target may be declared
+        # after the agent that names it.
+        conflicts = _typed_handoff_conflicts(self._agents)
+        if conflicts:
+            raise ValueError(f"invalid application: {conflicts[0]}")
         return {
             "name": self.name,
             "version": self.version,
@@ -1915,7 +2080,7 @@ class WebCortex:
         public = [
             f"{r['method']} {r['path']}"
             for r in self._routes_with_default_root()
-            if not r["scopes"] and not r["tool"]["scopes"]
+            if self._anonymous_may_call(r)
         ]
         return {
             "auth_configured": auth_on,
@@ -1984,6 +2149,25 @@ class WebCortex:
                 for b in self._behaviours
             ],
         }
+
+    def _anonymous_may_call(self, route: dict) -> bool:
+        """Whether a caller with no credential passes this route's scope check.
+
+        The runtime gives such a caller exactly ``anonymous_scopes`` (``"*"``
+        meaning every scope) and checks the route's scopes plus its tool
+        scopes; an agent's, behaviour's or flow's route carries its
+        ``expose_scopes`` as its scopes. A route whose every required scope is
+        granted anonymously is as public as one that requires none, so
+        ``anonymous_scopes("write")`` puts the write routes in
+        ``public_routes``. With no authentication configured, a route that
+        requires a scope anonymous callers lack answers 401 to everyone: it
+        is unreachable, not public.
+        """
+        granted = set(self._auth["anonymous_scopes"])
+        if "*" in granted:
+            return True
+        required = {*route["scopes"], *route["tool"]["scopes"]}
+        return required <= granted
 
     def _actuator_warnings(self, auth_on: bool) -> list[str]:
         """Ways the physical surface is easier to reach than it should be."""
@@ -2200,6 +2384,45 @@ def resolve_port(default: Any) -> int:
     if not 0 <= port <= 65535:
         raise ValueError(f"invalid application: {source}={value!r} is not a port number (0-65535)")
     return port
+
+
+# RFC 9110 (formerly RFC 7230) `token`: what a header name may contain.
+_HEADER_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+# Headers with a meaning of their own to clients, browsers, proxies or this
+# runtime. Reading a key from one would either never see it (a proxy strips
+# or rewrites it), leak it (a browser sends cookies everywhere), or shadow the
+# runtime's own use of it (`authorization` carries bearer tokens).
+_RESERVED_KEY_HEADERS = frozenset({
+    "authorization", "proxy-authorization", "cookie", "set-cookie", "host",
+    "content-type", "content-length", "content-encoding", "transfer-encoding",
+    "connection", "keep-alive", "upgrade", "te", "trailer", "expect",
+    "origin", "referer", "user-agent", "accept", "accept-encoding",
+    "if-none-match", "traceparent", "tracestate", "forwarded",
+    "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip",
+})
+# Set by browsers (`sec-fetch-site`, `sec-websocket-key`) or meant for proxies.
+_RESERVED_KEY_HEADER_PREFIXES = ("sec-", "proxy-")
+
+
+def _api_key_header(value: Any) -> str:
+    """Validate ``WebCortex(api_key_header=...)`` and return it lower-cased."""
+    if not isinstance(value, str) or not _HEADER_TOKEN.fullmatch(value):
+        raise ValueError(
+            f"WebCortex: api_key_header={value!r} is not a valid HTTP header name "
+            "(letters, digits and !#$%&'*+-.^_`|~ only, e.g. 'x-api-key')"
+        )
+    header = value.lower()
+    if header in _RESERVED_KEY_HEADERS or header.startswith(_RESERVED_KEY_HEADER_PREFIXES):
+        raise ValueError(
+            f"WebCortex: api_key_header={value!r} is a header clients, browsers or proxies already "
+            "use for something else; pick a name of your own, e.g. 'x-api-key' or 'x-service-key'"
+        )
+    return header
+
+
+# The algorithms `app.jwt()` accepts: HMAC, RSA PKCS#1, ECDSA P-256/P-384, Ed25519.
+JWT_ALGORITHMS = ("HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA")
 
 
 def _positive_int(who: str, name: str, value: Any, *, allow_zero: bool = False) -> int:

@@ -307,7 +307,8 @@ app.agent(
     tools=["list_items", "get_items", "get_items_by_id_summary", "create_items_purge"],
     scopes=["read"],
     # Who may start a run. Separate from `scopes`, which is what the run may do.
-    expose_scopes=["read"],
+    # Not "read": anonymous callers hold that, and a run spends tokens.
+    expose_scopes=["write"],
     max_steps=8,
     token_budget=50_000,
     expose_at="/ask",
