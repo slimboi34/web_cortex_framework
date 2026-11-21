@@ -148,6 +148,7 @@ webcortex typegen    # generate client/api.ts
 webcortex status     # what the running app is doing (admin key)
 webcortex trace      # what recent agent runs did, span by span (admin key)
 webcortex eval       # run the declared evals, replaying recorded model responses
+                     # (record them once with `webcortex eval --record` and a provider key)
 ```
 """
 
@@ -775,10 +776,14 @@ def triage(ctx, input):
 
 
 # --- Evals: what this app must keep doing -----------------------------------
-# `webcortex eval --record` runs these against the model once and saves its
-# responses under evals/. After that `webcortex eval` replays them: no key, no
+# An eval that asks a model needs a recording before it can pass. Once, with a
+# provider key set (ANTHROPIC_API_KEY for the models above):
+#     webcortex eval --record     # asks the model, saves its answers in evals/
+# and commit evals/. From then on `webcortex eval` replays them: no key, no
 # tokens, the same answer every time, with the tools and handoffs running for
-# real. Change an agent's prompt or tools and its recording goes stale.
+# real (`webcortex eval --replay` in CI). Until it is recorded, the eval fails
+# and says how to record it. Change an agent's prompt or tools and its
+# recording goes stale (WC319): record again and read the diff.
 
 app.eval(
     "refunds_reach_billing",
