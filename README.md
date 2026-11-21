@@ -566,7 +566,7 @@ tested, the known limits, and what v2 added to the surface.
 
 ## Status
 
-v2.8.0. Working and tested: the manifest IR, router, native ops (static /
+v2.9.0. Working and tested: the manifest IR, router, native ops (static /
 query / proxy / page / files / flow), the free-threaded Python bridge,
 authentication and scopes, rate limiting, CORS, security headers, graceful
 shutdown, Behaviours with concurrent leaves, the agent runtime with handoffs,
@@ -580,9 +580,13 @@ ingest and streams, agents over WebSocket), diagnostics (stable error codes
 with hints on every failure, `webcortex doctor`, the live `/_webcortex/status`
 view and its MCP tool), and, new in 2.8, structured agent output validated by
 the runtime, provider request options, run traces with OTLP export, and evals
-that replay recorded model responses. **961 tests** (284 Rust, 677 Python,
-including a 54-test adversarial suite and offline end-to-end suites that drive
-the whole agent stack over HTTP), clippy clean.
+that replay recorded model responses. 2.9 is a hardening release from a
+planned stress test of 2.8: 70 defects fixed or documented, three of them high
+severity (see the [changelog](CHANGELOG.md) and the review in
+[SECURITY.md](SECURITY.md)).
+**1,250 tests** (334 Rust, 916 Python, including a 54-test adversarial suite and
+offline end-to-end suites that drive the whole agent stack over HTTP), clippy
+clean.
 
 Not yet: Postgres, token-level SSE streaming, durable agent runs that survive a
 restart. See [DESIGN.md](DESIGN.md) for the roadmap, honest risk grading, and —

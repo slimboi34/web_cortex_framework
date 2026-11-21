@@ -63,8 +63,8 @@ Everything else in this document is downstream of those five ideas.
 
 ## 2. What exists and has been measured
 
-Working today, with **284 Rust tests and 677 Python tests** passing and clippy
-clean (as of 2.8.0):
+Working today, with **334 Rust tests and 916 Python tests** passing and clippy
+clean (as of 2.9.0):
 
 **Runtime**
 - Manifest IR, boot-time validation, method-partitioned radix router
@@ -370,6 +370,18 @@ Ordered by what unblocks the most.
    What 2.8 did not do: item 5's token deltas (SSE) are still deferred, for
    the reason given in Tier 2 — the response body is still `Bytes`.
 
+**v2.9 — shipped: hardening**
+✅ A stress test of 2.8.0, planned up front and run by several agents in
+   parallel (authorization and agent authority, injection and denial of
+   service, concurrency, the 2.8 evidence features, the upgrade, and newcomers
+   following the docs), confirmed 60 defects; with 10 already known, all are
+   fixed or documented. See `SECURITY.md` ("Review — 2.9.0").
+✅ The output validator now follows local `#/$defs/...` references, so a
+   recursive output type is checked at every depth, and a malformed schema is
+   a boot error rather than silently ignored.
+✅ Behaviours run on a pool of their own with a cap, and every blocking call
+   from a behaviour has a deadline (see §7).
+
 **Later, if warranted**
 12. Durable agent runs — only with a real design for exactly-once tool
     execution. Sessions and approvals stay in memory until then, and say so.
@@ -403,6 +415,21 @@ sibling's static segment landed on the sibling — so a gate held only as long a
 nothing sent an awkward value. The call now carries its route id and dispatch
 refuses a path that routes elsewhere: a decision made about one identity must be
 enforced against the same identity, not a re-derivation of it.
+
+**A gate checked at the doors is not a gate (2.9.0).** Approval was checked by
+tool name at each entry point (the agent loop, MCP, behaviours), and a flow ran
+its steps through the dispatcher, which never looked. Wrapping a gated tool in a
+flow walked it past every door. A flow cannot wait for a human, so the fix
+refuses such a flow at boot and checks again where the step runs: a rule about
+an action belongs where the action happens, and a configuration that cannot
+honour it should not start.
+
+**A blocking wait needs a deadline (2.9.0).** Behaviours and sync handlers
+shared one pool, and a behaviour's `ctx.call` blocked on a pool thread with no
+bound, so a handful of anonymous requests could hold every thread waiting for
+another. Two independent fixes, either of which prevents the wedge: behaviours
+have their own capped pool that refuses rather than queues, and every wait from
+a behaviour ends at the run's deadline or when its caller goes away.
 
 ## 8. The honest summary
 
@@ -440,7 +467,8 @@ a real collector, and speaks OTLP's JSON encoding only; the cost of tracing a
 run has not been benchmarked; a cassette replays responses in recorded order
 per agent, so two differently-named agents racing each other are matched by
 name rather than by time; and the output-schema validator ignores `pattern`,
-`format` and `$ref`.
+`format`, `patternProperties` and any `$ref` that does not point into the
+root's `$defs`.
 
 
 The largest genuine risk is still not technical, it is scope. A framework that

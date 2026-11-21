@@ -187,11 +187,11 @@ $ webcortex eval --replay       # …and replay them in CI: no key, no tokens, r
 ## Status
 
 !!! warning "Young"
-    v2.8.0, on PyPI as `web-cortex-framework`. Working and tested, but young.
+    v2.9.0, on PyPI as `web-cortex-framework`. Working and tested, but young.
     Read [Deployment](deployment.md#is-it-production-ready) for an honest
     assessment of what it is and is not ready for.
 
-**Verified:** 961 tests (284 Rust, 677 Python, including a 54-test adversarial
+**Verified:** 1,250 tests (334 Rust, 916 Python, including a 54-test adversarial
 suite and offline end-to-end suites that drive the whole agent stack over
 HTTP). Clippy clean. `cargo audit` clean. CI builds wheels for Linux
 (x86_64/aarch64), macOS (arm64/x86_64), and Windows across Python 3.12, 3.13,

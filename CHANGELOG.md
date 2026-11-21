@@ -3,6 +3,358 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.9.0] — 2026-11-21
+
+Hardening. This release comes out of a stress test of 2.8.0 that Fable planned and a team of
+agents carried out: hostile passes over authorization and agent authority, injection, denial
+of service and the supply chain, a concurrency and functional sweep, a check of the 2.8
+evidence features and of the 2.7 → 2.8 upgrade, and two newcomers following the README and
+the tutorial. It confirmed 60 new defects (3 high, 14 medium, 43 low; 17 more findings were
+refuted), and 10 bugs already known in 2.8.0 were added to the work. All 70 are dealt with
+here, each with a regression test: 68 are fixed, and 2 are documented rather than changed
+(typed parameters are converted, not validated; device ingest keys are bound by scope, not by
+device). Two smaller problems found along the way are fixed too: `halt` and `release` had no
+`--url`, and the orchestration starter's eval failed on a fresh scaffold without saying why.
+
+The three high-severity fixes: an approval gate could be skipped by running the gated tool as
+a flow step; a client that read slowly could pin responses in memory without limit; and eight
+anonymous requests to a behaviour could wedge the worker pool for good. The other security
+fixes: `aud`/`iss` are required when configured, WebSocket agent turns are rate limited and
+stop when the token expires, the proxy no longer follows upstream redirects, a request that
+will be refused is answered before its body is read, resource bodies are held to their schema,
+and the `json` template filter is safe inside `<script>`. Several fixes refuse what 2.8.0
+accepted, so read **Changed** before upgrading. `SECURITY.md` has the review ("Review —
+2.9.0").
+
+### Security
+
+- **An approval gate can no longer be skipped by wrapping the gated tool in a flow.** A flow
+  whose steps reach an `approval="required"` tool, directly or through nested flows,
+  `parallel=` branches or `route=` routes, is an invalid application: `app.manifest()`,
+  `webcortex check` and boot refuse it with `WC101`, naming the flow, the chain and the tool.
+  In 2.8.0 such a flow booted and the gated tool ran, with nobody asked, whenever an agent, an
+  MCP client or a behaviour called the flow. An agent step that calls the gated tool is still
+  allowed, because the agent suspends and asks. As defence in depth, a flow step that would
+  reach a gated tool fails with `WC309` without running, and MCP `tools/call`, `ctx.call` and
+  the agent loop refuse such a flow by name.
+- **Slow readers can no longer pin responses in memory.** A connection whose response body
+  makes no progress for the header timeout (`request_timeout`, at most 30 s) is closed; reads,
+  keep-alive bytes and HTTP/2 PINGs no longer count as progress, and a response counts as in
+  flight until its body has been taken. Static files are streamed from disk instead of read
+  whole for every request. HTTP/2 connections allow at most 64 concurrent streams (hyper's
+  default was 200), and the server pings idle peers. In 2.8.0 a client that opened HTTP/2
+  streams with a zero window and kept pinging, or read 4 KB every few seconds over HTTP/1.1,
+  held every response it asked for.
+- **Behaviours can no longer wedge the worker pool.** In 2.8.0 a behaviour that `ctx.call`ed a
+  sync Python route held a pool thread while it waited for another one, so `workers × 4`
+  concurrent requests (8 on a GIL build, anonymous ones included when the behaviour was
+  public) stopped every sync route for good, and SIGTERM could not end the process. Now:
+  - behaviours run on threads of their own, at most `max(32, workers × 8)` at once
+    (`WEBCORTEX_MAX_BEHAVIOURS` changes it); a run past that, including a nested
+    `ctx.call`/`ctx.gather` to a behaviour, is refused at once with **503 `WC215`** instead of
+    queueing;
+  - `ctx.call`, `ctx.gather`, `ctx.ask`, `ctx.ask_many` and `ctx.context` stop waiting once
+    the run's route timeout has passed, or as soon as whoever started the run stops waiting;
+    the behaviour then gets `BehaviourHalted` with `code == "WC203"`;
+  - Python worker threads are daemons, so a handler stuck past `shutdown_timeout` no longer
+    keeps the process alive after SIGTERM.
+  Either the separate pool or the bounded waits alone prevents the wedge.
+- **A request that will be refused is answered before its body is read.** No route (404), a
+  method the route does not take (405), a missing scope (401/403), the emergency stop (423)
+  and the control plane's admin scope are decided first. A refused HTTP/1 request with a body
+  still outstanding gets `connection: close`, and `Expect: 100-continue` is answered with the
+  refusal. In 2.8.0 up to 32 MB of body was buffered from anyone before the refusal.
+- **`app.jwt(audience=..., issuer=...)` requires the token to carry `aud` and `iss`.** In
+  2.8.0 they were checked only when present, so a token minted for another service that left
+  them out was accepted.
+- **WebSocket agent turns are rate limited.** The upgrade pays for the first turn and every
+  later turn is charged to the caller's bucket, as an HTTP run is. Over the limit the socket
+  gets `{"type": "error", "code": "WC401", "retry_after": n}` and the turn is not run; three
+  refusals in a row close the socket (1008). In 2.8.0 only the upgrade was charged.
+- **A WebSocket opened with a bearer token stops honouring it when it expires** (`exp` plus
+  `leeway_secs`). An agent socket refuses the next turn, or closes when idle, with a `WC603`
+  error frame and close 1008; a device ingest or stream socket is closed at that moment. In
+  2.8.0 the token was checked only at the upgrade.
+- **The proxy no longer follows upstream redirects.** A 3xx reaches the caller with its
+  `Location`; one pointing inside the upstream's `base_url` is mapped back through the app's
+  proxy routes to the path a caller uses here (or to the path beneath the base). Proxy requests
+  no longer send a `Referer`. In 2.8.0 the proxy followed a redirect to any host, a cloud
+  metadata address included, and sent the upstream's static headers there.
+- **Resource and query-route bodies are held to the advertised schema.** A resource's create
+  and update routes, and every native query route that takes a body (POST, PUT, PATCH) and has
+  an `input_schema`, answer **422 `WC206`** for a missing required field, a key the schema does
+  not allow or a value of the wrong type. The message names each problem, and they are listed
+  in `error.problems`; a value the path or query string supplies counts as present. In 2.8.0
+  `POST {}` inserted a row of NULLs, a misspelt key on `PUT` wiped every field, and `"lol"` was
+  stored in a REAL column.
+- **The `json` template filter is safe inside `<script>` and a single-quoted attribute.** It
+  writes `<`, `>`, `&`, `'`, U+2028 and U+2029 as `\uXXXX` and marks its output safe, so
+  `<script>const d = {{ data | json }}</script>` is valid JavaScript (2.8.0 HTML-escaped it)
+  and `</script>` in the data cannot end the element (2.8.0's workaround, `| json | safe`,
+  could). `tojson` is an alias; both take an optional `indent`. In an attribute, quote with
+  `'`, not `"`.
+- **Page templates are served with the content type their extension names**: `.json` as
+  `application/json`, `.txt` as `text/plain; charset=utf-8`, `.xml`, `.svg`, `.css`, `.js`,
+  `.csv` and `.md` as their own types, `.html`/`.htm`/`.xhtml` as `text/html`, anything else as
+  plain text (case-insensitive, looking through `.j2`/`.jinja`/`.jinja2`). In 2.8.0 every page
+  was `text/html`, so a `.txt` or `.json` template, which is not HTML-escaped, rendered data
+  holding `<script>` as a live page. `.json` templates now render `{{ value }}` as JSON, so a
+  value cannot break out of its string.
+- **`public_routes` lists the routes `anonymous_scopes(...)` opens**, in `webcortex security`,
+  `app.security_report()`, `/_webcortex/security`, the `webcortex dev` warning and the context
+  pack. A route is public when every scope it requires (route and tool scopes; `expose_scopes`
+  for agents, behaviours and flows) is granted anonymously, `"*"` granting all. In 2.8.0
+  `anonymous_scopes("write")` left anonymously writable routes off the list. With no
+  authentication configured, a route that requires a scope answers 401 to everyone, so it is
+  not listed.
+- **A JWT whose `sub` equals a configured API key's `id`, or starts with `watcher:`, gets
+  401 `WC603`.** Memory, sessions, `@principal` queries and the rate limiter are keyed by the
+  principal id, so in 2.8.0 such a token read and wrote that service's state. API-key ids and
+  JWT subjects share one id space; pick key ids no identity provider will issue.
+- **One principal can no longer evict another's pending approvals or agent sessions.** Each
+  root principal holds at most 100 pending approvals and `session_capacity / 10` sessions (at
+  least one); at its quota its own oldest entry goes. The global caps still apply. In 2.8.0 one
+  caller suspending a thousand runs destroyed everyone else's and flooded the approver's queue.
+- **Starters ship no working key.** `.env.example` has `WEBCORTEX_API_KEY=` and
+  `WEBCORTEX_JWT_SECRET=` empty, with a comment to run `webcortex keygen`; in 2.8.0 it held
+  `replace-me-run-webcortex-keygen`, and copying it to `.env`, as it said to, booted a publicly
+  known admin key. The runtime no longer registers an API key whose value starts with
+  `replace-me` (a warning names the variable), and `webcortex doctor` fails with `WC106` when a
+  declared key or the JWT secret is empty or still the placeholder, without printing it.
+- **`webcortex context --json` no longer prints credentials.** Upstream and camera header
+  values and any `user:password@` in an upstream, camera, webhook or database URL are shown as
+  `"<redacted>"`; `--show-secrets` prints the manifest as declared.
+- **`webcortex mcp-config` prints a shell-quoted `claude mcp add` line**, so an app name, URL
+  or key holding a space, `;`, `$` or a backtick is passed as written. The MCP server name is
+  the app name reduced to `[A-Za-z0-9_-]` (`My Shop` becomes `My-Shop`).
+- **The generated TypeScript client refuses dot-segment path arguments.** It throws a
+  `WebCortexError` (status 0) before sending when a path parameter is `""`, `"."` or `".."`,
+  or a `{*rest}` value has a `.` or `..` segment; `fetch()` resolves dot segments, so
+  `{id: ".."}` on `/users/{id}/disable` was sent as `POST /disable`. A line terminator in the
+  app name or version no longer ends the generated file's header comment.
+- **Image URLs are refused for more spellings of internal addresses**: IPv4-compatible IPv6
+  (`[::7f00:1]`), NAT64 `64:ff9b::/96` with an internal IPv4 inside, the local-use NAT64 prefix
+  `64:ff9b:1::/48`, 6to4 `2002::/16` with an internal IPv4 inside, and site-local `fec0::/10`.
+- **An agent no longer asks a human to approve a call it could never make.** Before
+  suspending, the gated tool's scopes are checked against the run's own authority (the agent's
+  `scopes=` intersected with its caller's); if one is missing the call is refused at once with
+  `WC602` and no approval is created. When the caller is an agent or behaviour, the hint names
+  that delegate and the scopes it holds. In 2.8.0 a human approved the call, it then failed,
+  and the hint blamed the caller's key.
+
+### Fixed
+
+- **Agents and behaviours**
+  - `ctx.ask(..., schema=)` and `ctx.ask_many(..., schema=)` check each answer against the
+    schema. A mismatch goes back with the problems, at most twice (each correction is a step);
+    then a `RuntimeError` whose message starts `WC318:` is raised, with `code` and `problems`.
+    In 2.8.0 a missing key, a wrong type, an off-enum value or an array came back as the answer.
+  - A typed run never sends two tools named `final_answer`: an agent with `output=` may not hand
+    off, through any chain, to an agent listing a `final_answer` route (`WC101` at
+    `app.manifest()`, `webcortex check` and boot), and the runtime drops a same-named tool when
+    it adds its own.
+  - A flow that times out, or whose client goes away, ends its span as `cancelled` and exports
+    it; in 2.8.0 it stayed open. A 504 `WC203` for a timed-out agent, behaviour or flow run
+    carries `x-webcortex-trace` and `error.trace_id`.
+  - `?access_token=` on a WebSocket upgrade accepts a JWT when `app.jwt()` is configured: a
+    value shaped like `header.payload.signature` is read as a bearer token, anything else as an
+    API key. A header credential still wins.
+  - ES256, ES384 and EdDSA tokens work, as documented: `secret_env` holds the PEM public key
+    and the 32-byte rule applies only to HMAC secrets. `app.jwt()` refuses any other algorithm
+    at declaration with a `ValueError` (with "did you mean" for `hs256` and the like) instead
+    of failing at boot.
+- **Structured output**
+  - A typed agent's answer (`output=` a dataclass or `TypedDict`) may not carry keys the type
+    does not declare, at any level, as the docs said (`additionalProperties: false`).
+    `dict[str, X]` fields stay open, and so does a `TypedDict` declared open with PEP 728
+    `closed=False` or `extra_items=`. Route schemas are unchanged.
+  - A recursive dataclass or `TypedDict` is described once under `$defs`, with
+    `{"$ref": "#/$defs/<Name>"}` at each recursion point, and the validator follows such refs,
+    so a wrong type three levels down is refused. Other `$ref`s are still ignored. The route's
+    OpenAPI and TypeScript envelope shows a recursion point as a plain object.
+  - `TypedDict` `Required[...]` and `NotRequired[...]` are honoured under
+    `from __future__ import annotations` (2.8.0 inverted them), including inside `Annotated` or
+    `ReadOnly`; `typing_extensions.TypedDict` is recognised.
+  - `minItems`, `maxItems`, `minLength` and `maxLength` written as `2.0` are enforced. `enum`
+    and `const` compare numbers as numbers at any depth, and integers compare exactly, in
+    `minimum`/`maximum` and the exclusive bounds too, so `maximum: 2^53` refuses `2^53 + 1`.
+    `uniqueItems` is checked, so a `set[...]` field refuses duplicates.
+  - A schema with `patternProperties` no longer refuses a valid answer: `additionalProperties`
+    is not applied in a schema that has it (see Known limits).
+  - A malformed output schema fails at boot, naming the keyword's location and what is wrong,
+    instead of being ignored on every answer: a bad `type`, `properties` that is not an object,
+    `required` that is not a list of names, `enum` that is not a list, a negative or fractional
+    count, a non-number bound (including draft-4's boolean `exclusiveMinimum`), list-form
+    `items`, an empty `anyOf`/`oneOf`/`allOf`, a `$ref` to a missing `$defs` entry, or a `$defs`
+    entry that refers to itself without consuming any of the value.
+  - An answer given as prose yields its last parseable JSON object or array, not the first, so
+    prose that mentions braces or shows a draft first still gives the answer.
+  - Floats pass through the core unchanged (serde_json `float_roundtrip`; about one random
+    double in eight was one ULP off), and `temperature` goes on the wire as written (`0.9`, not
+    `0.8999999761581421`) on both wire formats.
+- **Data and routing**
+  - A resource's `bool` fields, and any query route field whose `output_schema` says boolean,
+    read back as `true`/`false`, not `1`/`0`.
+  - A JSON integer SQLite cannot hold (above `i64::MAX`, or a whole number of magnitude 2^63 or
+    more) is refused with 400 `WC211` instead of being stored as a rounded float.
+  - `returns="affected"` reports `last_insert_id: null` when the statement inserted nothing,
+    instead of an id some earlier INSERT on the same pooled connection made.
+  - Routes with non-ASCII literal segments (`/café/{n}`) answer raw UTF-8, `%C3%A9` and
+    `%c3%a9`. Request paths are normalised before matching (upper-case hex, encoded unreserved
+    characters decoded, so `/p%69ng` is `/ping`); `%2F`, `%5C` and `%25` stay encoded.
+  - `app.query(...)` routes without `input_schema=` advertise one derived from `params` (MCP
+    `tools/list`, OpenAPI, the TypeScript client and agents saw an empty object), and default
+    their description to `summary`, else the SQL's first line.
+  - A deeply nested JSON body to a Python handler answers 400 `WC205`, not 500 `WC002`.
+  - `app.request_options(provider, /, **options)` takes the provider positionally only, so an
+    option may itself be called `provider`; the OpenRouter example in the docs raised
+    `TypeError`.
+  - `WebCortex(..., api_key_header="x-api-key")` sets the header API keys are read from, which
+    the security docs named but nothing could set. Headers with a meaning of their own
+    (`authorization`, `cookie`, `host`, `x-forwarded-*`, `sec-*`, …) raise `ValueError`.
+- **Tracing**
+  - OTLP export no longer loses spans when more runs are in flight than `tracing(keep=...)`:
+    a trace pushed out of the in-memory ring keeps its open spans aside and exports them when
+    they end. Spans that still cannot be exported (over `max_spans`, or more than 4096 held) are
+    counted in `spans_dropped` under `export` in `/_webcortex/traces`.
+  - `OTEL_EXPORTER_OTLP_HEADERS` (or the `otlp_headers_env` variable) is trimmed and
+    percent-decoded, as the OpenTelemetry spec says; a malformed entry is skipped with a warning
+    naming its position, never its value.
+  - An OTLP endpoint that is set but unusable (no `http(s)://`, no host, not a URL) is a boot
+    warning naming the variable it came from, and `webcortex doctor` gains a `tracing.export`
+    check that names the endpoint spans will go to.
+- **Evals**
+  - `tools_called`, `tools_not_called` and `max_model_calls` fail, saying why, when tracing is
+    disabled or the trace was truncated at `max_spans`. 2.8.0 fell back to the outer agent's own
+    steps, missing nested calls, and passed.
+  - `expect={"data": ...}` tells `true` from `1` and `false` from `0`, at any depth.
+  - A tool call the runtime refused (`WC401`, `WC403`, `WC502`, `WC601`-`WC604`, `WC607`,
+    besides `WC307` and `WC317`) does not count as called.
+  - A wrongly typed `expect` value, or `scopes` given as a string, is a `ValueError` at
+    declaration instead of a `TypeError` traceback that lost the report. An exception in one
+    eval fails that eval with `WC320`; the others still run.
+  - A cassette that cannot be read (permission denied, a directory, not UTF-8) or written is
+    `WC320` naming the path, not a traceback; cassettes are written through a temporary file.
+    `--record` with no reachable provider writes no cassette and reports the provider's code.
+    Each result has a new `error` field (`null` or `{code, message, hint}`).
+  - The orchestration starter's eval says, on a fresh scaffold with no key, that there is no
+    cassette and to run `webcortex eval --record` once.
+- **CLI**
+  - `webcortex check` loads and parses page templates as boot does, so a missing or broken
+    template fails the check. `run`, `dev` and `check` print `error[WCnnn]` for boot failures
+    instead of a traceback: `WC004` for a template (with file and line), `WC107` for a missing
+    templates directory or SQLite file, `WC104` for a bind failure, `WC101` otherwise.
+  - `webcortex check` prints the route table it promised: `route_table`, one entry per route
+    with `method`, `path`, `engine`, `tool` and `scopes`. `routes` is still the count.
+  - `webcortex halt` and `release` take `--url`, as the `WC108` hint said, and work without an
+    `api.py` when given one; a bind host of `0.0.0.0` is dialled as `127.0.0.1`.
+- **Documentation**
+  - The tutorial matches the app it builds: its route counts, the 422 example (which now sends
+    the key), 502 `WC301` rather than 503 with no provider key, restarting `webcortex dev`
+    after an edit, the real MCP `tools/list` entry, and an agent that holds the scope its gated
+    purge needs.
+  - The admin-panel use case boots (its HTML detail page moved to `/admin/users/{id}`), and
+    the deploy-bot use case declares the scope its gated tool needs.
+  - The README's flagship agents have a `token_budget`, and the triage behaviour declares its
+    scopes.
+  - `docs/api-reference.md` names every public parameter, with a Device hub section
+    (`only_on_change` included); `docs/cli.md` covers `mcp-config`, `--url`, `route_table` and
+    the redaction; `docs/installation.md` lists all seven starters.
+  - Every page describes 2.9.0 behaviour, and `tests/test_2_9_docs.py` builds the tutorial,
+    use-case, README and device-hub apps from the pages' own code blocks and checks the pages
+    against them.
+
+### Changed
+
+Upgrading from 2.8.0, these may need action:
+
+- A flow with an approval-gated step no longer boots (`WC101`); call the gated tool from an
+  agent step instead.
+- A token missing `aud` or `iss` gets 401 when `audience` or `issuer` is configured.
+- A body that breaks a resource's or query route's schema is a 422 `WC206`. `PUT` replaces the
+  whole row, so send every field; `POST` refuses an `id` when the key is generated.
+- A resource's list route returns rows **newest first**, as its description always said, with
+  `limit` clamped to 1–1000 and `offset` to at least 0 (`?limit=-1` no longer returns the whole
+  table; a `limit` that is not a number gives one row).
+- `returns="affected"` can report `last_insert_id: null`. A JSON number of magnitude 2^63 or
+  more is a 400 `WC211`, floats such as `6.02e23` included (the parsed body cannot tell them
+  from integers); send such a value as a string to a `REAL` column.
+- The proxy relays a 3xx instead of following it, and sends no `Referer`.
+- WebSocket agent turns are rate limited and end at the token's expiry. The claim name
+  `token_expires_at` is reserved.
+- An API key whose value starts with `replace-me` is not registered. A JWT `sub` equal to an
+  API key's `id`, or starting with `watcher:`, is refused.
+- At most `max(32, workers × 8)` behaviour runs go at once; past that, 503 `WC215`
+  (`WEBCORTEX_MAX_BEHAVIOURS` raises it). `ctx.*` waits end with `BehaviourHalted`
+  (`code == "WC203"`) at the run's timeout.
+- One principal holds at most 100 pending approvals and `session_capacity / 10` agent sessions
+  (100 by default). Raise `session_capacity` if one service key fronts many users' sessions.
+- A client must take each 64 KB of a response within the header timeout (about 2 KB/s at the
+  30 s default). HTTP/2 allows 64 concurrent streams per connection.
+- Static-file `ETag`s come from size, modification time and inode, so each client downloads
+  each file once more after the upgrade.
+- Typed outputs refuse undeclared keys, and some answers 2.8.0 accepted are now refused with
+  `WC318` (exact number comparison, `uniqueItems`, `$defs` refs, integral-float counts). A
+  malformed output schema is a boot error. Required-ness of some `TypedDict` keys changes for
+  modules using `from __future__ import annotations`.
+- `.txt`, `.json` and other non-HTML page templates change content type, and `.json`
+  templates escape values as JSON: write `{"q": {{ q }}}`, not `{"q": "{{ q }}"}`.
+- The `json` filter's output is no longer HTML-escaped; drop any `| safe` after it.
+- Prose answers yield the last JSON object, not the first.
+- `ctx.ask(schema=)` that gets no structured answer raises the `WC318` `RuntimeError` after
+  two corrections, instead of a plain `RuntimeError` at once.
+- Request paths are normalised before routing (`/p%69ng` reaches `/ping`).
+- `public_routes` grows to include anonymously reachable scoped routes. The `agent` starter's
+  assistant needs the `write` scope to start a run (`expose_scopes=["write"]`).
+- `app.request_options` takes `provider` positionally only.
+- Eval checks that read the trace fail when tracing is off or truncated; `true` no longer
+  matches `1`.
+- **Eval cassettes recorded with 2.8.0 report `WC319` once**, for every agent: the fingerprint
+  now covers the model an alias resolves to, the provider's request options and the agent's
+  context providers, and typed agents, query-route tools and resource list tools have new
+  schemas. Re-record with `webcortex eval --record`; recorded calls carry
+  `fingerprint_version: 2`.
+- `webcortex context --json` redacts credentials (`--show-secrets` for the raw manifest);
+  `webcortex mcp-config` quotes its command and slugifies the server name; `webcortex check`
+  JSON gains `route_table`.
+- New public surface: `WebCortex(api_key_header=)`, ES256/ES384/EdDSA JWTs, the `tojson`
+  filter, `--url` on `halt`/`release`, `context --show-secrets`, the env var
+  `WEBCORTEX_MAX_BEHAVIOURS`; helpers `webcortex.schema.output_schema_for` and
+  `typeddict_fields`, `webcortex.diagnostics.boot_error_code` and `is_placeholder_secret`,
+  `webcortex.cli.route_table`, `redacted_manifest`, `mcp_server_name` and
+  `claude_mcp_add_command`. Rust: `agent::replay::FingerprintScope`, `fingerprint_in` and
+  `FINGERPRINT_VERSION`, `RecordingProvider::with_scope`, `ReplayProvider::with_scope`/
+  `set_scope`, `agent::registry::{aliases_of, resolve_alias_in, merge_options}`,
+  `Tracer::export_plan`, `SessionStore::save_for`.
+- The `WC215` hint now also covers a full behaviour pool.
+
+### Known limits
+
+Deferred from this release, and why:
+
+- **Typed parameters are converted, not validated.** A value that cannot be converted reaches
+  the handler unchanged. Strict binding (`strict_params=True`, 422 on a failed conversion)
+  would break existing apps; the docs now tell handlers to validate.
+- **Device ingest keys are bound by scope, not by device.** Every device that keeps the
+  default `ingest_scopes` accepts the same `devices:ingest`; `docs/device-hub.md` shows the
+  per-device scope. Changing the default would break existing device keys.
+- **Identity namespacing.** API-key ids and JWT subjects still share one id space; colliding
+  subjects are refused, but full `key:`/`jwt:`/`watcher:` prefixes would orphan persisted
+  memory rows and sessions without a migration.
+- **`headers_env=` on `app.upstream`** (non-bearer upstream credentials from the environment)
+  is not built; `context --json` only redacts header values.
+- **`patternProperties` is not evaluated.** It no longer causes a valid answer to be refused,
+  but a regex engine with ECMA-262 syntax is not in the dependency tree.
+- **Prose JSON recovery returns one candidate**, the last parseable object, rather than
+  handing every candidate to the validator.
+- **Resources have no PATCH**, and generated DDL has no NOT NULL or CHECK constraints.
+- **No `content_type=` override** on `app.page`/`page_handler`; the extension decides.
+- **No global in-flight byte budgets or per-route body limits**, and ingest WebSocket frames
+  are limited only by `max_fps`.
+- **Not tested in this review:** TLS/HSTS over https, the timing of key comparison,
+  coverage-guided fuzzing of the parsers that run before authentication, real model
+  providers, and Linux and Windows (CI covers those platforms; the stress test ran on macOS).
+
 ## [2.8.0] — 2026-11-20
 
 Evidence: what an agent answered, what a run did, and whether it still does it. Four
