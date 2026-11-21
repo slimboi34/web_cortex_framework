@@ -31,16 +31,16 @@ impl Templates {
 
         let mut env = Environment::new();
         env.set_loader(minijinja::path_loader(&cfg.dir));
-        // Autoescape by default and derive it from the file extension, so an
-        // .html template escapes and a .txt or .json one does not. XSS-by-
-        // default is not an acceptable trade for a framework in 2026.
+        // Autoescape by default and derive it from the file extension: an
+        // .html template escapes HTML, a .json one writes every value as JSON,
+        // and a .txt one is plain text — served as text/plain, so a browser
+        // never renders what it holds as markup. XSS-by-default is not an
+        // acceptable trade for a framework in 2026.
         if cfg.autoescape {
-            env.set_auto_escape_callback(|name| {
-                if escapes_html(name) {
-                    minijinja::AutoEscape::Html
-                } else {
-                    minijinja::AutoEscape::None
-                }
+            env.set_auto_escape_callback(|name| match kind(name) {
+                Kind::Markup(_) => minijinja::AutoEscape::Html,
+                Kind::Json => minijinja::AutoEscape::Json,
+                Kind::Other(_) => minijinja::AutoEscape::None,
             });
         } else {
             env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
@@ -71,10 +71,10 @@ impl Templates {
         };
 
         match tmpl.render(context) {
-            Ok(html) => WebCortexResponse {
+            Ok(text) => WebCortexResponse {
                 status,
-                headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
-                body: bytes::Bytes::from(html),
+                headers: vec![("content-type".into(), content_type(name).into())],
+                body: bytes::Bytes::from(text),
             },
             Err(e) => {
                 // Template errors carry source snippets; those belong in the log,
@@ -86,27 +86,123 @@ impl Templates {
     }
 }
 
-/// Whether a template's output is markup, judged by its extension.
-///
-/// Case-insensitive, and looking through a trailing Jinja suffix: in 2.5.3
-/// `page.html.j2`, `page.html.jinja` and `PAGE.HTML` all rendered with no
-/// escaping at all, so data in them was an XSS. `.svg` and `.xhtml` are
-/// markup too.
-fn escapes_html(name: &str) -> bool {
+/// What a template produces, judged by its extension: case-insensitive, and
+/// looking through a trailing Jinja suffix (`page.html.j2`, `feed.XML.jinja`).
+/// The same judgement sets both the escaping and the content type, so the two
+/// cannot disagree: in 2.8 a `.txt` or `.json` template was not escaped but
+/// was still served as `text/html`, so a value holding `<script>` ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// HTML, XML or SVG: HTML-escaped. Carries the content type.
+    Markup(&'static str),
+    /// JSON: every value is written as JSON.
+    Json,
+    /// Anything else: not escaped, and never served as markup.
+    Other(&'static str),
+}
+
+const TEXT: &str = "text/plain; charset=utf-8";
+
+fn kind(name: &str) -> Kind {
     let lower = name.to_ascii_lowercase();
     let inner = [".j2", ".jinja", ".jinja2"]
         .iter()
         .find_map(|suffix| lower.strip_suffix(suffix))
         .unwrap_or(&lower);
-    [".html", ".htm", ".xhtml", ".xml", ".svg"].iter().any(|ext| inner.ends_with(ext))
+    let ext = inner.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
+    // A bare name ("html", "a.j2") has no extension and is plain text.
+    let ext = if inner.contains('.') { ext } else { "" };
+    match ext {
+        "html" | "htm" | "xhtml" => Kind::Markup("text/html; charset=utf-8"),
+        "xml" => Kind::Markup("application/xml"),
+        "svg" => Kind::Markup("image/svg+xml"),
+        "json" => Kind::Json,
+        "css" => Kind::Other("text/css; charset=utf-8"),
+        "js" | "mjs" => Kind::Other("text/javascript; charset=utf-8"),
+        "csv" => Kind::Other("text/csv; charset=utf-8"),
+        "md" => Kind::Other("text/markdown; charset=utf-8"),
+        _ => Kind::Other(TEXT),
+    }
+}
+
+/// Whether a template's output is markup, so HTML-escaped.
+#[cfg(test)]
+fn escapes_html(name: &str) -> bool {
+    matches!(kind(name), Kind::Markup(_))
+}
+
+/// The `content-type` a rendered page is served with.
+fn content_type(name: &str) -> &'static str {
+    match kind(name) {
+        Kind::Markup(ct) | Kind::Other(ct) => ct,
+        Kind::Json => "application/json",
+    }
+}
+
+/// `json` (and its alias `tojson`): the value as JSON that is safe to place
+/// inside a `<script>` element or a single-quoted attribute of an HTML page,
+/// and is still valid JSON. `<`, `>`, `&` and `'` are written as `\uXXXX`
+/// escapes, so `</script>` or `<!--` in the data cannot end the element, and
+/// so are U+2028 and U+2029, which older JavaScript reads as line breaks. The
+/// result is marked safe, so HTML autoescaping does not turn its quotes into
+/// `&quot;` (which made the documented `const d = {{ data | json }}` a syntax
+/// error in 2.8). An optional indent (a number, or `true` for 2) pretty-prints.
+fn json_filter(
+    value: &minijinja::Value,
+    indent: Option<minijinja::Value>,
+    args: minijinja::value::Kwargs,
+) -> Result<minijinja::Value, minijinja::Error> {
+    let indent = match indent {
+        Some(indent) => Some(indent),
+        None => args.get("indent")?,
+    };
+    args.assert_all_used()?;
+    let indent = match indent {
+        None => None,
+        Some(v) => match bool::try_from(v.clone()) {
+            Ok(true) => Some(2),
+            Ok(false) => None,
+            Err(_) => Some(usize::try_from(v)?),
+        },
+    };
+    let text = match indent {
+        None => serde_json::to_string(value),
+        Some(n) => {
+            let mut out = Vec::new();
+            let pad = " ".repeat(n.min(16));
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+            let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
+            serde::Serialize::serialize(value, &mut ser).map(|()| String::from_utf8_lossy(&out).into_owned())
+        }
+    }
+    .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "cannot serialize to JSON").with_source(e))?;
+    Ok(minijinja::Value::from_safe_string(script_safe(&text)))
+}
+
+/// Escape the characters of JSON text that HTML or old JavaScript would read
+/// as something else. Each can only occur inside a JSON string, where a
+/// `\uXXXX` escape means the same character, so the JSON is unchanged.
+fn script_safe(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\'' => out.push_str("\\u0027"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn add_filters(env: &mut Environment<'static>) {
     // A small, deliberately boring filter set. Anything more expressive belongs
     // in the data source, not the template.
-    env.add_filter("json", |v: minijinja::Value| {
-        serde_json::to_string(&v).unwrap_or_else(|_| "null".into())
-    });
+    env.add_filter("json", json_filter);
+    env.add_filter("tojson", json_filter);
     env.add_filter("currency", |v: f64| format!("{v:.2}"));
     env.add_filter("truncate_words", |s: String, n: usize| {
         let words: Vec<&str> = s.split_whitespace().collect();
@@ -194,6 +290,74 @@ mod tests {
         let (_d, t) = temp_templates(&[("x.txt", "{{ data }}")]);
         let res = t.render("x.txt", &serde_json::json!({"data": "a<b"}), 200);
         assert_eq!(String::from_utf8_lossy(&res.body), "a<b");
+    }
+
+    fn content_type_of(res: &WebCortexResponse) -> &str {
+        res.headers.iter().find(|(k, _)| k == "content-type").map(|(_, v)| v.as_str()).unwrap_or("")
+    }
+
+    #[test]
+    fn the_content_type_follows_the_extension_like_the_escaping_does() {
+        for (name, ct) in [
+            ("a.html", "text/html; charset=utf-8"), ("a.HTM", "text/html; charset=utf-8"),
+            ("a.xhtml.j2", "text/html; charset=utf-8"), ("a.html.jinja2", "text/html; charset=utf-8"),
+            ("feed.XML", "application/xml"), ("i.svg.jinja", "image/svg+xml"),
+            ("d.json", "application/json"), ("d.JSON.j2", "application/json"),
+            ("n.txt", "text/plain; charset=utf-8"), ("n.txt.jinja", "text/plain; charset=utf-8"),
+            ("s.css", "text/css; charset=utf-8"), ("a.j2", "text/plain; charset=utf-8"),
+            ("html", "text/plain; charset=utf-8"), ("notes.md", "text/markdown; charset=utf-8"),
+            ("x.unknown", "text/plain; charset=utf-8"),
+        ] {
+            assert_eq!(content_type(name), ct, "{name}");
+        }
+        // A .txt page holding markup is plain text, not a page that runs it.
+        let (_d, t) = temp_templates(&[("echo.txt", "hello {{ q }}")]);
+        let res = t.render("echo.txt", &serde_json::json!({"q": "<script>alert(1)</script>"}), 200);
+        assert_eq!(content_type_of(&res), "text/plain; charset=utf-8");
+        assert_eq!(String::from_utf8_lossy(&res.body), "hello <script>alert(1)</script>");
+        let (_d, t) = temp_templates(&[("p.html", "x")]);
+        assert_eq!(content_type_of(&t.render("p.html", &serde_json::json!({}), 200)), "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn a_json_template_writes_values_as_json() {
+        let (_d, t) = temp_templates(&[("echo.json", "{\"q\": {{ q }}, \"n\": {{ n }}, \"raw\": {{ q | safe }}}")]);
+        let res = t.render("echo.json", &serde_json::json!({"q": "x\", \"admin\": true, \"y\": \"<b>", "n": 3}), 200);
+        assert_eq!(content_type_of(&res), "application/json");
+        let body = String::from_utf8_lossy(&res.body).into_owned();
+        assert!(body.starts_with("{\"q\": \"x\\\", \\\"admin\\\""), "{body}");
+        let (_d, t) = temp_templates(&[("ok.json", "{\"q\": {{ q }}, \"d\": {{ d | json }}}")]);
+        let res = t.render("ok.json", &serde_json::json!({"q": "x\", \"admin\": true", "d": {"a": [1, "<"]}}), 200);
+        let parsed: serde_json::Value = serde_json::from_slice(&res.body).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!({"q": "x\", \"admin\": true", "d": {"a": [1, "<"]}}));
+    }
+
+    #[test]
+    fn the_json_filter_is_script_safe_valid_json_and_not_html_escaped() {
+        let (_d, t) = temp_templates(&[
+            ("s.html", "<script>const d = {{ data | json }}</script>"),
+            ("t.html", "<script>const d = {{ data | tojson }}</script>"),
+            ("u.html", "<script>const d = {{ data | json | safe }}</script>"),
+            ("a.html", "<div data-x='{{ data | json }}'></div>"),
+            ("i.html", "{{ data | tojson(indent=2) }}"),
+        ]);
+        let payload = "</script><script>alert(document.cookie)</script><!-- ' & \u{2028}";
+        let ctx = serde_json::json!({"data": {"name": payload, "n": 1}});
+        for name in ["s.html", "t.html", "u.html"] {
+            let body = String::from_utf8_lossy(&t.render(name, &ctx, 200).body).into_owned();
+            let inner = body.strip_prefix("<script>const d = ").and_then(|b| b.strip_suffix("</script>")).expect(&body);
+            assert!(!inner.contains('<') && !inner.contains('>') && !inner.contains('&') && !inner.contains('\''), "{name}: {body}");
+            assert!(!inner.contains("&quot;"), "{name}: {body}");
+            assert!(!inner.contains('\u{2028}'), "{name}: {body}");
+            let parsed: serde_json::Value = serde_json::from_str(inner).expect("valid JSON");
+            assert_eq!(parsed, ctx["data"], "{name}");
+        }
+        let attr = String::from_utf8_lossy(&t.render("a.html", &ctx, 200).body).into_owned();
+        assert_eq!(attr.matches('\'').count(), 2, "only the attribute's own quotes: {attr}");
+        assert!(!attr.contains("<script>") && !attr.contains("<!--"), "{attr}");
+        let pretty = String::from_utf8_lossy(&t.render("i.html", &ctx, 200).body).into_owned();
+        assert!(pretty.contains("\n  \""), "{pretty}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&pretty).unwrap(), ctx["data"]);
     }
 
     #[test]

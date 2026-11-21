@@ -27,7 +27,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
-minijinja = { version = "2.22", features = ["loader", "builtins"] }
+# json: AutoEscape::Json, which .json page templates render with.
+minijinja = { version = "2.22", features = ["loader", "builtins", "json"] }
 # Both features are load-bearing. Without a crypto provider (`rust_crypto` or
 # `aws_lc_rs`) jsonwebtoken *panics* inside `decode` — reachable by any
 # unauthenticated client sending an Authorization header. Without `use_pem` the
