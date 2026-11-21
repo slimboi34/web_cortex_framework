@@ -769,16 +769,23 @@ impl App {
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.as_ref().ok_or("no database configured")?;
+                    let route = req.route_id.and_then(|id| self.routes_by_id.get(&id));
+                    if let Some(refused) = route.and_then(|r| body_refusal(r, &req)) {
+                        return Ok(refused);
+                    }
                     let bindings = match req.bind(params) {
                         Ok(b) => b,
                         Err(e) => return Ok(WebCortexResponse::coded(400, "WC205", e)),
                     };
-                    let value = match db.run(sql, &bindings, *returns).await {
+                    let mut value = match db.run(sql, &bindings, *returns).await {
                         Ok(v) => v,
                         Err(e) => return Ok(WebCortexResponse::coded(e.status(), e.code(), e.message())),
                     };
                     if value.is_null() && *returns == crate::manifest::QueryReturns::One {
                         return Ok(WebCortexResponse::coded(404, "WC207", "not found"));
+                    }
+                    if let Some(schema) = route.and_then(|r| r.output_schema.as_ref()) {
+                        restore_booleans(&mut value, schema);
                     }
                     Ok(WebCortexResponse::json(200, &value))
                 }
@@ -1716,6 +1723,96 @@ fn fill_template(template: &str, params: &std::collections::BTreeMap<String, Str
     out
 }
 
+/// The 422 for a native query route's body that does not match the route's
+/// `input_schema`, or `None` when it matches (or there is nothing to check).
+///
+/// Only routes that take a body (POST, PUT, PATCH) are checked, and only the
+/// body: a parameter the path or query string supplies counts as present and
+/// is not checked here (binding takes that value, and a path value is text
+/// until it is bound), even if the body repeats it. Through 2.8.0 the
+/// advertised schema was never applied: `{}` inserted a row of NULLs, a
+/// misspelt key on PUT wiped every field, and `"lol"` was stored in a REAL
+/// column.
+fn body_refusal(route: &Route, req: &WebCortexRequest) -> Option<WebCortexResponse> {
+    let schema = route.input_schema.as_ref()?;
+    if !matches!(req.method.to_ascii_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
+        return None;
+    }
+    let from_url = |name: &str| req.path_params.contains_key(name) || req.query.contains_key(name);
+    let body = if req.body.is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&req.body) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.retain(|k, _| !from_url(k));
+                serde_json::Value::Object(map)
+            }
+            // Not an object, or not JSON: binding refuses it with WC205.
+            _ => return None,
+        }
+    };
+    let mut schema = schema.clone();
+    if let Some(serde_json::Value::Array(required)) = schema.get_mut("required") {
+        required.retain(|name| name.as_str().is_none_or(|n| !from_url(n)));
+    }
+    let problems = crate::schema::validate(&schema, &body);
+    if problems.is_empty() {
+        return None;
+    }
+    let message = format!(
+        "the request body does not match the input schema of {} {}: {}",
+        route.method,
+        route.path,
+        problems.join("; ")
+    );
+    let mut res = WebCortexResponse::json(
+        422,
+        &serde_json::json!({"error": {
+            "status": 422, "message": message, "code": "WC206",
+            "hint": crate::errors::hint("WC206"), "problems": problems,
+        }}),
+    );
+    res.headers.push(("x-webcortex-error".into(), "WC206".into()));
+    Some(res)
+}
+
+/// Turn the 0 and 1 SQLite stores for a boolean back into `false` and `true`
+/// wherever `schema` (a route's `output_schema`) declares a boolean: a row,
+/// or each row of a list. SQLite has no boolean type, so a resource's `bool`
+/// field read back as an integer, contradicting its own schema.
+fn restore_booleans(value: &mut serde_json::Value, schema: &serde_json::Value) {
+    let declares = |s: &serde_json::Value, t: &str| match s.get("type") {
+        Some(serde_json::Value::String(x)) => x == t,
+        Some(serde_json::Value::Array(xs)) => xs.iter().any(|x| x == t),
+        _ => false,
+    };
+    match value {
+        serde_json::Value::Array(items) => {
+            if let Some(item_schema) = schema.get("items") {
+                for item in items {
+                    restore_booleans(item, item_schema);
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else { return };
+            for (key, field) in map.iter_mut() {
+                let Some(sub) = props.get(key) else { continue };
+                if declares(sub, "boolean") {
+                    match field.as_i64() {
+                        Some(0) => *field = serde_json::Value::Bool(false),
+                        Some(1) => *field = serde_json::Value::Bool(true),
+                        _ => {}
+                    }
+                } else {
+                    restore_booleans(field, sub);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Whether a declared query binds the caller's identity.
 fn binds_principal(params: &[String]) -> bool {
     params.iter().any(|p| p == "@principal")
@@ -1864,6 +1961,84 @@ mod tests {
         let p: std::collections::BTreeMap<String, String> = [("rest".to_string(), "x/y".to_string())].into();
         assert_eq!(fill_template("/b/{*rest}", &p), "/b/x/y");
         assert_eq!(fill_template("/b/{*rest}", &Default::default()), "/b");
+    }
+
+    async fn resource_app() -> App {
+        let manifest: Manifest = serde_json::from_value(json!({
+            "name": "r",
+            "database": {"url": "sqlite://:memory:", "schema": "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT, price REAL, ok INTEGER)"},
+            "routes": [
+                {"id": 0, "method": "POST", "path": "/items",
+                 "op": {"kind": "query", "sql": "INSERT INTO items (name, price, ok) VALUES (?, ?, ?) RETURNING *",
+                        "params": ["name", "price", "ok"], "returns": "one"},
+                 "input_schema": {"type": "object", "additionalProperties": false, "required": ["name", "price", "ok"],
+                                  "properties": {"name": {"type": "string"}, "price": {"type": "number"}, "ok": {"type": "boolean"}}},
+                 "output_schema": {"type": "object", "properties": {"id": {"type": "integer"}, "name": {"type": "string"},
+                                   "price": {"type": "number"}, "ok": {"type": "boolean"}}}},
+                {"id": 1, "method": "PUT", "path": "/items/{id}",
+                 "op": {"kind": "query", "sql": "UPDATE items SET name = ?, price = ?, ok = ? WHERE id = ? RETURNING *",
+                        "params": ["name", "price", "ok", "id"], "returns": "one"},
+                 "input_schema": {"type": "object", "additionalProperties": false, "required": ["id", "name", "price", "ok"],
+                                  "properties": {"id": {"type": "integer"}, "name": {"type": "string"}, "price": {"type": "number"},
+                                                 "ok": {"type": "boolean"}}},
+                 "output_schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}},
+                {"id": 2, "method": "GET", "path": "/items",
+                 "op": {"kind": "query", "sql": "SELECT * FROM items", "params": [], "returns": "many"},
+                 "output_schema": {"type": "array", "items": {"type": "object", "properties": {"ok": {"type": "boolean"}}}}}
+            ]
+        }))
+        .unwrap();
+        App::build_without_python(manifest).await.expect("app")
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_query_routes_body_is_held_to_its_input_schema_and_booleans_read_back() {
+        let app = resource_app().await;
+        let send = |method: &str, path: &str, body: serde_json::Value| WebCortexRequest {
+            method: method.into(),
+            path: path.into(),
+            path_params: Default::default(),
+            query: Default::default(),
+            query_all: Vec::new(),
+            headers: Default::default(),
+            body: if body.is_null() { bytes::Bytes::new() } else { bytes::Bytes::from(serde_json::to_vec(&body).unwrap()) },
+            route_id: None,
+            principal: Principal::anonymous(),
+            depth: 0,
+            budget: None,
+            trace: None,
+        };
+        // Through 2.8.0 each of these was stored: NULLs, text in a REAL
+        // column, a misspelt key silently ignored.
+        for (body, needle) in [
+            (json!({}), "missing required property \"name\""),
+            (json!({"name": "a", "price": "abc", "ok": true}), "$.price: expected number"),
+            (json!({"name": "a", "price": 1, "ok": true, "colour": "red"}), "colour"),
+            (json!({"name": "a", "price": 1, "ok": "yes"}), "$.ok: expected boolean"),
+        ] {
+            let res = app.dispatch(send("POST", "/items", body)).await;
+            assert_eq!(res.status, 422, "{}", String::from_utf8_lossy(&res.body));
+            let v = res.json_value();
+            assert_eq!(v["error"]["code"], "WC206");
+            assert!(v["error"]["message"].as_str().unwrap().contains(needle), "{v}");
+            assert!(!v["error"]["problems"].as_array().unwrap().is_empty());
+        }
+        let res = app.dispatch(send("POST", "/items", json!({"name": "a", "price": 1.5, "ok": true}))).await;
+        assert_eq!(res.status, 200);
+        assert_eq!(res.json_value()["ok"], json!(true), "a stored 1 reads back as true");
+        // The path supplies the id; the body need not repeat it, and a typo is refused.
+        let res = app.dispatch(send("PUT", "/items/1", json!({"name": "b", "price": 2, "ok": false}))).await;
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+        assert_eq!(res.json_value()["ok"], json!(false));
+        let res = app.dispatch(send("PUT", "/items/1", json!({"titel": "b", "price": 2, "ok": false}))).await;
+        assert_eq!(res.status, 422);
+        // A body that repeats what the path supplies is not held to it: the
+        // path's value is the one bound.
+        let res = app.dispatch(send("PUT", "/items/1", json!({"id": "1", "name": "b", "price": 2, "ok": false}))).await;
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+        let res = app.dispatch(send("GET", "/items", serde_json::Value::Null)).await;
+        assert_eq!(res.json_value(), json!([{"id": 1, "name": "b", "price": 2.0, "ok": false}]));
     }
 
     async fn notes_app() -> App {
