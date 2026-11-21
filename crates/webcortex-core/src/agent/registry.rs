@@ -38,12 +38,7 @@ impl ProviderRegistry {
     /// only makes the corresponding models unavailable, which is reported when
     /// one is asked for rather than at boot.
     pub fn from_env(cfg: &ModelsConfig) -> Self {
-        let mut aliases = BTreeMap::new();
-        aliases.insert("default".to_string(), BUILTIN_DEFAULT.to_string());
-        aliases.insert("fast".to_string(), BUILTIN_FAST.to_string());
-        for (k, v) in &cfg.aliases {
-            aliases.insert(k.clone(), v.clone());
-        }
+        let aliases = aliases_of(cfg);
 
         let fake = std::env::var("WEBCORTEX_FAKE_PROVIDER")
             .ok()
@@ -146,11 +141,7 @@ impl ProviderRegistry {
     /// The request options a call to `concrete` carries: the provider's,
     /// overridden key by key by the agent's.
     pub fn options_for(&self, concrete: &str, own: &RequestOptions) -> RequestOptions {
-        let mut merged = self.options.get(Self::provider_name(concrete)).cloned().unwrap_or_default();
-        for (k, v) in own {
-            merged.insert(k.clone(), v.clone());
-        }
-        merged
+        merge_options(&self.options, concrete, own)
     }
 
     /// Which providers are live, for the startup banner and `/_webcortex/models`.
@@ -169,14 +160,7 @@ impl ProviderRegistry {
     /// Follow aliases to a concrete model name. Bounded so `a → b → a` cannot
     /// spin.
     pub fn resolve_alias(&self, name: &str) -> String {
-        let mut current = name.to_string();
-        for _ in 0..8 {
-            match self.aliases.get(&current) {
-                Some(next) if next != &current => current = next.clone(),
-                _ => break,
-            }
-        }
-        current
+        resolve_alias_in(&self.aliases, name)
     }
 
     /// Pick the provider for a concrete model name and return the name the
@@ -258,6 +242,45 @@ impl ProviderRegistry {
             .or_else(|| model.split_once('/').and_then(|(_, m)| self.pricing.get(m)))
             .copied()
     }
+}
+
+/// Every alias an app's models resolve through: the built-in `default` and
+/// `fast`, overridden by the app's own.
+pub fn aliases_of(cfg: &ModelsConfig) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
+    aliases.insert("default".to_string(), BUILTIN_DEFAULT.to_string());
+    aliases.insert("fast".to_string(), BUILTIN_FAST.to_string());
+    for (k, v) in &cfg.aliases {
+        aliases.insert(k.clone(), v.clone());
+    }
+    aliases
+}
+
+/// Follow `aliases` from `name` to a concrete model name. Bounded so
+/// `a → b → a` cannot spin.
+pub fn resolve_alias_in(aliases: &BTreeMap<String, String>, name: &str) -> String {
+    let mut current = name.to_string();
+    for _ in 0..8 {
+        match aliases.get(&current) {
+            Some(next) if next != &current => current = next.clone(),
+            _ => break,
+        }
+    }
+    current
+}
+
+/// The request options a call to `concrete` carries: its provider's (from
+/// `by_provider`), overridden key by key by the agent's `own`.
+pub fn merge_options(
+    by_provider: &BTreeMap<String, RequestOptions>,
+    concrete: &str,
+    own: &RequestOptions,
+) -> RequestOptions {
+    let mut merged = by_provider.get(ProviderRegistry::provider_name(concrete)).cloned().unwrap_or_default();
+    for (k, v) in own {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
 }
 
 impl ModelProvider for ProviderRegistry {

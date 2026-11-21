@@ -125,12 +125,25 @@ pub fn names_an_internal_host(url: &str) -> bool {
             || (a == 100 && (64..128).contains(&b)) // shared / CGNAT
     }
     fn v6(ip: Ipv6Addr) -> bool {
-        let first = ip.segments()[0];
+        let s = ip.segments();
+        // The IPv4 address carried in two 16-bit groups.
+        let v4_in = |hi: u16, lo: u16| v4(Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo)));
         ip.is_loopback()
             || ip.is_unspecified()
-            || (first & 0xfe00) == 0xfc00 // unique local
-            || (first & 0xffc0) == 0xfe80 // link-local
-            || ip.to_ipv4_mapped().is_some_and(v4)
+            || (s[0] & 0xfe00) == 0xfc00 // unique local
+            || (s[0] & 0xffc0) == 0xfe80 // link-local
+            || (s[0] & 0xffc0) == 0xfec0 // site-local: deprecated, still routed on some networks
+            || ip.to_ipv4_mapped().is_some_and(v4) // ::ffff:a.b.c.d
+            // Other spellings of an IPv4 address: IPv4-compatible (::a.b.c.d),
+            // the NAT64 well-known prefix (64:ff9b::a.b.c.d) and 6to4
+            // (2002:aabb:ccdd::). A NAT64 gateway or 6to4 relay delivers them
+            // to that IPv4 address, private or not.
+            || (s[..6] == [0; 6] && v4_in(s[6], s[7]))
+            || (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] && v4_in(s[6], s[7]))
+            || (s[0] == 0x2002 && v4_in(s[1], s[2]))
+            // 64:ff9b:1::/48 is the local-use NAT64 prefix (RFC 8215): it
+            // only exists inside a network, so all of it is internal.
+            || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
     }
     let Ok(parsed) = reqwest::Url::parse(url) else { return true };
     // The parser has already normalised the host: IPv4 in any notation comes
@@ -423,11 +436,22 @@ mod tests {
             "http://LOCALHOST./x.png",
             "http://metadata.google.internal/x.png",
             "http://printer.local/x.png",
+            "http://[::7f00:1]/x.png",
+            "http://[::a00:5]/x.png",
+            "http://[64:ff9b::a9fe:a9fe]/x.png",
+            "http://[64:ff9b::7f00:1]/x.png",
+            "http://[64:ff9b:1::808:808]/x.png",
+            "http://[2002:a9fe:a9fe::]/x.png",
+            "http://[2002:c0a8:10a::1]/x.png",
+            "http://[fec0::1]/x.png",
+            "http://[FEFF::1]/x.png",
         ] {
             let err = input_images(Some(&json!([{"url": url}]))).unwrap_err();
             assert!(err.contains("may not point at"), "{url}: {err}");
         }
-        for url in ["https://x.test/a.png", "https://8.8.8.8/a.png", "https://[2001:db8::1]/a.png"] {
+        for url in ["https://x.test/a.png", "https://8.8.8.8/a.png", "https://[2001:db8::1]/a.png",
+                    "https://[2002:808:808::]/a.png", "https://[64:ff9b::808:808]/a.png",
+                    "https://[2606:4700::1111]/a.png", "https://[::808:808]/a.png"] {
             assert!(input_images(Some(&json!([{"url": url}]))).is_ok(), "{url}");
         }
     }

@@ -541,7 +541,7 @@ fn eval_call(
     mode: &str,
     cassette_json: Option<&str>,
 ) -> PyResult<String> {
-    use webcortex_core::agent::replay::{RecordingProvider, ReplayProvider};
+    use webcortex_core::agent::replay::{FingerprintScope, RecordingProvider, ReplayProvider};
 
     let manifest: Manifest = serde_json::from_str(manifest_json)
         .map_err(|e| PyValueError::new_err(format!("invalid manifest: {e}")))?;
@@ -577,7 +577,12 @@ fn eval_call(
             .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
         rt.block_on(async move {
             let app = App::build(manifest, bridge).await.map_err(PyRuntimeError::new_err)?;
-            let recorder = record.then(|| Arc::new(RecordingProvider::new(app.provider().clone())));
+            // Both sides fingerprint against the app's aliases, provider options and contexts.
+            let scope = FingerprintScope::of(&app);
+            if let Some(r) = &replayer {
+                r.set_scope(scope.clone());
+            }
+            let recorder = record.then(|| Arc::new(RecordingProvider::new(app.provider().clone()).with_scope(scope)));
             let app = match (&recorder, &replayer) {
                 (Some(r), _) => app.with_provider(r.clone()),
                 (None, Some(r)) => app.with_provider(r.clone()),

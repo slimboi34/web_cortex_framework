@@ -318,6 +318,13 @@ impl ModelProvider for AnthropicProvider {
     }
 }
 
+/// A temperature as the number the app wrote. It is held as an `f32`, and
+/// widening one to `f64` sends `0.9` as `0.8999999761581421`; going through
+/// its shortest decimal form sends `0.9`.
+fn wire_temperature(t: f32) -> Value {
+    json!(t.to_string().parse::<f64>().unwrap_or(f64::from(t)))
+}
+
 /// The Messages API request body for one completion.
 pub fn anthropic_body(req: &CompletionRequest<'_>) -> Value {
     let agent = req.agent;
@@ -336,7 +343,7 @@ pub fn anthropic_body(req: &CompletionRequest<'_>) -> Value {
     // Only when the app set one: Claude Opus 5, Opus 4.7/4.8 and Sonnet 5
     // reject sampling parameters outright.
     if let Some(t) = agent.temperature {
-        body["temperature"] = json!(t);
+        body["temperature"] = wire_temperature(t);
     }
 
     let system = full_system(req);
@@ -532,7 +539,7 @@ pub fn openai_body(req: &CompletionRequest) -> Value {
         "messages": messages,
     });
     if let Some(t) = agent.temperature {
-        body["temperature"] = json!(t);
+        body["temperature"] = wire_temperature(t);
     }
     // Only when the app set it. `none` is how a local thinking model (Qwen,
     // Gemma 4, MiniCPM through Ollama) is told to answer instead of deliberate.
@@ -739,6 +746,11 @@ pub fn parse_openai(payload: &Value, model: &str) -> Result<ProviderResponse, St
 /// frequently answer in text — often *correct* JSON, sometimes wrapped in a
 /// code fence. Accepting that costs nothing and turns a class of "model did not
 /// return structured output" failures into successes.
+///
+/// When the whole text is not JSON, every fenced block and every balanced
+/// `{ … }` in it is a candidate, and the one that ends last and parses wins:
+/// prose that mentions braces before the answer ("the fields are {a, b}"), or
+/// shows a draft first, still yields the final answer, which comes last.
 pub fn recover_json(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     if let Ok(v) = serde_json::from_str::<Value>(trimmed)
@@ -754,12 +766,23 @@ pub fn recover_json(text: &str) -> Option<Value> {
         && let Ok(v) = serde_json::from_str::<Value>(inner) {
             return Some(v);
         }
-    // The first balanced `{ … }` in the text.
-    let start = trimmed.find('{')?;
-    let mut depth = 0i32;
+    // (end, start) of each candidate, so sorting puts the last-ending first
+    // and, of two ending together, the outer one.
+    let mut candidates: Vec<(usize, std::cmp::Reverse<usize>)> = Vec::new();
+    let mut fences = trimmed.match_indices("```").map(|(i, _)| i);
+    while let (Some(open), Some(close)) = (fences.next(), fences.next()) {
+        // Skip the info string ("json") on the opening fence's line.
+        let body = trimmed[open + 3..close].find('\n').map(|nl| open + 3 + nl + 1).unwrap_or(open + 3);
+        if body < close {
+            candidates.push((close, std::cmp::Reverse(body)));
+        }
+    }
+    // Balanced braces, one pass: strings are only tracked inside a group, so
+    // an apostrophe in the prose around it does not matter.
+    let mut open: Vec<usize> = Vec::new();
     let mut in_str = false;
     let mut escape = false;
-    for (i, ch) in trimmed[start..].char_indices() {
+    for (i, ch) in trimmed.char_indices() {
         if in_str {
             if escape {
                 escape = false;
@@ -771,18 +794,24 @@ pub fn recover_json(text: &str) -> Option<Value> {
             continue;
         }
         match ch {
-            '"' => in_str = true,
-            '{' => depth += 1,
+            '"' if !open.is_empty() => in_str = true,
+            '{' => open.push(i),
             '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return serde_json::from_str(&trimmed[start..start + i + 1]).ok();
+                if let Some(start) = open.pop() {
+                    candidates.push((i + 1, std::cmp::Reverse(start)));
                 }
             }
             _ => {}
         }
     }
-    None
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    // Bounded: a pathological text with thousands of groups is not parsed
+    // thousands of times.
+    candidates
+        .into_iter()
+        .take(64)
+        .filter_map(|(end, std::cmp::Reverse(start))| serde_json::from_str::<Value>(trimmed[start..end].trim()).ok())
+        .find(|v| v.is_object() || v.is_array())
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,7 +1255,26 @@ mod tests {
         };
         assert!(body(&agent).get("temperature").is_none(), "Opus 5 rejects any sampling parameter");
         agent.temperature = Some(0.2);
-        assert_eq!(body(&agent)["temperature"], json!(0.2f32));
+        assert_eq!(body(&agent)["temperature"], json!(0.2));
+    }
+
+    #[test]
+    fn temperature_goes_on_the_wire_as_written_on_both_formats() {
+        let conversation = Conversation::default();
+        for t in [0.9f32, 0.7, 0.1, 1.0, 0.33, 2.0, 0.0] {
+            let mut agent: AgentDef = serde_json::from_value(json!({"name": "a", "model": "m"})).unwrap();
+            agent.temperature = Some(t);
+            let req = CompletionRequest { agent: &agent, conversation: &conversation, tools: &[], force_tool: None, system_suffix: "" };
+            let written: f64 = t.to_string().parse().unwrap();
+            for body in [anthropic_body(&req), openai_body(&req)] {
+                assert_eq!(body["temperature"], json!(written), "{t}");
+                assert!(body.to_string().contains(&format!("\"temperature\":{}", json!(written))), "{body}");
+            }
+        }
+        let mut agent: AgentDef = serde_json::from_value(json!({"name": "a", "model": "m"})).unwrap();
+        agent.temperature = Some(0.9);
+        let req = CompletionRequest { agent: &agent, conversation: &conversation, tools: &[], force_tool: None, system_suffix: "" };
+        assert!(openai_body(&req).to_string().contains("\"temperature\":0.9,") || openai_body(&req).to_string().contains("\"temperature\":0.9}"));
     }
 
     #[test]
@@ -1502,5 +1550,22 @@ mod tests {
         );
         assert_eq!(recover_json("no json here"), None);
         assert_eq!(recover_json("42"), None, "a bare scalar is not structured output");
+    }
+
+    #[test]
+    fn the_last_json_in_prose_is_the_answer() {
+        let answer = json!({"category": "billing", "urgency": 3});
+        let a = answer.to_string();
+        assert_eq!(recover_json(&format!("Here you go: {a}")), Some(answer.clone()));
+        assert_eq!(recover_json(&format!("The fields are {{category, urgency}}. Answer: {a}")), Some(answer.clone()));
+        assert_eq!(recover_json(&format!("First guess {{\"category\": \"other\"}}, final answer {a}")), Some(answer.clone()));
+        assert_eq!(recover_json(&format!("{a} (fields: {{category, urgency}})")), Some(answer.clone()), "a later group that is not JSON is skipped");
+        assert_eq!(recover_json(&format!("It's {{unclosed, then {a} and that's it")), Some(answer.clone()));
+        assert_eq!(recover_json(&format!("Draft:\n```json\n{{\"category\": \"bug\"}}\n```\nFinal:\n```json\n{a}\n```\nDone.")), Some(answer.clone()));
+        assert_eq!(recover_json(&format!("```\n{a}\n``` and a note {{not json}}")), Some(answer.clone()));
+        assert_eq!(recover_json(&format!("Wrapped: {{\"answer\": {a}}}")), Some(json!({"answer": answer})), "the outer group, not the inner one");
+        assert_eq!(recover_json("Use {a: 1} or {b}"), None);
+        let noisy = "{".repeat(5000) + &a;
+        assert_eq!(recover_json(&noisy), Some(answer));
     }
 }

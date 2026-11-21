@@ -388,11 +388,14 @@ def test_a_body_a_query_cannot_read_is_a_400_and_writes_nothing(server):
 
 def test_percent_encoded_and_odd_paths_are_answered_cleanly(server):
     base, port, _ = server
-    for path in ("/ping/", "//ping", "/p%69ng", "/%00", "/%ff%fe", "/" + "a/" * 2000,
+    for path in ("/ping/", "//ping", "/%00", "/%ff%fe", "/" + "a/" * 2000,
                  "/assets/%2e%2e/api.py", "/assets/..%2fapi.py", "/assets/%252e%252e/api.py"):
         status, body, _ = call(base, path)
         assert status in (400, 404), (path, status)
         assert b"WebCortex(" not in body
+    # 2.9: an encoded unreserved letter is the same path (RFC 3986 6.2.2.2),
+    # so /p%69ng is /ping; an encoded separator or dot segment still is not.
+    assert call(base, "/p%69ng")[0] == 200
     reply = raw(port, b"GET /p\xffing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     assert status_of(reply) in (400, 404)
     assert healthy(base)
