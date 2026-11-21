@@ -491,6 +491,7 @@ impl AgentRuntime {
             &format!("agent {}", def.name),
         );
         let trace_id = span.as_ref().map(|s| s.trace_id.to_string());
+        crate::app::note_edge_trace(opts.depth, span.as_ref());
 
         let system_suffix = match self.system_suffix(app, def, &actor, input, def.output_schema.is_some()).await {
             Ok(s) => s,
@@ -932,12 +933,50 @@ impl AgentRuntime {
             }
 
             // 3. Does it need a human?
-            let route_approval = app
-                .route_for_tool(&call.name)
-                .map(|r| r.approval)
-                .unwrap_or(Approval::Never);
+            let route = app.route_for_tool(&call.name);
+            let route_approval = route.map(|r| r.approval).unwrap_or(Approval::Never);
             if route_approval == Approval::Required {
+                // A human is asked only for a call the run could then make.
+                // The gated route's scopes are checked against the run's own
+                // authority first: through 2.8.0 the approval was requested,
+                // granted, and the call then failed on a scope the agent never
+                // held — with a hint blaming the caller's key.
+                let missing = route.map(|r| st.actor.missing_scopes(&App::scopes_of(r))).unwrap_or_default();
+                if !missing.is_empty() {
+                    let hint = crate::app::scope_hint(&st.actor, &missing);
+                    let msg = format!(
+                        "tool {:?} needs scope(s) {} that this run does not hold, so it was not \
+                         sent for approval (WC602). {hint}",
+                        call.name,
+                        missing.join(", "),
+                    );
+                    let mut step = refused(st.usage.steps, call, &msg, started);
+                    step.code = Some("WC602".into());
+                    step.hint = Some(hint);
+                    st.steps.push(step);
+                    app.tracer().event(st.span.as_ref(), "tool", &format!("tool {}", call.name), Some("WC602"), vec![]);
+                    app.recorder().record_failure("tool", &format!("tool {} (agent {})", call.name, st.def.name), "WC602", &st.run_id);
+                    self.audit.record(AuditEvent::tool_refused(&st.run_id, &st.actor, &call.name, &msg));
+                    results.push(tool_result(&call.id, &json!({"error": msg}), true));
+                    continue;
+                }
                 return CallsOutcome::Suspended { gated: i, results };
+            }
+            // A flow that would run a gated tool as a step cannot be approved
+            // as a whole (it refuses the step itself); refused here so the
+            // model is told why. Manifest validation keeps such flows out.
+            if let Some(gated) = app.gated_tool_behind(&call.name) {
+                let msg = format!(
+                    "tool {:?} runs the approval-gated tool {gated:?} as a flow step, which no human \
+                     can approve (WC309); call {gated:?} directly instead",
+                    call.name
+                );
+                let mut step = refused(st.usage.steps, call, &msg, started);
+                step.code = Some("WC309".into());
+                st.steps.push(step);
+                self.audit.record(AuditEvent::tool_refused(&st.run_id, &st.actor, &call.name, &msg));
+                results.push(tool_result(&call.id, &json!({"error": msg}), true));
+                continue;
             }
 
             // 4. Dispatch in-process, under delegated authority and the shared
@@ -1228,6 +1267,10 @@ impl AgentRuntime {
     fn specs_for(&self, app: &App, st: &RunState) -> Vec<ToolSpec> {
         let mut specs = self.tool_specs(app, &st.def);
         if let Some(schema) = &st.entry.output_schema {
+            // One tool of each name, whatever the manifest says: providers
+            // refuse a request with two, and every call to this name is the
+            // answer anyway (see `execute_calls`).
+            specs.retain(|s| s.name != FINAL_TOOL);
             specs.push(ToolSpec {
                 name: FINAL_TOOL.into(),
                 description: "Give the final answer. Call this exactly once, when the work is done; \
@@ -1772,6 +1815,74 @@ mod tests {
         // And the conversation the model saw carried every tool_result.
         assert!(audit.contains("approval_decided"));
         assert!(app.pending_approvals().is_empty(), "consumed on resume");
+    }
+
+    #[tokio::test]
+    async fn approval_is_not_asked_for_a_call_the_run_could_never_make() {
+        // The agent holds only "read"; the gated tool needs "admin". The caller
+        // holds both, but an agent is a delegate: approving the call could
+        // never let it run. 2.8.0 asked a human anyway, then failed the call
+        // with a hint telling the caller to get a key it already had.
+        let m: Manifest = serde_json::from_value(json!({
+            "name": "t",
+            "routes": [
+                {"id": 0, "method": "POST", "path": "/purge", "op": {"kind": "static", "body": {"purged": true}},
+                 "tool": {"expose": true, "name": "purge"}, "approval": "required", "scopes": ["admin"]}
+            ],
+            "agents": [
+                {"name": "reader", "model": "test", "tools": ["purge"], "scopes": ["read"], "max_steps": 3},
+                {"name": "admin", "model": "test", "tools": ["purge"], "scopes": ["read", "admin"], "max_steps": 3}
+            ]
+        }))
+        .unwrap();
+        let build = |p: ScriptedProvider| {
+            let m = m.clone();
+            async move {
+                let app = App::build_without_python(m).await.expect("app");
+                let rt = AgentRuntime::new(Arc::new(p), Arc::new(MemoryAudit::default()));
+                app.with_agent_runtime(rt).into_arc()
+            }
+        };
+        let app = build(ScriptedProvider::tool_then_text("purge", json!({}), "could not")).await;
+        let out = run(&app, "reader", &caller(&["read", "admin"]), "purge it").await;
+        assert_eq!(out.status, RunStatus::Completed, "{:?}", out.steps);
+        assert!(out.pending_approval.is_none());
+        assert!(app.pending_approvals().is_empty(), "no approval was created");
+        let refused = out.steps.iter().find(|s| s.kind == StepKind::ToolRefused).expect("refused at once");
+        assert_eq!(refused.code.as_deref(), Some("WC602"));
+        let hint = refused.hint.clone().unwrap_or_default();
+        assert!(hint.contains("\"reader\"") && hint.contains("scopes="), "{hint}");
+
+        // The same tool, from an agent that holds the scope, waits for a human.
+        let app = build(ScriptedProvider::tool_then_text("purge", json!({}), "done")).await;
+        let out = run(&app, "admin", &caller(&["read", "admin"]), "purge it").await;
+        assert_eq!(out.status, RunStatus::AwaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn the_answer_tool_is_offered_once_even_beside_a_route_of_that_name() {
+        // Manifest validation refuses this pairing; an agent definition built
+        // in code is held to one tool per name all the same.
+        let m: Manifest = serde_json::from_value(json!({
+            "name": "t",
+            "routes": [{"id": 0, "method": "POST", "path": "/final", "op": {"kind": "static", "body": {}},
+                        "tool": {"expose": true, "name": FINAL_TOOL}}]
+        }))
+        .unwrap();
+        let provider = Arc::new(ScriptedProvider::tool_then_text(FINAL_TOOL, json!({"n": 1}), "x"));
+        let app = App::build_without_python(m).await.expect("app")
+            .with_agent_runtime(AgentRuntime::new(provider.clone(), Arc::new(MemoryAudit::default())))
+            .into_arc();
+        let def: AgentDef = serde_json::from_value(json!({
+            "name": "typed", "model": "test", "tools": [FINAL_TOOL],
+            "output_schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
+        }))
+        .unwrap();
+        let out = app.agent_runtime().unwrap().run(&app, &def, &caller(&[]), "go", RunOptions::default()).await;
+        assert_eq!(out.status, RunStatus::Completed);
+        assert_eq!(out.data, Some(json!({"n": 1})));
+        let names = &provider.snapshots()[0].tool_names;
+        assert_eq!(names.iter().filter(|n| *n == FINAL_TOOL).count(), 1, "{names:?}");
     }
 
     #[tokio::test]

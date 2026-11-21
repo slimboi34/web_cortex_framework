@@ -184,10 +184,21 @@ async fn call_step(
     let mut span = app.tracer().scoped(parent, "tool", &format!("tool {}", step.tool));
     span.set("gen_ai.operation.name", json!("execute_tool"));
     span.set("gen_ai.tool.name", json!(step.tool));
-    let result = app
-        .call_tool_traced(&step.tool, &args, actor, depth + 1, Some(budget.clone()), span.ctx().cloned())
-        .await
-        .and_then(|v| unwrap_output(&step.tool, v));
+    // A flow cannot wait for a human, so a step that is (or contains) an
+    // approval-gated tool is refused rather than run. Manifest validation
+    // already refuses such a flow at boot; this holds even for a flow that
+    // never went through it.
+    let result = match app.gated_tool_behind(&step.tool) {
+        Some(gated) => Err(format!(
+            "step {:?} would run the approval-gated tool {gated:?} with no human to approve it \
+             (WC309); a flow cannot wait for approval, so it was not run",
+            step.tool
+        )),
+        None => app
+            .call_tool_traced(&step.tool, &args, actor, depth + 1, Some(budget.clone()), span.ctx().cloned())
+            .await
+            .and_then(|v| unwrap_output(&step.tool, v)),
+    };
     match &result {
         Ok(_) => span.ok(),
         Err(e) => span.fail(crate::errors::code_in(e).unwrap_or("WC315")),
@@ -478,6 +489,28 @@ mod tests {
         let out = run(&app, flow(&app, "fine"), json!({}), &who, 0, Some(SharedBudget::new("o", Some(10))), None).await.unwrap();
         assert_eq!(out["status"], "completed");
         assert_eq!(out["steps"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_step_that_is_an_approval_gated_tool_is_refused_not_run() {
+        // Boot validation keeps such a flow out of a manifest; a flow run
+        // without it (built in code, say) is refused at the step as well.
+        let m: Manifest = serde_json::from_value(json!({
+            "name": "g",
+            "routes": [
+                {"id": 0, "method": "POST", "path": "/purge", "op": {"kind": "static", "body": {"purged": true}},
+                 "tool": {"expose": true, "name": "purge"}, "approval": "required"}
+            ]
+        }))
+        .unwrap();
+        let app = App::build_without_python(m).await.expect("app").into_arc();
+        let def: FlowDef = serde_json::from_value(json!({
+            "name": "sneaky", "kind": {"kind": "pipeline", "steps": [{"tool": "purge"}]}
+        }))
+        .unwrap();
+        let err = run(&app, &def, json!({}), &Principal::anonymous(), 0, None, None).await.unwrap_err();
+        assert!(err.contains("WC309") && err.contains("purge"), "{err}");
+        assert!(!err.contains("purged"), "the gated tool ran: {err}");
     }
 
     #[test]

@@ -13,7 +13,12 @@
 //! * **Agent session** (any agent route): send `{"input", "images"?,
 //!   "session_id"?, "reset"?}`, receive `{"type": "step"}` for each step as it
 //!   happens and then `{"type": "result"}`. The socket stays open for the next
-//!   turn.
+//!   turn. Every turn after the first is charged to the caller's rate limit,
+//!   exactly as an HTTP run would be.
+//!
+//! A socket opened with a bearer token honours it only until it expires: an
+//! agent socket refuses the next turn and closes (1008), and a device socket is
+//! closed at the token's `exp` (plus the leeway).
 
 use crate::app::App;
 use crate::auth::Principal;
@@ -55,6 +60,28 @@ struct Timing {
 const TIMING: Timing = Timing { stalled_send: Duration::from_secs(30), keepalive: Duration::from_secs(30) };
 /// Replies queued for a device before further ones are dropped.
 const INGEST_REPLIES: usize = 16;
+/// Turns refused in a row for the rate limit before an agent socket is closed.
+const MAX_REFUSED_TURNS: u32 = 3;
+
+/// When a socket's credential lapses: the token's expiry plus the leeway, or
+/// `None` for one that never does (an API key, an anonymous caller).
+type Expiry = Option<tokio::time::Instant>;
+
+/// Resolves when the socket's credential lapses; never, for one that does not.
+async fn lapsed(at: Expiry) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// The close a socket gets when the token it was opened with expires.
+fn token_expired() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: CloseCode::Policy,
+        reason: "[WC603] the token this socket was opened with has expired".into(),
+    }))
+}
 
 /// Set at server shutdown. A dropped sender (tests, an App never served)
 /// means no shutdown is coming.
@@ -88,6 +115,9 @@ enum Mode {
 
 /// Authorise and accept an upgrade. Returns the `101` (or the refusal); the
 /// socket itself is served on a task once hyper hands the connection over.
+/// `rate_key` is the caller's rate-limit bucket, when the app is rate
+/// limited: the upgrade itself was charged to it, and so is every agent turn
+/// after the first.
 pub fn accept(
     app: Arc<App>,
     req: &mut Request<Incoming>,
@@ -95,6 +125,7 @@ pub fn accept(
     path: &str,
     query: &BTreeMap<String, String>,
     principal: Principal,
+    rate_key: Option<String>,
 ) -> WebCortexResponse {
     if headers.get("sec-websocket-version").map(String::as_str) != Some("13") {
         let mut res = WebCortexResponse::coded(426, "WC213", "unsupported WebSocket version; use 13");
@@ -141,6 +172,7 @@ pub fn accept(
         return res;
     };
     let stop = app.shutdown_watch();
+    let expires: Expiry = app.authenticator.expires_in(&principal).map(|left| tokio::time::Instant::now() + left);
     let accept_key = derive_accept_key(key.as_bytes());
     let on_upgrade = hyper::upgrade::on(req);
     tokio::spawn(async move {
@@ -157,9 +189,9 @@ pub fn accept(
             .max_frame_size(Some(max_message));
         let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(config)).await;
         match mode {
-            Mode::Ingest { device } => ingest(app, device, principal, ws, stop).await,
-            Mode::Stream { device, binary } => stream(app, device, binary, ws, stop).await,
-            Mode::Agent { agent } => agent_session(app, agent, principal, ws, stop).await,
+            Mode::Ingest { device } => ingest(app, device, principal, ws, stop, expires).await,
+            Mode::Stream { device, binary } => stream(app, device, binary, ws, stop, expires).await,
+            Mode::Agent { agent } => agent_session(app, agent, principal, ws, stop, rate_key).await,
         }
     });
 
@@ -189,13 +221,13 @@ fn error(code: &str, message: impl Into<String>) -> Message {
     }))
 }
 
-async fn ingest<S>(app: Arc<App>, name: String, principal: Principal, ws: WebSocketStream<S>, stop: Stop)
+async fn ingest<S>(app: Arc<App>, name: String, principal: Principal, ws: WebSocketStream<S>, stop: Stop, expires: Expiry)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Some(device) = app.devices().get(&name).cloned() else { return };
     tracing::info!(device = %name, principal = %principal.id, "device connected");
-    ingest_loop(device, ws, TIMING, stop).await;
+    ingest_loop(device, ws, TIMING, stop, expires).await;
     tracing::info!(device = %name, "device disconnected");
 }
 
@@ -207,7 +239,7 @@ where
 /// one and stopped reading frames: the device then blocked too, for good.
 /// Now a reply that does not fit in the queue is dropped; `frames_rejected`
 /// still counts every refusal.
-async fn ingest_loop<S>(device: Arc<Device>, mut ws: WebSocketStream<S>, t: Timing, mut stop: Stop)
+async fn ingest_loop<S>(device: Arc<Device>, mut ws: WebSocketStream<S>, t: Timing, mut stop: Stop, expires: Expiry)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -227,6 +259,11 @@ where
             },
             _ = stopped(&mut stop) => {
                 let _ = replies.send(going_away()).await;
+                break;
+            }
+            _ = lapsed(expires) => {
+                tracing::info!(device = %name, "device socket closed: its token expired");
+                let _ = replies.send(token_expired()).await;
                 break;
             }
         };
@@ -323,15 +360,15 @@ fn close_for(e: &WsError) -> Option<CloseFrame> {
     Some(CloseFrame { code, reason: reason.into() })
 }
 
-async fn stream<S>(app: Arc<App>, name: String, binary: bool, ws: WebSocketStream<S>, stop: Stop)
+async fn stream<S>(app: Arc<App>, name: String, binary: bool, ws: WebSocketStream<S>, stop: Stop, expires: Expiry)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Some(device) = app.devices().get(&name).cloned() else { return };
-    stream_loop(device, binary, ws, TIMING, stop).await;
+    stream_loop(device, binary, ws, TIMING, stop, expires).await;
 }
 
-async fn stream_loop<S>(device: Arc<Device>, binary: bool, ws: WebSocketStream<S>, t: Timing, mut stop: Stop)
+async fn stream_loop<S>(device: Arc<Device>, binary: bool, ws: WebSocketStream<S>, t: Timing, mut stop: Stop, expires: Expiry)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -392,6 +429,10 @@ where
                 let _ = deliver(&mut out, going_away(), t).await;
                 break;
             }
+            _ = lapsed(expires) => {
+                let _ = deliver(&mut out, token_expired(), t).await;
+                break;
+            }
         };
         for m in batch {
             if !deliver(&mut out, m, t).await {
@@ -413,13 +454,30 @@ fn frame_event(f: &crate::devices::Frame) -> Value {
 /// it finishes; past this many the extra ones are refused, not buffered.
 const MAX_QUEUED_TURNS: usize = 8;
 
-async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: Socket, mut stop: Stop) {
+/// What an agent socket is told when a turn is refused for the rate limit:
+/// the code an HTTP caller would get, and when to try again.
+fn rate_limited(retry_after_secs: u64) -> Message {
+    text(json!({
+        "type": "error",
+        "message": "rate limit exceeded; this turn was not run",
+        "code": "WC401",
+        "hint": crate::errors::hint("WC401"),
+        "retry_after": retry_after_secs,
+    }))
+}
+
+async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: Socket, mut stop: Stop, rate_key: Option<String>) {
     let t = TIMING;
+    let expires: Expiry = app.authenticator.expires_in(&principal).map(|left| tokio::time::Instant::now() + left);
     let (mut out, mut inbound) = ws.split();
     if !deliver(&mut out, text(json!({"type": "ready", "agent": agent})), t).await {
         return;
     }
     let mut queued: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
+    // The upgrade was charged to the rate limit; it pays for the first turn,
+    // so one socket turn costs what one HTTP run does.
+    let mut turns_run: u64 = 0;
+    let mut refused_in_a_row: u32 = 0;
     // A turn in flight at shutdown is finished; the socket closes before the
     // next one, queued or not.
     loop {
@@ -437,6 +495,13 @@ async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: S
                 _ = stopped(&mut stop) => {
                     let _ = deliver(&mut out, going_away(), t).await;
                     break;
+                }
+                // An idle socket whose token lapses is closed then, rather
+                // than at the next turn.
+                _ = lapsed(expires) => {
+                    let _ = deliver(&mut out, error("WC603", "the token this socket was opened with has expired; reconnect with a fresh one"), t).await;
+                    let _ = deliver(&mut out, token_expired(), t).await;
+                    return;
                 }
             },
         };
@@ -459,6 +524,14 @@ async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: S
             }
             Ok(_) => continue,
         };
+        // The credential is checked on every turn, as an HTTP request's is:
+        // through 2.8.0 a socket opened with a token kept running turns, with
+        // its scopes and its spend, for as long as it stayed open.
+        if app.authenticator.expired(&principal) {
+            let _ = deliver(&mut out, error("WC603", "the token this socket was opened with has expired; reconnect with a fresh one"), t).await;
+            let _ = deliver(&mut out, token_expired(), t).await;
+            return;
+        }
         let turn = match parse_turn(&raw, &principal) {
             Ok(t) => t,
             Err((code, e)) => {
@@ -468,6 +541,30 @@ async fn agent_session(app: Arc<App>, agent: String, principal: Principal, ws: S
                 continue;
             }
         };
+        // Each turn is a whole agent run, so each is charged to the caller's
+        // rate limit like an HTTP run. Through 2.8.0 only the upgrade was.
+        if turns_run > 0
+            && let (Some(limiter), Some(key)) = (&app.rate_limiter, &rate_key)
+        {
+            let decision = limiter.check(key);
+            if !decision.allowed {
+                refused_in_a_row += 1;
+                if !deliver(&mut out, rate_limited(decision.retry_after_secs), t).await {
+                    return;
+                }
+                if refused_in_a_row >= MAX_REFUSED_TURNS {
+                    let close = Message::Close(Some(CloseFrame {
+                        code: CloseCode::Policy,
+                        reason: "[WC401] rate limit exceeded".into(),
+                    }));
+                    let _ = deliver(&mut out, close, t).await;
+                    return;
+                }
+                continue;
+            }
+        }
+        refused_in_a_row = 0;
+        turns_run += 1;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let opts = crate::agent::RunOptions {
@@ -629,7 +726,7 @@ mod tests {
     async fn close_code_after(device: Arc<Device>, bytes: Vec<u8>) -> Option<u16> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (a, mut b) = tokio::io::duplex(64 * 1024);
-        let task = tokio::spawn(ingest_loop(device, server(a).await, QUICK, no_stop()));
+        let task = tokio::spawn(ingest_loop(device, server(a).await, QUICK, no_stop(), None));
         b.write_all(&bytes).await.unwrap();
         let mut got = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(10), b.read_to_end(&mut got)).await;
@@ -674,7 +771,7 @@ mod tests {
         // stopped reading after a couple of thousand; the device then blocked.
         let d = device(1e9);
         let (a, b) = tokio::io::duplex(4096);
-        let task = tokio::spawn(ingest_loop(d.clone(), server(a).await, QUICK, no_stop()));
+        let task = tokio::spawn(ingest_loop(d.clone(), server(a).await, QUICK, no_stop(), None));
         let mut cam = client(b).await;
         let sending = async {
             for _ in 0..3000 {
@@ -696,7 +793,7 @@ mod tests {
     async fn a_subscriber_that_stops_reading_is_let_go() {
         let d = device(1e9);
         let (a, _b) = tokio::io::duplex(1024);
-        let task = tokio::spawn(stream_loop(d.clone(), true, server(a).await, QUICK, no_stop()));
+        let task = tokio::spawn(stream_loop(d.clone(), true, server(a).await, QUICK, no_stop(), None));
         tokio::time::timeout(Duration::from_secs(10), async {
             while d.describe()["subscribers"] != 1 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -720,7 +817,7 @@ mod tests {
         let d = device(10.0);
         let (a, b) = tokio::io::duplex(64 * 1024);
         let t = Timing { stalled_send: Duration::from_secs(5), keepalive: Duration::from_millis(100) };
-        let task = tokio::spawn(stream_loop(d, true, server(a).await, t, no_stop()));
+        let task = tokio::spawn(stream_loop(d, true, server(a).await, t, no_stop(), None));
         let mut viewer = client(b).await;
         let hello = viewer.next().await.unwrap().unwrap();
         assert!(hello.to_text().unwrap().contains("hello"));
@@ -742,9 +839,9 @@ mod tests {
             let (a, b) = tokio::io::duplex(64 * 1024);
             let (tx, rx) = tokio::sync::watch::channel(false);
             let task = if ingest {
-                tokio::spawn(ingest_loop(d, server(a).await, QUICK, rx))
+                tokio::spawn(ingest_loop(d, server(a).await, QUICK, rx, None))
             } else {
-                tokio::spawn(stream_loop(d, true, server(a).await, QUICK, rx))
+                tokio::spawn(stream_loop(d, true, server(a).await, QUICK, rx, None))
             };
             let mut peer = client(b).await;
             let first = peer.next().await.unwrap().unwrap();
@@ -758,6 +855,34 @@ mod tests {
                 }
             };
             assert_eq!(close.map(|c| u16::from(c.code)), Some(1001), "ingest={ingest}");
+            tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_device_socket_is_closed_when_its_token_expires() {
+        // Through 2.8.0 a stream or ingest socket opened with a token outlived
+        // it for as long as the client kept it open.
+        for ingest in [true, false] {
+            let d = device(10.0);
+            let (a, b) = tokio::io::duplex(64 * 1024);
+            let at = Some(tokio::time::Instant::now() + Duration::from_millis(300));
+            let task = if ingest {
+                tokio::spawn(ingest_loop(d, server(a).await, QUICK, no_stop(), at))
+            } else {
+                tokio::spawn(stream_loop(d, true, server(a).await, QUICK, no_stop(), at))
+            };
+            let mut peer = client(b).await;
+            let close = loop {
+                match tokio::time::timeout(Duration::from_secs(10), peer.next()).await.unwrap() {
+                    Some(Ok(Message::Close(c))) => break c,
+                    Some(Ok(_)) => continue,
+                    other => panic!("no close frame: {other:?}"),
+                }
+            };
+            let close = close.expect("a close frame with a code");
+            assert_eq!(u16::from(close.code), 1008, "ingest={ingest}");
+            assert!(close.reason.contains("WC603"));
             tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
         }
     }

@@ -363,6 +363,10 @@ fn inspect_manifest(manifest_json: &str) -> PyResult<String> {
     manifest
         .validate()
         .map_err(|e| PyValueError::new_err(format!("invalid application: {e}")))?;
+    // Templates are loaded and parsed exactly as a boot would, so a page whose
+    // template is missing or does not parse fails the check, not only `run`.
+    webcortex_core::app::load_templates(&manifest)
+        .map_err(|e| PyValueError::new_err(format!("invalid application: {e}")))?;
 
     let report = serde_json::json!({
         "name": manifest.name,

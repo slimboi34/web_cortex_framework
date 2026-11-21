@@ -256,14 +256,18 @@ impl BehaviourContext {
             )));
         }
         // An approval gate must stop a behaviour just as it stops an agent,
-        // otherwise wrapping a gated tool in a behaviour would launder it.
-        if let Some(route) = self.app.route_for_tool(tool)
-            && route.approval == webcortex_core::manifest::Approval::Required {
-                return Err(BehaviourHalted::new_err(format!(
-                    "tool {tool:?} requires human approval and cannot run unattended \
+        // otherwise wrapping a gated tool in a behaviour would launder it —
+        // as would calling a flow that runs one as a step.
+        if let Some(gated) = self.app.gated_tool_behind(tool) {
+            return Err(BehaviourHalted::new_err(if gated == tool {
+                format!("tool {tool:?} requires human approval and cannot run unattended inside a behaviour")
+            } else {
+                format!(
+                    "tool {tool:?} runs the approval-gated tool {gated:?} and cannot run unattended \
                      inside a behaviour"
-                )));
-            }
+                )
+            }));
+        }
         Ok(())
     }
 
