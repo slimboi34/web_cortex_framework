@@ -318,6 +318,13 @@ impl ModelProvider for AnthropicProvider {
     }
 }
 
+/// A temperature as the number the app wrote. It is held as an `f32`, and
+/// widening one to `f64` sends `0.9` as `0.8999999761581421`; going through
+/// its shortest decimal form sends `0.9`.
+fn wire_temperature(t: f32) -> Value {
+    json!(t.to_string().parse::<f64>().unwrap_or(f64::from(t)))
+}
+
 /// The Messages API request body for one completion.
 pub fn anthropic_body(req: &CompletionRequest<'_>) -> Value {
     let agent = req.agent;
@@ -336,7 +343,7 @@ pub fn anthropic_body(req: &CompletionRequest<'_>) -> Value {
     // Only when the app set one: Claude Opus 5, Opus 4.7/4.8 and Sonnet 5
     // reject sampling parameters outright.
     if let Some(t) = agent.temperature {
-        body["temperature"] = json!(t);
+        body["temperature"] = wire_temperature(t);
     }
 
     let system = full_system(req);
@@ -532,7 +539,7 @@ pub fn openai_body(req: &CompletionRequest) -> Value {
         "messages": messages,
     });
     if let Some(t) = agent.temperature {
-        body["temperature"] = json!(t);
+        body["temperature"] = wire_temperature(t);
     }
     // Only when the app set it. `none` is how a local thinking model (Qwen,
     // Gemma 4, MiniCPM through Ollama) is told to answer instead of deliberate.
@@ -1248,7 +1255,26 @@ mod tests {
         };
         assert!(body(&agent).get("temperature").is_none(), "Opus 5 rejects any sampling parameter");
         agent.temperature = Some(0.2);
-        assert_eq!(body(&agent)["temperature"], json!(0.2f32));
+        assert_eq!(body(&agent)["temperature"], json!(0.2));
+    }
+
+    #[test]
+    fn temperature_goes_on_the_wire_as_written_on_both_formats() {
+        let conversation = Conversation::default();
+        for t in [0.9f32, 0.7, 0.1, 1.0, 0.33, 2.0, 0.0] {
+            let mut agent: AgentDef = serde_json::from_value(json!({"name": "a", "model": "m"})).unwrap();
+            agent.temperature = Some(t);
+            let req = CompletionRequest { agent: &agent, conversation: &conversation, tools: &[], force_tool: None, system_suffix: "" };
+            let written: f64 = t.to_string().parse().unwrap();
+            for body in [anthropic_body(&req), openai_body(&req)] {
+                assert_eq!(body["temperature"], json!(written), "{t}");
+                assert!(body.to_string().contains(&format!("\"temperature\":{}", json!(written))), "{body}");
+            }
+        }
+        let mut agent: AgentDef = serde_json::from_value(json!({"name": "a", "model": "m"})).unwrap();
+        agent.temperature = Some(0.9);
+        let req = CompletionRequest { agent: &agent, conversation: &conversation, tools: &[], force_tool: None, system_suffix: "" };
+        assert!(openai_body(&req).to_string().contains("\"temperature\":0.9,") || openai_body(&req).to_string().contains("\"temperature\":0.9}"));
     }
 
     #[test]
