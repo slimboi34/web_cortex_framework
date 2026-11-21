@@ -48,7 +48,7 @@ app.agent(
     system="You help ops staff understand pending deploys. Never approve anything.",
     tools=["list_deploys", "get_deploys", "get_deploys_pending",
            "create_deploys_by_id_approve"],
-    scopes=["read"],
+    scopes=["read", "write"],   # write is only ever used through the gate
     expose_scopes=["read"],
     max_steps=10,
     token_budget=40_000,
@@ -63,8 +63,17 @@ app.page("/", "index.html",
 
 **Why it is safe.** The agent lists the approve tool, so it can *reason* about
 approvals and propose one — but `approval="required"` means the run suspends
-instead of executing, and `scopes=["read"]` means even without the gate it could
-not reach a write route. Two independent controls.
+instead of executing, and only a human holding `webcortex:admin` can let it
+continue. The agent's `scopes` are intersected with the caller's: when someone
+with the viewer key (only `read`) asks, the run holds no `write`, so the
+proposal is refused at once (`WC602`) and nothing is queued for approval. The
+approve tool is the only write tool it lists, so `write` buys it nothing it can
+do without a person. Two independent controls: the caller's scopes decide
+whether the agent may even ask, and the gate decides that a human commits.
+
+A direct `POST /deploys/{id}/approve` from someone holding `write` is not gated:
+the gate holds agents and MCP clients to a human decision, while people are
+held to their scopes.
 
 ---
 
@@ -208,6 +217,10 @@ app.proxy("GET", "/catalog/products",
 - Path parameters containing traversal are rejected with 400 before any request
   is issued
 - An undeclared upstream is a **boot error**
+- Redirects from an upstream are relayed to the caller, never followed, so the
+  internal tokens cannot be sent to a host a redirect names
+- Because `audience` is set, a JWT without a matching `aud` claim is a 401
+  (likewise `iss` when `issuer` is set)
 
 Every proxied route is also an MCP tool, so an agent can reach internal services
 through exactly the same authorization checks a partner does.
@@ -233,7 +246,8 @@ app.page("/", "users.html",
          sql="SELECT * FROM users ORDER BY id DESC LIMIT 100",
          bind="users", scopes=["admin"])
 
-app.page("/users/{id}", "user_detail.html",
+# Not /users/{id}: the resource already serves GET /users/{id} as JSON.
+app.page("/admin/users/{id}", "user_detail.html",
          sql="SELECT * FROM users WHERE id = ?",
          params=["id"], returns="one", bind="user", scopes=["admin"])
 
@@ -252,7 +266,7 @@ app.static_files("/assets", "static")
   <table>
     {% for u in users %}
       <tr>
-        <td><a href="/users/{{ u.id }}">{{ u.email }}</a></td>
+        <td><a href="/admin/users/{{ u.id }}">{{ u.email }}</a></td>
         <td>{{ u.role }}</td>
       </tr>
     {% endfor %}
