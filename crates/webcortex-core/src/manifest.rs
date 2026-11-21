@@ -7,7 +7,7 @@
 //! the interpreter; everything else is served without touching the GIL.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -455,6 +455,18 @@ pub enum FlowKind {
         #[serde(default)]
         classify_prompt: Option<String>,
     },
+}
+
+impl FlowKind {
+    /// Every step the flow can run: a pipeline's steps, a parallel's
+    /// branches, a router's routes and its default.
+    pub fn steps(&self) -> Vec<&FlowStep> {
+        match self {
+            FlowKind::Pipeline { steps } => steps.iter().collect(),
+            FlowKind::Parallel { branches, .. } => branches.iter().collect(),
+            FlowKind::Route { routes, default, .. } => routes.values().chain(default.iter()).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1185,7 +1197,24 @@ impl Manifest {
                 }
                 if a.tools.iter().any(|t| t == crate::agent::FINAL_TOOL) {
                     return Err(format!(
-                        "agent {:?} has an output schema, so the tool name {:?} is taken by its answer;                          rename the route's tool",
+                        "agent {:?} has an output schema, so the tool name {:?} is taken by its answer; \
+                         rename the route's tool",
+                        a.name,
+                        crate::agent::FINAL_TOOL
+                    ));
+                }
+                // The answer tool survives a handoff (the entry agent's
+                // contract holds for the whole run), so it is taken for every
+                // agent the run can be handed to as well. Through 2.8.0 a
+                // specialist listing a route named final_answer booted, and
+                // its request then carried two tools of that name.
+                if let Some(target) = self.handoff_closure(&a.name).into_iter().find(|t| {
+                    self.agents.iter().any(|o| &o.name == t && o.tools.iter().any(|x| x == crate::agent::FINAL_TOOL))
+                }) {
+                    return Err(format!(
+                        "agent {:?} has an output schema, so the tool name {:?} is taken by its answer \
+                         for the whole run, but agent {target:?}, which the run can be handed to, lists a \
+                         tool of that name; rename the route's tool",
                         a.name,
                         crate::agent::FINAL_TOOL
                     ));
@@ -1517,7 +1546,93 @@ impl Manifest {
                 }
             }
         }
+        // A flow step is dispatched straight to its tool, with nobody to ask:
+        // a flow cannot wait for a human. Through 2.8.0 a gated tool named as
+        // a step simply ran, so wrapping it in a flow — then calling the flow
+        // from an agent, over MCP or from a behaviour — skipped its approval.
+        for f in &self.flows {
+            if let Some((via, tool)) = self.gated_tool_in_flow(&f.name) {
+                let path = if via.len() > 1 { format!(" (through {})", via.join(" -> ")) } else { String::new() };
+                return Err(format!(
+                    "flow {:?} runs the approval-gated tool {tool:?} as a step{path}; a flow cannot \
+                     wait for a human, so its gate would never be asked. Let an agent call {tool:?} \
+                     (the run suspends for approval) or remove approval=\"required\"",
+                    f.name
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Every agent a run started at `agent` can be handed to, directly or
+    /// through other handoffs. Excludes `agent` itself.
+    pub fn handoff_closure(&self, agent: &str) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        let mut queue: Vec<&str> = vec![agent];
+        while let Some(name) = queue.pop() {
+            let Some(def) = self.agents.iter().find(|a| a.name == name) else { continue };
+            for h in &def.handoffs {
+                if h != agent && !seen.iter().any(|s| s == h) {
+                    seen.push(h.clone());
+                    queue.push(h);
+                }
+            }
+        }
+        seen
+    }
+
+    /// The approval-gated tool that calling `tool` would reach without an
+    /// agent asking a human first: `tool` itself when it is gated, or a gated
+    /// step anywhere inside it when it is a flow (nested flows, parallel
+    /// branches and router routes included). `None` when there is none.
+    pub fn gated_tool_behind(&self, tool: &str) -> Option<String> {
+        let route = self.routes.iter().find(|r| r.tool.expose && r.tool_name() == tool)?;
+        if route.approval == Approval::Required {
+            return Some(tool.to_string());
+        }
+        match &route.op {
+            Op::Flow { flow } => self.gated_tool_in_flow(flow).map(|(_, gated)| gated),
+            _ => None,
+        }
+    }
+
+    /// The first approval-gated tool a flow runs as a step, directly or
+    /// through flows nested in it, with the chain of flows that reaches it.
+    pub fn gated_tool_in_flow(&self, flow: &str) -> Option<(Vec<String>, String)> {
+        let by_tool: HashMap<String, &Route> =
+            self.routes.iter().filter(|r| r.tool.expose).map(|r| (r.tool_name(), r)).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut via = Vec::new();
+        self.walk_flow_for_gates(flow, &by_tool, &mut seen, &mut via)
+    }
+
+    fn walk_flow_for_gates(
+        &self,
+        flow: &str,
+        by_tool: &HashMap<String, &Route>,
+        seen: &mut std::collections::HashSet<String>,
+        via: &mut Vec<String>,
+    ) -> Option<(Vec<String>, String)> {
+        // Flows may name each other in a cycle (bounded at run time by the
+        // nesting ceiling); each is walked once.
+        if !seen.insert(flow.to_string()) {
+            return None;
+        }
+        let def = self.flow(flow)?;
+        via.push(flow.to_string());
+        for step in def.kind.steps() {
+            let Some(route) = by_tool.get(&step.tool) else { continue };
+            if route.approval == Approval::Required {
+                return Some((via.clone(), step.tool.clone()));
+            }
+            if let Op::Flow { flow: inner } = &route.op
+                && let Some(found) = self.walk_flow_for_gates(inner, by_tool, seen, via)
+            {
+                return Some(found);
+            }
+        }
+        via.pop();
+        None
     }
 
     pub fn flow(&self, name: &str) -> Option<&FlowDef> {
@@ -1530,10 +1645,20 @@ impl Manifest {
 
     /// Routes reachable without any credential. Surfaced by `webcortex check` so an
     /// operator can see their public attack surface on one screen.
+    ///
+    /// A route is public when no authentication is configured at all, or when
+    /// every scope it requires (its own and its tool's; for an agent, a
+    /// behaviour or a flow that is its `expose_scopes`) is one that
+    /// `anonymous_scopes` grants. Through 2.8.0 only routes declaring no scope
+    /// were listed, so a write route opened by `anonymous_scopes("write")`
+    /// was missing from the very report meant to show it.
     pub fn public_routes(&self) -> Vec<&Route> {
+        let auth_off = self.auth.api_keys.is_empty() && self.auth.jwt.is_none();
+        let anonymous = &self.auth.anonymous_scopes;
+        let granted = |scope: &String| anonymous.iter().any(|a| a == scope || a == "*");
         self.routes
             .iter()
-            .filter(|r| r.scopes.is_empty() && r.tool.scopes.is_empty())
+            .filter(|r| auth_off || r.scopes.iter().chain(&r.tool.scopes).all(granted))
             .collect()
     }
 }
@@ -1671,5 +1796,123 @@ mod tests {
         // A typo still finds its near neighbour.
         assert_eq!(nearest("list_thing", &tools).as_deref(), Some("list_things"));
         assert_eq!(nearest("zzzzzzzzzz", &tools), None);
+    }
+
+    #[test]
+    fn routes_opened_by_anonymous_scopes_are_public() {
+        let m = |auth: serde_json::Value| -> super::Manifest {
+            serde_json::from_value(serde_json::json!({
+                "name": "p",
+                "auth": auth,
+                "routes": [
+                    {"id": 0, "method": "GET", "path": "/open", "op": {"kind": "static", "body": {}}},
+                    {"id": 1, "method": "POST", "path": "/items", "op": {"kind": "static", "body": {}}, "scopes": ["write"]},
+                    {"id": 2, "method": "GET", "path": "/items", "op": {"kind": "static", "body": {}},
+                     "tool": {"expose": true, "name": "list_items", "scopes": ["read"]}},
+                    {"id": 3, "method": "DELETE", "path": "/all", "op": {"kind": "static", "body": {}}, "scopes": ["admin"]}
+                ]
+            }))
+            .unwrap()
+        };
+        let public = |m: &super::Manifest| -> Vec<String> {
+            m.public_routes().iter().map(|r| format!("{} {}", r.method, r.path)).collect()
+        };
+        let keys = serde_json::json!({"api_keys": {"K": {"id": "svc", "scopes": ["*"]}}, "api_key_header": "x-api-key"});
+        assert_eq!(public(&m(keys.clone())), vec!["GET /open"]);
+        let mut anon = keys.clone();
+        anon["anonymous_scopes"] = serde_json::json!(["read", "write"]);
+        assert_eq!(public(&m(anon)), vec!["GET /open", "POST /items", "GET /items"]);
+        let mut star = keys;
+        star["anonymous_scopes"] = serde_json::json!(["*"]);
+        assert_eq!(public(&m(star)).len(), 4);
+        // With no authentication configured, every route is open to everyone.
+        assert_eq!(public(&m(serde_json::json!({}))).len(), 4);
+    }
+
+    #[test]
+    fn the_answer_tool_name_is_taken_for_every_agent_a_typed_run_reaches() {
+        let m = |specialist_tools: serde_json::Value| -> super::Manifest {
+            serde_json::from_value(serde_json::json!({
+                "name": "h",
+                "routes": [
+                    {"id": 0, "method": "POST", "path": "/final_answer", "op": {"kind": "static", "body": {}},
+                     "tool": {"expose": true, "name": "final_answer"}},
+                    {"id": 1, "method": "POST", "path": "/ok", "op": {"kind": "static", "body": {}},
+                     "tool": {"expose": true, "name": "ok"}}
+                ],
+                "agents": [
+                    {"name": "desk", "model": "m", "handoffs": ["triage"],
+                     "output_schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}},
+                    {"name": "triage", "model": "m", "handoffs": ["specialist", "desk"]},
+                    {"name": "specialist", "model": "m", "tools": specialist_tools}
+                ]
+            }))
+            .unwrap()
+        };
+        let err = m(serde_json::json!(["final_answer"])).validate().unwrap_err();
+        assert!(err.contains("\"desk\"") && err.contains("\"specialist\"") && err.contains("final_answer"), "{err}");
+        m(serde_json::json!(["ok"])).validate().expect("no clash");
+        assert_eq!(m(serde_json::json!([])).handoff_closure("desk"), vec!["triage", "specialist"]);
+    }
+
+    fn gate_manifest(flows: serde_json::Value) -> super::Manifest {
+        serde_json::from_value(serde_json::json!({
+            "name": "g",
+            "routes": [
+                {"id": 0, "method": "POST", "path": "/purge", "op": {"kind": "static", "body": {}},
+                 "tool": {"expose": true, "name": "purge"}, "approval": "required"},
+                {"id": 1, "method": "POST", "path": "/ok", "op": {"kind": "static", "body": {}},
+                 "tool": {"expose": true, "name": "ok"}},
+                {"id": 2, "method": "POST", "path": "/agents/asker", "op": {"kind": "agent", "agent": "asker"},
+                 "tool": {"expose": true, "name": "asker"}},
+                {"id": 3, "method": "POST", "path": "/flows/inner", "op": {"kind": "flow", "flow": "inner"},
+                 "tool": {"expose": true, "name": "inner"}},
+                {"id": 4, "method": "POST", "path": "/flows/outer", "op": {"kind": "flow", "flow": "outer"},
+                 "tool": {"expose": true, "name": "outer"}}
+            ],
+            "agents": [{"name": "asker", "model": "m", "tools": ["purge"]}],
+            "flows": flows,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_flow_may_not_run_an_approval_gated_tool_as_a_step() {
+        use serde_json::json;
+        // Through 2.8.0 each of these booted, and the gated tool ran unattended
+        // whenever the flow was called — by an agent, over MCP, from a behaviour.
+        let cases = [
+            json!([{"name": "inner", "kind": {"kind": "pipeline", "steps": [{"tool": "ok"}, {"tool": "purge"}]}},
+                   {"name": "outer", "kind": {"kind": "pipeline", "steps": [{"tool": "ok"}]}}]),
+            json!([{"name": "inner", "kind": {"kind": "parallel", "branches": [{"tool": "ok"}, {"tool": "purge"}]}},
+                   {"name": "outer", "kind": {"kind": "pipeline", "steps": [{"tool": "ok"}]}}]),
+            json!([{"name": "inner", "kind": {"kind": "route", "routes": {"a": {"tool": "ok"}}, "default": {"tool": "purge"}}},
+                   {"name": "outer", "kind": {"kind": "pipeline", "steps": [{"tool": "ok"}]}}]),
+        ];
+        for flows in cases {
+            let err = gate_manifest(flows.clone()).validate().unwrap_err();
+            assert!(err.contains("\"inner\"") && err.contains("\"purge\""), "{err}");
+        }
+        // Nested: the outer flow reaches the gate through the inner one, and
+        // the message names the chain.
+        let nested = json!([
+            {"name": "inner", "kind": {"kind": "pipeline", "steps": [{"tool": "purge"}]}},
+            {"name": "outer", "kind": {"kind": "pipeline", "steps": [{"tool": "ok"}, {"tool": "inner"}]}}]);
+        let m = gate_manifest(nested);
+        assert_eq!(m.gated_tool_behind("outer").as_deref(), Some("purge"));
+        assert_eq!(m.gated_tool_in_flow("outer").unwrap().0, vec!["outer", "inner"]);
+        assert!(m.validate().is_err());
+
+        // An agent step that calls the gated tool is fine: the agent suspends
+        // and asks. So are flows naming each other in a cycle.
+        let fine = json!([
+            {"name": "inner", "kind": {"kind": "pipeline", "steps": [{"tool": "asker"}, {"tool": "outer"}]}},
+            {"name": "outer", "kind": {"kind": "pipeline", "steps": [{"tool": "inner"}]}}]);
+        let m = gate_manifest(fine);
+        m.validate().expect("an agent step asks a human; a flow cycle has no gate");
+        assert_eq!(m.gated_tool_behind("purge").as_deref(), Some("purge"));
+        assert_eq!(m.gated_tool_behind("outer"), None);
+        assert_eq!(m.gated_tool_behind("asker"), None);
+        assert_eq!(m.gated_tool_behind("nope"), None);
     }
 }

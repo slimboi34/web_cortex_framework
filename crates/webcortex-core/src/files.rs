@@ -13,6 +13,15 @@ pub struct FileServer {
     cache_secs: u64,
 }
 
+/// What a request for a static file comes to: an answer with no file behind
+/// it (a redirect, a 304, a 404), or a file to send after its headers.
+pub enum FileReply {
+    Done(WebCortexResponse),
+    /// The response head (200, its headers, an empty body), the open file,
+    /// and how many bytes of it to send.
+    Stream { head: WebCortexResponse, file: std::fs::File, len: u64 },
+}
+
 impl FileServer {
     pub fn new(dir: &str, index: Option<String>, cache_secs: u64) -> Result<Self, String> {
         let root = std::fs::canonicalize(dir)
@@ -23,14 +32,36 @@ impl FileServer {
         Ok(Self { root, index, cache_secs })
     }
 
-    /// Serve `relative` (the path beneath the mount point). `request_path` is
-    /// the full path the client asked for, used only to redirect a directory
-    /// requested without its trailing slash.
+    /// Serve `relative` with the whole file in the body. The HTTP server uses
+    /// [`Self::open`] and streams instead; this is for an in-process caller
+    /// (a tool call) that needs the bytes.
     pub fn serve(&self, relative: &str, request_path: &str, if_none_match: Option<&str>) -> WebCortexResponse {
+        match self.open(relative, request_path, if_none_match) {
+            FileReply::Done(res) => res,
+            FileReply::Stream { mut head, file, len } => {
+                use std::io::Read;
+                let mut bytes = Vec::with_capacity(len.min(64 * 1024 * 1024) as usize);
+                if file.take(len).read_to_end(&mut bytes).is_err() {
+                    return WebCortexResponse::coded(404, "WC207", "not found");
+                }
+                head.body = bytes::Bytes::from(bytes);
+                head
+            }
+        }
+    }
+
+    /// Resolve `relative` (the path beneath the mount point) and open it,
+    /// without reading it: the server streams the file from disk, so a large
+    /// file is never held in memory per request — and a client that reads it
+    /// slowly holds a file handle, not the file. `request_path` is the full
+    /// path the client asked for, used only to redirect a directory
+    /// requested without its trailing slash.
+    pub fn open(&self, relative: &str, request_path: &str, if_none_match: Option<&str>) -> FileReply {
+        use FileReply::Done;
         let Some(safe) = self.resolve(relative) else {
             // Deliberately 404, not 403: a traversal attempt should learn
             // nothing about what does or does not exist outside the root.
-            return WebCortexResponse::coded(404, "WC207", "not found");
+            return Done(WebCortexResponse::coded(404, "WC207", "not found"));
         };
 
         let target = if safe.is_dir() {
@@ -42,41 +73,43 @@ impl FileServer {
                 // so no request path can turn it into an off-site redirect.
                 Some(_) if !request_path.ends_with('/') => {
                     let last = request_path.rsplit('/').next().unwrap_or_default();
-                    return WebCortexResponse {
+                    return Done(WebCortexResponse {
                         status: 301,
                         headers: vec![("location".into(), format!("./{last}/"))],
                         body: bytes::Bytes::new(),
-                    };
+                    });
                 }
                 Some(name) => safe.join(name),
-                None => return WebCortexResponse::coded(404, "WC207", "not found"),
+                None => return Done(WebCortexResponse::coded(404, "WC207", "not found")),
             }
         } else {
             safe
         };
 
-        let bytes = match std::fs::read(&target) {
-            Ok(b) => b,
-            Err(_) => return WebCortexResponse::coded(404, "WC207", "not found"),
-        };
+        let not_found = || Done(WebCortexResponse::coded(404, "WC207", "not found"));
+        let Ok(file) = std::fs::File::open(&target) else { return not_found() };
+        let Ok(meta) = file.metadata() else { return not_found() };
+        if !meta.is_file() {
+            return not_found();
+        }
 
-        let etag = weak_etag(&bytes);
+        let etag = weak_etag(&meta);
         if if_none_match.is_some_and(|v| etag_matches(v, &etag)) {
-            return WebCortexResponse {
+            return Done(WebCortexResponse {
                 status: 304,
                 headers: vec![
                     ("etag".into(), etag),
                     ("cache-control".into(), format!("public, max-age={}", self.cache_secs)),
                 ],
                 body: bytes::Bytes::new(),
-            };
+            });
         }
 
         let mime = mime_guess::from_path(&target)
             .first_or_octet_stream()
             .to_string();
 
-        WebCortexResponse {
+        let head = WebCortexResponse {
             status: 200,
             headers: vec![
                 ("content-type".into(), mime),
@@ -89,8 +122,9 @@ impl FileServer {
                 // browser sniff one into executable content.
                 ("x-content-type-options".into(), "nosniff".into()),
             ],
-            body: bytes::Bytes::from(bytes),
-        }
+            body: bytes::Bytes::new(),
+        };
+        FileReply::Stream { head, file, len: meta.len() }
     }
 
     /// Resolve a request path inside the root, or `None` if it escapes.
@@ -139,13 +173,27 @@ fn etag_matches(header: &str, etag: &str) -> bool {
     header.split(',').any(|t| t.trim() == "*" || opaque(t) == ours)
 }
 
-fn weak_etag(bytes: &[u8]) -> String {
+/// A weak validator from what the filesystem says about the file — its size,
+/// modification time and (on Unix) inode — so a file is never read just to
+/// tag it. Through 2.8.0 the tag hashed the whole file, read into memory on
+/// every request.
+fn weak_etag(meta: &std::fs::Metadata) -> String {
     use sha2::{Digest, Sha256};
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(meta);
+    #[cfg(not(unix))]
+    let inode = 0u64;
     let mut h = Sha256::new();
-    h.update(bytes);
+    h.update(format!("{}:{modified}:{inode}", meta.len()).as_bytes());
     let digest = h.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in digest.iter() {
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
         use std::fmt::Write;
         let _ = write!(hex, "{byte:02x}");
     }
@@ -258,6 +306,29 @@ mod tests {
             assert_eq!(s.serve("/app.js", "/s/app.js", Some(&header)).status, 304, "{header}");
         }
         assert_eq!(s.serve("/app.js", "/s/app.js", Some("W/\"other\"")).status, 200);
+    }
+
+    #[test]
+    fn a_file_is_opened_for_streaming_not_read() {
+        let f = Fixture::new();
+        let big = vec![7u8; 3 * 1024 * 1024];
+        std::fs::write(f.dir.join("big.bin"), &big).expect("write");
+        match f.server().open("/big.bin", "/s/big.bin", None) {
+            FileReply::Stream { head, len, .. } => {
+                assert_eq!(head.status, 200);
+                assert!(head.body.is_empty(), "the body is streamed, not buffered");
+                assert_eq!(len, big.len() as u64);
+            }
+            FileReply::Done(r) => panic!("expected a stream, got {}", r.status),
+        }
+        // The in-process path still gets the bytes, and the tag is the same.
+        let whole = f.server().serve("/big.bin", "/s/big.bin", None);
+        assert_eq!(whole.body.len(), big.len());
+        let etag = whole.headers.iter().find(|(k, _)| k == "etag").unwrap().1.clone();
+        assert!(matches!(f.server().open("/big.bin", "/s/big.bin", Some(&etag)), FileReply::Done(r) if r.status == 304));
+        // A changed file gets a new tag.
+        std::fs::write(f.dir.join("big.bin"), b"short").expect("write");
+        assert!(matches!(f.server().open("/big.bin", "/s/big.bin", Some(&etag)), FileReply::Stream { .. }));
     }
 
     #[test]

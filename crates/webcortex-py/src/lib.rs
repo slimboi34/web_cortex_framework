@@ -199,6 +199,14 @@ impl PyBridge for PythonBridge {
         // Captured here, on a tokio thread. The behaviour later runs on a Python
         // worker thread and uses this handle to re-enter the runtime.
         let handle = tokio::runtime::Handle::current();
+        // No call the behaviour makes may wait longer than its route may run,
+        // nor once nobody is waiting for the run: `waiting` is held by the
+        // future returned below, so a request timeout or a caller that gives
+        // up drops it, and every wait in the behaviour then ends.
+        let limit = std::time::Duration::from_secs(
+            app.manifest.server.agent_timeout_secs.max(app.manifest.server.request_timeout_secs).max(1),
+        );
+        let (waiting, caller) = tokio::sync::watch::channel(());
 
         let submitted = Python::attach(|py| -> PyResult<()> {
             let ctx = BehaviourContext::new(
@@ -221,6 +229,8 @@ impl PyBridge for PythonBridge {
                 input.clone(),
                 def.options.clone(),
                 trace,
+                limit,
+                caller,
             );
             let completer = Py::new(
                 py,
@@ -235,6 +245,7 @@ impl PyBridge for PythonBridge {
         });
 
         Box::pin(async move {
+            let _waiting = waiting;
             if let Err(e) = submitted {
                 return Err(format!("failed to submit behaviour to Python: {e}"));
             }
@@ -362,6 +373,10 @@ fn inspect_manifest(manifest_json: &str) -> PyResult<String> {
         .map_err(|e| PyValueError::new_err(format!("invalid manifest: {e}")))?;
     manifest
         .validate()
+        .map_err(|e| PyValueError::new_err(format!("invalid application: {e}")))?;
+    // Templates are loaded and parsed exactly as a boot would, so a page whose
+    // template is missing or does not parse fails the check, not only `run`.
+    webcortex_core::app::load_templates(&manifest)
         .map_err(|e| PyValueError::new_err(format!("invalid application: {e}")))?;
 
     let report = serde_json::json!({

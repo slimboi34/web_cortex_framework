@@ -21,6 +21,12 @@
 //! worker would cause. `gather` and `ask_many` block on a `join_all`, so the
 //! leaves they fan out run genuinely concurrently on the runtime while the
 //! worker thread waits once.
+//!
+//! Every such wait is bounded (see [`BehaviourContext::wait`]): it ends at
+//! the run's deadline, or as soon as whoever started the run stops waiting
+//! for it, and the behaviour gets a `BehaviourHalted` carrying `WC203`. An
+//! unbounded wait on a pool thread, for a Python route that needs a pool
+//! thread to run, is how a full pool used to wedge for good.
 
 use pyo3::exceptions::{PyPermissionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -92,6 +98,16 @@ pub struct BehaviourContext {
     /// The behaviour's span; its tool and model calls are children of it.
     span: Option<webcortex_core::trace::TraceCtx>,
 
+    /// When the run must be over: its route's time limit, counted from when
+    /// it was started. No call it makes may wait past this.
+    deadline: tokio::time::Instant,
+    /// How long the run was given, for the message when it runs out.
+    limit: std::time::Duration,
+    /// Resolves once whoever started the run has stopped waiting for it (the
+    /// request timed out, the client left, the agent that called it gave up):
+    /// its sender is held by the future the caller awaits.
+    caller: tokio::sync::watch::Receiver<()>,
+
     trace: Mutex<Vec<TraceEntry>>,
 }
 
@@ -125,6 +141,8 @@ impl BehaviourContext {
         input: serde_json::Value,
         options: webcortex_core::manifest::RequestOptions,
         span: Option<webcortex_core::trace::TraceCtx>,
+        limit: std::time::Duration,
+        caller: tokio::sync::watch::Receiver<()>,
     ) -> Self {
         Self {
             app,
@@ -150,8 +168,49 @@ impl BehaviourContext {
             input,
             options,
             span,
+            deadline: tokio::time::Instant::now() + limit,
+            limit,
+            caller,
             trace: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Wait on the runtime for `work`, from this worker thread, but only for
+    /// as long as the run may last: until its deadline, or until whoever
+    /// started it stops waiting. `Err` carries the `WC203` message to raise.
+    ///
+    /// Through 2.8.0 the wait had no bound. A behaviour holds a Python worker
+    /// thread while it waits, and a Python route it calls needs one to run:
+    /// once every thread held a behaviour, the routes they waited for never
+    /// started, the requests timed out, and the threads stayed blocked for
+    /// good. Now the wait ends, the behaviour is told, and its thread is free.
+    fn wait<F: std::future::Future>(&self, work: F) -> Result<F::Output, String> {
+        let deadline = self.deadline;
+        let mut caller = self.caller.clone();
+        let outcome = self.handle.block_on(async move {
+            tokio::select! {
+                out = work => Ok(out),
+                _ = tokio::time::sleep_until(deadline) => Err(true),
+                // Never sent to: this resolves when the sender is dropped.
+                _ = caller.changed() => Err(false),
+            }
+        });
+        outcome.map_err(|out_of_time| {
+            if out_of_time {
+                format!(
+                    "behaviour {:?} ran out of time: it was given {} s (the route's timeout) and the call \
+                     it was waiting on was abandoned (WC203)",
+                    self.behaviour,
+                    self.limit.as_secs()
+                )
+            } else {
+                format!(
+                    "behaviour {:?} was abandoned: the request that started it timed out or its caller \
+                     went away, so the call it was waiting on was dropped (WC203)",
+                    self.behaviour
+                )
+            }
+        })
     }
 
     fn charge_step(&self) -> PyResult<()> {
@@ -256,14 +315,18 @@ impl BehaviourContext {
             )));
         }
         // An approval gate must stop a behaviour just as it stops an agent,
-        // otherwise wrapping a gated tool in a behaviour would launder it.
-        if let Some(route) = self.app.route_for_tool(tool)
-            && route.approval == webcortex_core::manifest::Approval::Required {
-                return Err(BehaviourHalted::new_err(format!(
-                    "tool {tool:?} requires human approval and cannot run unattended \
+        // otherwise wrapping a gated tool in a behaviour would launder it —
+        // as would calling a flow that runs one as a step.
+        if let Some(gated) = self.app.gated_tool_behind(tool) {
+            return Err(BehaviourHalted::new_err(if gated == tool {
+                format!("tool {tool:?} requires human approval and cannot run unattended inside a behaviour")
+            } else {
+                format!(
+                    "tool {tool:?} runs the approval-gated tool {gated:?} and cannot run unattended \
                      inside a behaviour"
-                )));
-            }
+                )
+            }));
+        }
         Ok(())
     }
 
@@ -326,35 +389,60 @@ impl BehaviourContext {
         span
     }
 
-    /// Turn a provider response into what `ask` returns: structured output
-    /// when a schema was given (recovered from prose if a local model answered
-    /// in text), otherwise the text.
-    fn settle_ask(&self, py: Python<'_>, response: webcortex_core::agent::ProviderResponse, structured: bool, elapsed: u64) -> PyResult<Py<PyAny>> {
-        self.account(&response)?;
-        self.answer(py, response, structured, elapsed)
+    /// A structured answer as `ask` checks it: the `respond` call's
+    /// arguments, or JSON recovered from prose when a local model answered in
+    /// text, held to the schema. `Err` lists what is wrong with it, each
+    /// problem naming the place it is at.
+    ///
+    /// Through 2.8.0 nothing was checked: whatever object the model sent back
+    /// — a key missing, a string where the schema said integer, a value off
+    /// the enum, even an array — was handed to the behaviour as the answer.
+    fn structured(response: &webcortex_core::agent::ProviderResponse, schema: &serde_json::Value) -> Result<serde_json::Value, Vec<String>> {
+        let value = response
+            .tool_calls
+            .iter()
+            .find(|c| c.name == RESPOND)
+            .map(|c| c.arguments.clone())
+            .or_else(|| recover_json(&response.text));
+        let Some(value) = value else {
+            return Err(vec![format!(
+                "$: the answer was not structured output (no {RESPOND} call and no JSON in the text: {})",
+                if response.text.is_empty() { "<nothing>".to_string() } else { clip(&response.text, 200) }
+            )]);
+        };
+        let problems = webcortex_core::schema::validate(schema, &value);
+        if problems.is_empty() { Ok(value) } else { Err(problems) }
     }
 
-    /// What `ask` returns for a response that has already been charged.
-    fn answer(&self, py: Python<'_>, response: webcortex_core::agent::ProviderResponse, structured: bool, elapsed: u64) -> PyResult<Py<PyAny>> {
-        if structured {
-            let value = response
-                .tool_calls
-                .iter()
-                .find(|c| c.name == "respond")
-                .map(|c| c.arguments.clone())
-                .or_else(|| recover_json(&response.text));
-            return match value {
-                Some(value) => {
-                    self.record("ask", "structured", value.clone(), elapsed);
-                    json_to_py(py, &value)
-                }
-                None => Err(PyRuntimeError::new_err(format!(
-                    "model did not return structured output; it said: {}",
-                    if response.text.is_empty() { "<nothing>" } else { &response.text }
-                ))),
-            };
-        }
+    /// What the model is told when its structured answer did not match.
+    fn correction(problems: &[String]) -> String {
+        format!(
+            "the answer does not match the required schema (WC318): {}. Call {RESPOND} again with \
+             arguments that match its schema.",
+            problems.join("; ")
+        )
+    }
 
+    /// The error `ask` raises once the corrections are spent: a RuntimeError
+    /// whose message starts `WC318:`, with `code` and `problems` attributes.
+    fn mismatch(&self, py: Python<'_>, problems: &[String], elapsed: u64) -> PyErr {
+        self.record("ask_failed", "structured", serde_json::json!({"code": "WC318", "problems": problems}), elapsed);
+        self.app.recorder().record_failure(
+            "behaviour",
+            &format!("ask in behaviour {}", self.behaviour),
+            "WC318",
+            &self.run_id,
+        );
+        let err = PyRuntimeError::new_err(format!(
+            "WC318: the model's answer still did not match the schema after {} correction(s): {}",
+            webcortex_core::agent::MAX_OUTPUT_REPAIRS,
+            problems.join("; ")
+        ));
+        coded(py, err, "WC318", Some(problems))
+    }
+
+    /// The text `ask` returns for an unstructured answer.
+    fn text_answer(&self, py: Python<'_>, response: webcortex_core::agent::ProviderResponse, elapsed: u64) -> PyResult<Py<PyAny>> {
         self.record(
             "ask",
             "text",
@@ -363,6 +451,191 @@ impl BehaviourContext {
         );
         Ok(response.text.into_pyobject(py)?.into_any().unbind())
     }
+
+    /// Send one completion per conversation, at most `limit` at once, each
+    /// under its own model span, bounded by the run's deadline.
+    fn complete_all(
+        &self,
+        py: Python<'_>,
+        def: &AgentDef,
+        conversations: &[Conversation],
+        tools: &[ToolSpec],
+        limit: usize,
+    ) -> Result<Vec<Result<webcortex_core::agent::ProviderResponse, String>>, String> {
+        let provider = self.provider.clone();
+        let structured = !tools.is_empty();
+        let spans: Vec<_> = conversations.iter().map(|_| self.model_span(&def.model)).collect();
+        let waited = py.detach(|| {
+            self.wait(async {
+                use futures::StreamExt;
+                futures::stream::iter(conversations.iter())
+                    .map(|conversation| {
+                        let provider = provider.clone();
+                        async move {
+                            let req = CompletionRequest {
+                                agent: def,
+                                conversation,
+                                tools,
+                                force_tool: if structured { Some(RESPOND) } else { None },
+                                system_suffix: "",
+                            };
+                            provider.complete(&req).await
+                        }
+                    })
+                    .buffered(limit)
+                    .collect::<Vec<_>>()
+                    .await
+            })
+        });
+        match waited {
+            Ok(responses) => {
+                for (span, response) in spans.into_iter().zip(&responses) {
+                    end_model_span(span, response);
+                }
+                Ok(responses)
+            }
+            Err(stopped) => {
+                for span in spans {
+                    end_model_span(span, &Err(stopped.clone()));
+                }
+                Err(stopped)
+            }
+        }
+    }
+
+    /// Ask every prompt, holding structured answers to `schema`: an answer
+    /// that does not match is sent back with what is wrong, at most
+    /// [`MAX_OUTPUT_REPAIRS`](webcortex_core::agent::MAX_OUTPUT_REPAIRS)
+    /// times, as an agent's `output=` answer is. Every response is charged
+    /// before anything is raised; each correction is a step.
+    #[allow(clippy::too_many_arguments)]
+    fn ask_all(
+        &self,
+        py: Python<'_>,
+        prompts: &[String],
+        schema: Option<serde_json::Value>,
+        system: Option<&str>,
+        model: Option<&str>,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        limit: usize,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let def = self.agent_def(model, system, max_tokens, temperature);
+        // A schema is expressed as a single tool the model must use. That is
+        // what turns "please answer as JSON" from a request into a guarantee
+        // — and the runtime checks the answer, because a provider only asks.
+        let tools: Vec<ToolSpec> = match &schema {
+            Some(s) => vec![ToolSpec {
+                name: RESPOND.into(),
+                description: "Respond with structured output in the required shape.".into(),
+                input_schema: s.clone(),
+            }],
+            None => Vec::new(),
+        };
+        let mut conversations: Vec<Conversation> = prompts
+            .iter()
+            .map(|p| Conversation { messages: vec![Message { role: "user".into(), content: serde_json::json!(p) }] })
+            .collect();
+        let mut answers: Vec<Option<Py<PyAny>>> = prompts.iter().map(|_| None).collect();
+        let mut pending: Vec<usize> = (0..prompts.len()).collect();
+        let mut repairs = 0;
+        let started = std::time::Instant::now();
+        loop {
+            let round: Vec<Conversation> = pending.iter().map(|&i| conversations[i].clone()).collect();
+            let responses = match self.complete_all(py, &def, &round, &tools, limit) {
+                Ok(r) => r,
+                Err(stopped) => {
+                    let elapsed = started.elapsed().as_millis() as u64;
+                    self.record("ask_failed", "model", serde_json::json!({"error": &stopped}), elapsed);
+                    return Err(coded(py, BehaviourHalted::new_err(stopped), "WC203", None));
+                }
+            };
+            let elapsed = started.elapsed().as_millis() as u64;
+
+            // Every answer that came back was paid for, so every one is
+            // charged before anything is raised. Settling in order and
+            // stopping at the first failure (or the first answer over budget)
+            // left the rest of the batch out of the ledger and the budget.
+            let mut halted: Option<PyErr> = None;
+            for response in responses.iter().flatten() {
+                if let Err(e) = self.account(response)
+                    && halted.is_none()
+                {
+                    halted = Some(e);
+                }
+            }
+            if let Some(e) = halted {
+                return Err(e);
+            }
+
+            let mut retry = Vec::new();
+            let mut failed: Option<Vec<String>> = None;
+            for (&i, response) in pending.iter().zip(responses) {
+                let response = response.map_err(|e| {
+                    self.record("ask_failed", "model", serde_json::json!({"error": &e}), elapsed);
+                    PyRuntimeError::new_err(e)
+                })?;
+                let Some(schema) = &schema else {
+                    answers[i] = Some(self.text_answer(py, response, elapsed)?);
+                    continue;
+                };
+                match Self::structured(&response, schema) {
+                    Ok(value) => {
+                        self.record("ask", "structured", value.clone(), elapsed);
+                        answers[i] = Some(json_to_py(py, &value)?);
+                    }
+                    Err(problems) if repairs < webcortex_core::agent::MAX_OUTPUT_REPAIRS => {
+                        self.record("ask_rejected", "structured", serde_json::json!({"code": "WC318", "problems": &problems}), elapsed);
+                        conversations[i].messages.extend(webcortex_core::agent::correction_turns(&response, &Self::correction(&problems)));
+                        retry.push(i);
+                    }
+                    Err(problems) => {
+                        failed.get_or_insert(problems);
+                    }
+                }
+            }
+            if let Some(problems) = failed {
+                return Err(self.mismatch(py, &problems, elapsed));
+            }
+            if retry.is_empty() {
+                break;
+            }
+            // Each correction is another model call: one step, and only while
+            // there is budget left to spend.
+            self.ensure_budget()?;
+            for _ in &retry {
+                self.charge_step()?;
+            }
+            repairs += 1;
+            pending = retry;
+        }
+        Ok(answers.into_iter().map(|a| a.expect("every prompt answered")).collect())
+    }
+}
+
+/// The tool a structured `ask` is answered through.
+const RESPOND: &str = "respond";
+
+/// The first `max` characters of `text`, marked when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// `err` with a `code` attribute (and `problems`, when given), so a
+/// behaviour can tell a deadline (`WC203`) or a schema mismatch (`WC318`)
+/// from any other failure without parsing the message.
+fn coded(py: Python<'_>, err: PyErr, code: &str, problems: Option<&[String]>) -> PyErr {
+    let value = err.value(py);
+    let _ = value.setattr("code", code);
+    if let Some(problems) = problems {
+        let _ = value.setattr("problems", problems.to_vec());
+    }
+    err
 }
 
 /// Close a tool call's span with its outcome.
@@ -458,15 +731,24 @@ impl BehaviourContext {
 
         // Release the GIL: the tool call may take real time, and other worker
         // threads must keep running while it does.
-        let result = py.detach(|| {
-            self.handle.block_on(async move {
+        let waited = py.detach(|| {
+            self.wait(async move {
                 app.call_tool_traced(&tool_name, &args, &principal, depth, Some(budget), trace)
                     .await
             })
         });
+        let elapsed = started.elapsed().as_millis() as u64;
+        let result = match waited {
+            Ok(result) => result,
+            Err(stopped) => {
+                end_tool_span(span, &Err(stopped.clone()));
+                self.record("call_failed", tool, serde_json::json!({"error": &stopped}), elapsed);
+                return Err(coded(py, BehaviourHalted::new_err(stopped), "WC203", None));
+            }
+        };
         end_tool_span(span, &result);
 
-        self.settle_call(py, tool, result, started.elapsed().as_millis() as u64)
+        self.settle_call(py, tool, result, elapsed)
     }
 
     /// Call several tools at once and wait for all of them.
@@ -505,18 +787,28 @@ impl BehaviourContext {
         let spans: Vec<_> = names.iter().map(|n| self.tool_span(n)).collect();
         let traces: Vec<_> = spans.iter().map(|s| s.ctx().cloned()).collect();
 
-        let results: Vec<Result<serde_json::Value, String>> = py.detach(|| {
-            self.handle.block_on(async move {
+        let waited = py.detach(|| {
+            self.wait(async move {
                 let futures = calls.iter().zip(traces).map(|((name, args), trace)| {
                     app.call_tool_traced(name, args, &principal, depth, Some(budget.clone()), trace)
                 });
                 futures::future::join_all(futures).await
             })
         });
+        let elapsed = started.elapsed().as_millis() as u64;
+        let results: Vec<Result<serde_json::Value, String>> = match waited {
+            Ok(results) => results,
+            Err(stopped) => {
+                for (span, name) in spans.into_iter().zip(&names) {
+                    end_tool_span(span, &Err(stopped.clone()));
+                    self.record("call_failed", name, serde_json::json!({"error": &stopped}), elapsed);
+                }
+                return Err(coded(py, BehaviourHalted::new_err(stopped), "WC203", None));
+            }
+        };
         for (span, result) in spans.into_iter().zip(&results) {
             end_tool_span(span, result);
         }
-        let elapsed = started.elapsed().as_millis() as u64;
 
         let list = PyList::empty(py);
         let mut first_err: Option<String> = None;
@@ -549,8 +841,11 @@ impl BehaviourContext {
     ///
     /// With `schema`, the model is *forced* to answer in that shape and the
     /// parsed object is returned — so a behaviour's branches can switch on real
-    /// values rather than on parsed prose. `model` may be an alias such as
-    /// `"fast"`: use the cheap tier for classification leaves.
+    /// values rather than on parsed prose. The answer is checked against the
+    /// schema; one that does not match is sent back to the model with what is
+    /// wrong, at most twice, and then a `RuntimeError` (`code == "WC318"`,
+    /// `problems` listing each mismatch) is raised. `model` may be an alias
+    /// such as `"fast"`: use the cheap tier for classification leaves.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (prompt, *, schema = None, system = None, model = None, max_tokens = None, temperature = None))]
     fn ask(
@@ -565,52 +860,13 @@ impl BehaviourContext {
     ) -> PyResult<Py<PyAny>> {
         self.ensure_budget()?;
         self.charge_step()?;
-
         let schema_json = match schema {
             Some(s) => Some(py_to_json(s)?),
             None => None,
         };
-        let def = self.agent_def(model, system, max_tokens, temperature);
-        let mut conversation = Conversation::default();
-        conversation.messages.push(Message {
-            role: "user".into(),
-            content: serde_json::json!(prompt),
-        });
-        // A schema is expressed as a single tool the model must use. That is
-        // what turns "please answer as JSON" from a request into a guarantee.
-        let tools: Vec<ToolSpec> = match &schema_json {
-            Some(s) => vec![ToolSpec {
-                name: "respond".into(),
-                description: "Respond with structured output in the required shape.".into(),
-                input_schema: s.clone(),
-            }],
-            None => Vec::new(),
-        };
-        let structured = schema_json.is_some();
-
-        let started = std::time::Instant::now();
-        let provider = self.provider.clone();
-        let span = self.model_span(&def.model);
-        let response = py.detach(|| {
-            self.handle.block_on(async {
-                let req = CompletionRequest {
-                    agent: &def,
-                    conversation: &conversation,
-                    tools: &tools,
-                    force_tool: if structured { Some("respond") } else { None },
-                    system_suffix: "",
-                };
-                provider.complete(&req).await
-            })
-        });
-        end_model_span(span, &response);
-        let elapsed = started.elapsed().as_millis() as u64;
-
-        let response = response.map_err(|e| {
-            self.record("ask_failed", "model", serde_json::json!({"error": &e}), elapsed);
-            PyRuntimeError::new_err(e)
-        })?;
-        self.settle_ask(py, response, structured, elapsed)
+        let mut answers =
+            self.ask_all(py, &[prompt.to_string()], schema_json, system, model, max_tokens, temperature, 1)?;
+        Ok(answers.remove(0))
     }
 
     /// Ask the model many questions at once.
@@ -619,7 +875,8 @@ impl BehaviourContext {
     /// the answers come back in order. This is the loop
     /// `for ticket in tickets: ctx.ask(...)` collapsed into one wait — the same
     /// tokens, a fraction of the wall-clock. Each prompt is one step and is
-    /// charged like a single `ask`.
+    /// charged like a single `ask`, and each structured answer is checked
+    /// against `schema` the same way.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (prompts, *, schema = None, system = None, model = None, max_tokens = None, temperature = None, concurrency = 8))]
     fn ask_many(
@@ -641,78 +898,11 @@ impl BehaviourContext {
             Some(s) => Some(py_to_json(s)?),
             None => None,
         };
-        let structured = schema_json.is_some();
-        let def = self.agent_def(model, system, max_tokens, temperature);
-        let tools: Vec<ToolSpec> = match &schema_json {
-            Some(s) => vec![ToolSpec {
-                name: "respond".into(),
-                description: "Respond with structured output in the required shape.".into(),
-                input_schema: s.clone(),
-            }],
-            None => Vec::new(),
-        };
-
-        let started = std::time::Instant::now();
-        let provider = self.provider.clone();
         let limit = concurrency.clamp(1, 64);
-        let spans: Vec<_> = prompts.iter().map(|_| self.model_span(&def.model)).collect();
-        let responses = py.detach(|| {
-            self.handle.block_on(async {
-                use futures::StreamExt;
-                let conversations: Vec<Conversation> = prompts
-                    .iter()
-                    .map(|p| Conversation {
-                        messages: vec![Message { role: "user".into(), content: serde_json::json!(p) }],
-                    })
-                    .collect();
-                futures::stream::iter(conversations.iter())
-                    .map(|conversation| {
-                        let provider = provider.clone();
-                        let def = &def;
-                        let tools = &tools;
-                        async move {
-                            let req = CompletionRequest {
-                                agent: def,
-                                conversation,
-                                tools,
-                                force_tool: if structured { Some("respond") } else { None },
-                                system_suffix: "",
-                            };
-                            provider.complete(&req).await
-                        }
-                    })
-                    .buffered(limit)
-                    .collect::<Vec<_>>()
-                    .await
-            })
-        });
-        let elapsed = started.elapsed().as_millis() as u64;
-        for (span, response) in spans.into_iter().zip(&responses) {
-            end_model_span(span, response);
-        }
-
-        // Every answer that came back was paid for, so every one is charged
-        // before anything is raised. Settling in order and stopping at the
-        // first failure (or the first answer over budget) left the rest of
-        // the batch out of the ledger and the shared budget.
-        let mut halted: Option<PyErr> = None;
-        for response in responses.iter().flatten() {
-            if let Err(e) = self.account(response)
-                && halted.is_none()
-            {
-                halted = Some(e);
-            }
-        }
-        if let Some(e) = halted {
-            return Err(e);
-        }
+        let answers = self.ask_all(py, &prompts, schema_json, system, model, max_tokens, temperature, limit)?;
         let list = PyList::empty(py);
-        for response in responses {
-            let response = response.map_err(|e| {
-                self.record("ask_failed", "model", serde_json::json!({"error": &e}), elapsed);
-                PyRuntimeError::new_err(e)
-            })?;
-            list.append(self.answer(py, response, structured, elapsed)?)?;
+        for answer in answers {
+            list.append(answer)?;
         }
         Ok(list.into_any().unbind())
     }
@@ -739,12 +929,17 @@ impl BehaviourContext {
         let app = self.app.clone();
         let principal = self.principal.clone();
         let input = self.input.clone();
-        let result = py.detach(|| {
-            self.handle.block_on(async move {
-                webcortex_core::context::resolve_one(&app, &def, &principal, &input).await
-            })
+        let waited = py.detach(|| {
+            self.wait(async move { webcortex_core::context::resolve_one(&app, &def, &principal, &input).await })
         });
         let elapsed = started.elapsed().as_millis() as u64;
+        let result = match waited {
+            Ok(result) => result,
+            Err(stopped) => {
+                self.record("context_failed", name, serde_json::json!({"error": &stopped}), elapsed);
+                return Err(coded(py, BehaviourHalted::new_err(stopped), "WC203", None));
+            }
+        };
         match result {
             Ok(value) => {
                 self.record("context", name, serde_json::json!({"chars": value.to_string().len()}), elapsed);

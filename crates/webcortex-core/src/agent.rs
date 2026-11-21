@@ -315,6 +315,12 @@ pub struct SuspendedRun {
 }
 
 impl SuspendedRun {
+    /// The root principal whose run this is: the human or service behind
+    /// any chain of agents. Approval quotas are counted per root.
+    pub fn root(&self) -> &str {
+        self.state.caller.root_id()
+    }
+
     pub fn summary(&self) -> Value {
         json!({
             "approval_id": self.approval_id,
@@ -491,6 +497,7 @@ impl AgentRuntime {
             &format!("agent {}", def.name),
         );
         let trace_id = span.as_ref().map(|s| s.trace_id.to_string());
+        crate::app::note_edge_trace(opts.depth, span.as_ref());
 
         let system_suffix = match self.system_suffix(app, def, &actor, input, def.output_schema.is_some()).await {
             Ok(s) => s,
@@ -932,12 +939,50 @@ impl AgentRuntime {
             }
 
             // 3. Does it need a human?
-            let route_approval = app
-                .route_for_tool(&call.name)
-                .map(|r| r.approval)
-                .unwrap_or(Approval::Never);
+            let route = app.route_for_tool(&call.name);
+            let route_approval = route.map(|r| r.approval).unwrap_or(Approval::Never);
             if route_approval == Approval::Required {
+                // A human is asked only for a call the run could then make.
+                // The gated route's scopes are checked against the run's own
+                // authority first: through 2.8.0 the approval was requested,
+                // granted, and the call then failed on a scope the agent never
+                // held — with a hint blaming the caller's key.
+                let missing = route.map(|r| st.actor.missing_scopes(&App::scopes_of(r))).unwrap_or_default();
+                if !missing.is_empty() {
+                    let hint = crate::app::scope_hint(&st.actor, &missing);
+                    let msg = format!(
+                        "tool {:?} needs scope(s) {} that this run does not hold, so it was not \
+                         sent for approval (WC602). {hint}",
+                        call.name,
+                        missing.join(", "),
+                    );
+                    let mut step = refused(st.usage.steps, call, &msg, started);
+                    step.code = Some("WC602".into());
+                    step.hint = Some(hint);
+                    st.steps.push(step);
+                    app.tracer().event(st.span.as_ref(), "tool", &format!("tool {}", call.name), Some("WC602"), vec![]);
+                    app.recorder().record_failure("tool", &format!("tool {} (agent {})", call.name, st.def.name), "WC602", &st.run_id);
+                    self.audit.record(AuditEvent::tool_refused(&st.run_id, &st.actor, &call.name, &msg));
+                    results.push(tool_result(&call.id, &json!({"error": msg}), true));
+                    continue;
+                }
                 return CallsOutcome::Suspended { gated: i, results };
+            }
+            // A flow that would run a gated tool as a step cannot be approved
+            // as a whole (it refuses the step itself); refused here so the
+            // model is told why. Manifest validation keeps such flows out.
+            if let Some(gated) = app.gated_tool_behind(&call.name) {
+                let msg = format!(
+                    "tool {:?} runs the approval-gated tool {gated:?} as a flow step, which no human \
+                     can approve (WC309); call {gated:?} directly instead",
+                    call.name
+                );
+                let mut step = refused(st.usage.steps, call, &msg, started);
+                step.code = Some("WC309".into());
+                st.steps.push(step);
+                self.audit.record(AuditEvent::tool_refused(&st.run_id, &st.actor, &call.name, &msg));
+                results.push(tool_result(&call.id, &json!({"error": msg}), true));
+                continue;
             }
 
             // 4. Dispatch in-process, under delegated authority and the shared
@@ -1228,6 +1273,10 @@ impl AgentRuntime {
     fn specs_for(&self, app: &App, st: &RunState) -> Vec<ToolSpec> {
         let mut specs = self.tool_specs(app, &st.def);
         if let Some(schema) = &st.entry.output_schema {
+            // One tool of each name, whatever the manifest says: providers
+            // refuse a request with two, and every call to this name is the
+            // answer anyway (see `execute_calls`).
+            specs.retain(|s| s.name != FINAL_TOOL);
             specs.push(ToolSpec {
                 name: FINAL_TOOL.into(),
                 description: "Give the final answer. Call this exactly once, when the work is done; \
@@ -1410,7 +1459,7 @@ impl AgentRuntime {
         app.ledger().count_run();
         if status != RunStatus::AwaitingApproval
             && let Some(key) = &st.session_key {
-                app.sessions().save(key.clone(), st.conversation.clone());
+                app.sessions().save_for(key.clone(), st.caller.root_id(), st.conversation.clone());
             }
         for step in &mut st.steps {
             if let (Some(code), None) = (&step.code, &step.hint) {
@@ -1577,6 +1626,33 @@ pub fn tool_result_with_images(id: &str, content: &Value, is_error: bool, images
         result["content"] = Value::Array(blocks);
     }
     result
+}
+
+/// The turns that send a rejected structured answer back to a model, outside
+/// the agent loop (a behaviour's `ctx.ask(schema=...)`): the model's own turn
+/// as it is replayed, then what it is told — `correction` as the result of
+/// every tool call it made, or as a user message when it answered in text.
+/// Every call gets a result, which both wire formats require.
+pub fn correction_turns(response: &ProviderResponse, correction: &str) -> Vec<Message> {
+    let has_tool_use = |c: &Value| {
+        c.as_array().is_some_and(|bs| bs.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use")))
+    };
+    // Tool results answer the calls only when the replayed turn carries them;
+    // otherwise the calls are dropped from it and the model is told in text.
+    let replay_calls = !response.tool_calls.is_empty() && has_tool_use(&response.raw_content);
+    let mut turns = Vec::with_capacity(2);
+    if let Some(content) = replayable(&response.raw_content, replay_calls) {
+        turns.push(Message { role: "assistant".into(), content });
+    }
+    let told = if replay_calls {
+        Value::Array(
+            response.tool_calls.iter().map(|c| tool_result(&c.id, &json!({"error": correction}), true)).collect(),
+        )
+    } else {
+        json!(correction)
+    };
+    turns.push(Message { role: "user".into(), content: told });
+    turns
 }
 
 /// An assistant turn as it is kept in the conversation: without `tool_use`
@@ -1772,6 +1848,131 @@ mod tests {
         // And the conversation the model saw carried every tool_result.
         assert!(audit.contains("approval_decided"));
         assert!(app.pending_approvals().is_empty(), "consumed on resume");
+    }
+
+    #[tokio::test]
+    async fn approval_is_not_asked_for_a_call_the_run_could_never_make() {
+        // The agent holds only "read"; the gated tool needs "admin". The caller
+        // holds both, but an agent is a delegate: approving the call could
+        // never let it run. 2.8.0 asked a human anyway, then failed the call
+        // with a hint telling the caller to get a key it already had.
+        let m: Manifest = serde_json::from_value(json!({
+            "name": "t",
+            "routes": [
+                {"id": 0, "method": "POST", "path": "/purge", "op": {"kind": "static", "body": {"purged": true}},
+                 "tool": {"expose": true, "name": "purge"}, "approval": "required", "scopes": ["admin"]}
+            ],
+            "agents": [
+                {"name": "reader", "model": "test", "tools": ["purge"], "scopes": ["read"], "max_steps": 3},
+                {"name": "admin", "model": "test", "tools": ["purge"], "scopes": ["read", "admin"], "max_steps": 3}
+            ]
+        }))
+        .unwrap();
+        let build = |p: ScriptedProvider| {
+            let m = m.clone();
+            async move {
+                let app = App::build_without_python(m).await.expect("app");
+                let rt = AgentRuntime::new(Arc::new(p), Arc::new(MemoryAudit::default()));
+                app.with_agent_runtime(rt).into_arc()
+            }
+        };
+        let app = build(ScriptedProvider::tool_then_text("purge", json!({}), "could not")).await;
+        let out = run(&app, "reader", &caller(&["read", "admin"]), "purge it").await;
+        assert_eq!(out.status, RunStatus::Completed, "{:?}", out.steps);
+        assert!(out.pending_approval.is_none());
+        assert!(app.pending_approvals().is_empty(), "no approval was created");
+        let refused = out.steps.iter().find(|s| s.kind == StepKind::ToolRefused).expect("refused at once");
+        assert_eq!(refused.code.as_deref(), Some("WC602"));
+        let hint = refused.hint.clone().unwrap_or_default();
+        assert!(hint.contains("\"reader\"") && hint.contains("scopes="), "{hint}");
+
+        // The same tool, from an agent that holds the scope, waits for a human.
+        let app = build(ScriptedProvider::tool_then_text("purge", json!({}), "done")).await;
+        let out = run(&app, "admin", &caller(&["read", "admin"]), "purge it").await;
+        assert_eq!(out.status, RunStatus::AwaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn one_caller_flooding_approvals_evicts_only_its_own() {
+        // Through 2.8.0 the store evicted the oldest approval of anyone's, so
+        // a thousand suspended runs from one caller threw away everyone else's.
+        let (app, _, _) = app_with(ScriptedProvider::always_tool("danger", json!({}))).await;
+        let who = |id: &str| Principal {
+            id: id.into(),
+            kind: crate::auth::PrincipalKind::ApiKey,
+            scopes: vec![],
+            claims: Default::default(),
+        };
+        let alice = run(&app, "a", &who("alice"), "x").await;
+        let alice_id = alice.pending_approval.expect("suspended").approval_id;
+        for _ in 0..(crate::app::MAX_APPROVALS_PER_PRINCIPAL + 20) {
+            assert_eq!(run(&app, "a", &who("mallory"), "x").await.status, RunStatus::AwaitingApproval);
+        }
+        let pending = app.pending_approvals();
+        assert!(pending.iter().any(|p| p["approval_id"] == json!(alice_id)), "alice's approval survived");
+        let mallory = pending.iter().filter(|p| p["caller"] == "mallory").count();
+        assert_eq!(mallory, crate::app::MAX_APPROVALS_PER_PRINCIPAL);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_answer_is_replayed_with_a_result_for_every_call() {
+        let tool_answer = ProviderResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall { id: "c1".into(), name: "respond".into(), arguments: json!({"n": "x"}) }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            model: "m".into(),
+            raw_content: json!([{"type": "tool_use", "id": "c1", "name": "respond", "input": {"n": "x"}}]),
+        };
+        let turns = correction_turns(&tool_answer, "fix it");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "assistant");
+        assert_eq!(turns[1].content[0]["type"], "tool_result");
+        assert_eq!(turns[1].content[0]["tool_use_id"], "c1");
+        assert!(turns[1].content[0]["content"].as_str().unwrap().contains("fix it"));
+        // An answer in prose is told in prose.
+        let prose = ProviderResponse {
+            text: "n is x".into(),
+            tool_calls: vec![],
+            stop_reason: StopReason::EndTurn,
+            raw_content: json!([{"type": "text", "text": "n is x"}]),
+            ..tool_answer.clone()
+        };
+        let turns = correction_turns(&prose, "fix it");
+        assert_eq!(turns[1].content, json!("fix it"));
+        // A call the replayed turn does not carry gets no orphan result.
+        let bare = ProviderResponse { raw_content: json!("n is x"), ..tool_answer };
+        let turns = correction_turns(&bare, "fix it");
+        assert_eq!(turns.last().unwrap().content, json!("fix it"));
+    }
+
+    #[tokio::test]
+    async fn the_answer_tool_is_offered_once_even_beside_a_route_of_that_name() {
+        // Manifest validation refuses this pairing; an agent definition built
+        // in code is held to one tool per name all the same.
+        let m: Manifest = serde_json::from_value(json!({
+            "name": "t",
+            "routes": [{"id": 0, "method": "POST", "path": "/final", "op": {"kind": "static", "body": {}},
+                        "tool": {"expose": true, "name": FINAL_TOOL}}]
+        }))
+        .unwrap();
+        let provider = Arc::new(ScriptedProvider::tool_then_text(FINAL_TOOL, json!({"n": 1}), "x"));
+        let app = App::build_without_python(m).await.expect("app")
+            .with_agent_runtime(AgentRuntime::new(provider.clone(), Arc::new(MemoryAudit::default())))
+            .into_arc();
+        let def: AgentDef = serde_json::from_value(json!({
+            "name": "typed", "model": "test", "tools": [FINAL_TOOL],
+            "output_schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
+        }))
+        .unwrap();
+        let out = app.agent_runtime().unwrap().run(&app, &def, &caller(&[]), "go", RunOptions::default()).await;
+        assert_eq!(out.status, RunStatus::Completed);
+        assert_eq!(out.data, Some(json!({"n": 1})));
+        let names = &provider.snapshots()[0].tool_names;
+        assert_eq!(names.iter().filter(|n| *n == FINAL_TOOL).count(), 1, "{names:?}");
     }
 
     #[tokio::test]

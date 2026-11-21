@@ -12,13 +12,13 @@
 //! Steps 1–4 run for the control plane too. An unauthenticated MCP endpoint
 //! would hand an attacker every tool in the application.
 
-use crate::app::App;
+use crate::app::{App, Reply};
 use crate::auth::Principal;
 use crate::http::{WebCortexRequest, WebCortexResponse, parse_query_pairs};
 use crate::{mcp, middleware, openapi};
 use bytes::Bytes;
 use futures::FutureExt;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use std::panic::AssertUnwindSafe;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -93,10 +93,20 @@ const DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_HEADER_READ_SECS: u64 = 30;
 
 /// The header read timeout for this app: its request timeout, at most
-/// [`MAX_HEADER_READ_SECS`], at least one second.
+/// [`MAX_HEADER_READ_SECS`], at least one second. It is also the send
+/// deadline: how long a response body may go without the client taking any
+/// of it before the connection is closed.
 fn header_read_timeout(request_timeout_secs: u64) -> std::time::Duration {
     std::time::Duration::from_secs(request_timeout_secs.clamp(1, MAX_HEADER_READ_SECS))
 }
+
+/// The most concurrent streams one HTTP/2 connection may open. Each can hold
+/// a response being sent; hyper's default allowed 200.
+const MAX_H2_STREAMS: u32 = 64;
+
+/// How a response body is handed to hyper: in pieces of this size, so that
+/// taking each one is evidence the client is reading (see [`OutBody`]).
+const BODY_CHUNK: usize = 64 * 1024;
 
 pub async fn serve(app: Arc<App>) -> Result<(), String> {
     serve_with_shutdown(app, shutdown_signal()).await
@@ -207,8 +217,13 @@ where
                         let app = app.clone();
                         let client_ip = peer.ip().to_string();
                         let busy = in_service.begin();
+                        let activity = in_service.clone();
                         async move {
-                            let res = handle(app, req, client_ip).await;
+                            let mut res = handle(app, req, client_ip).await;
+                            // The connection stays busy until the client has
+                            // taken the whole body, not merely until it was
+                            // built: hyper writes it after this returns.
+                            res.body_mut().arm(activity.start_sending());
                             drop(busy);
                             Ok::<_, Infallible>(res)
                         }
@@ -217,7 +232,14 @@ where
                     // hyper applies a header read timeout only when it has a
                     // timer; without one, slow or silent clients were held forever.
                     builder.http1().timer(TokioTimer::new()).header_read_timeout(header_timeout);
-                    builder.http2().timer(TokioTimer::new());
+                    // Keep-alive pings find a peer that has gone without
+                    // closing; the stream cap bounds what one connection holds.
+                    builder
+                        .http2()
+                        .timer(TokioTimer::new())
+                        .max_concurrent_streams(MAX_H2_STREAMS)
+                        .keep_alive_interval(Some(header_timeout))
+                        .keep_alive_timeout(header_timeout);
                     let conn = builder.serve_connection_with_upgrades(io, svc);
                     tokio::pin!(conn);
                     // hyper's header timeout covers HTTP/1 only. An HTTP/2
@@ -227,23 +249,41 @@ where
                     // piled up past every timeout. A connection with nothing
                     // in flight and no bytes moving for the header timeout is
                     // now closed, whatever its protocol.
+                    //
+                    // A response the client does not read is bounded too.
+                    // Through 2.8.0 any byte moved counted as activity, so a
+                    // client that opened HTTP/2 streams with a zero window
+                    // and pinged, or read 4 KB every few seconds, held every
+                    // response it asked for in memory indefinitely. Now each
+                    // response body must make progress — the client taking
+                    // a piece of it — within the header timeout, or the
+                    // connection is closed; reads and pings do not count.
                     let tick = (header_timeout / 4).max(std::time::Duration::from_millis(250));
+                    let mut draining = false;
+                    let mut cut_off_at: Option<tokio::time::Instant> = None;
                     let result = loop {
                         tokio::select! {
                             r = conn.as_mut() => break r,
-                            _ = stop.changed() => {
+                            _ = stop.changed(), if !draining => {
                                 // Finish the request in flight, answer it with
                                 // `connection: close`, and close an idle one now.
                                 conn.as_mut().graceful_shutdown();
-                                break conn.await;
+                                draining = true;
                             }
                             _ = tokio::time::sleep(tick) => {
-                                if activity.idle_for() >= header_timeout {
+                                if activity.send_stalled_for().is_some_and(|d| d >= header_timeout) {
+                                    tracing::debug!(%peer, stalled_secs = header_timeout.as_secs(),
+                                                    "a response was not read; connection closed");
+                                    break Ok(());
+                                }
+                                if cut_off_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                                    break Ok(());
+                                }
+                                if !draining && activity.idle_for() >= header_timeout {
                                     tracing::debug!(%peer, "idle connection closed");
                                     conn.as_mut().graceful_shutdown();
-                                    break tokio::time::timeout(header_timeout, conn.as_mut())
-                                        .await
-                                        .unwrap_or(Ok(()));
+                                    draining = true;
+                                    cut_off_at = Some(tokio::time::Instant::now() + header_timeout);
                                 }
                             }
                         }
@@ -286,12 +326,15 @@ where
     Ok(())
 }
 
-/// What a connection is doing: when bytes last moved, and how many requests
-/// are being handled on it. Idle means neither, for a while.
+/// What a connection is doing: when bytes last moved, how many requests are
+/// being handled on it, and the response bodies still being sent. Idle means
+/// none of those, for a while.
 struct Activity {
     epoch: std::time::Instant,
     last_ms: std::sync::atomic::AtomicU64,
     in_flight: std::sync::atomic::AtomicUsize,
+    /// One clock per response body not yet taken whole by the client.
+    sending: std::sync::Mutex<Vec<std::sync::Weak<BodyClock>>>,
 }
 
 /// Held while a request is being handled.
@@ -304,18 +347,46 @@ impl Drop for Busy {
     }
 }
 
+/// When a response body last made progress: the client took a piece of it.
+struct BodyClock {
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+/// Held by a response body until the client has taken all of it (or the
+/// body is dropped): the connection is busy, and on the send deadline, until then.
+struct Sending {
+    activity: Arc<Activity>,
+    clock: Arc<BodyClock>,
+}
+
+impl Sending {
+    fn progress(&self) {
+        self.clock.last_ms.store(self.activity.now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        self.activity.touch();
+    }
+}
+
 impl Activity {
     fn new() -> Self {
         Self {
             epoch: std::time::Instant::now(),
             last_ms: std::sync::atomic::AtomicU64::new(0),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
+            sending: std::sync::Mutex::new(Vec::new()),
         }
     }
 
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
     fn touch(&self) {
-        let now = self.epoch.elapsed().as_millis() as u64;
-        self.last_ms.store(now, std::sync::atomic::Ordering::Relaxed);
+        self.last_ms.store(self.now_ms(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn begin(self: &Arc<Self>) -> Busy {
@@ -324,14 +395,130 @@ impl Activity {
         Busy(self.clone())
     }
 
-    /// How long the connection has had nothing in flight and moved no bytes.
+    /// Start the send clock of a response body that is about to be written.
+    fn start_sending(self: &Arc<Self>) -> Sending {
+        let clock = Arc::new(BodyClock { last_ms: std::sync::atomic::AtomicU64::new(self.now_ms()) });
+        let mut sending = self.sending.lock().unwrap_or_else(|p| p.into_inner());
+        sending.retain(|c| c.strong_count() > 0);
+        sending.push(Arc::downgrade(&clock));
+        Sending { activity: self.clone(), clock }
+    }
+
+    /// How long the most stalled response body on this connection has gone
+    /// without progress; `None` when no body is being sent.
+    fn send_stalled_for(&self) -> Option<std::time::Duration> {
+        let mut sending = self.sending.lock().unwrap_or_else(|p| p.into_inner());
+        sending.retain(|c| c.strong_count() > 0);
+        let oldest = sending
+            .iter()
+            .filter_map(|c| c.upgrade())
+            .map(|c| c.last_ms.load(std::sync::atomic::Ordering::Relaxed))
+            .min()?;
+        Some(std::time::Duration::from_millis(self.now_ms().saturating_sub(oldest)))
+    }
+
+    /// How long the connection has had nothing in flight, nothing being
+    /// sent, and moved no bytes.
     fn idle_for(&self) -> std::time::Duration {
-        if self.in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        if self.in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 || self.send_stalled_for().is_some() {
             return std::time::Duration::ZERO;
         }
         let last = self.last_ms.load(std::sync::atomic::Ordering::Relaxed);
-        let now = self.epoch.elapsed().as_millis() as u64;
-        std::time::Duration::from_millis(now.saturating_sub(last))
+        std::time::Duration::from_millis(self.now_ms().saturating_sub(last))
+    }
+}
+
+/// A response body: bytes already in memory, or a static file read from disk
+/// as the client takes it. Handed to hyper a [`BODY_CHUNK`] at a time, and
+/// each piece taken is recorded as progress on the body's send clock — which
+/// is what the send deadline watches, rather than any byte moving.
+pub struct OutBody {
+    source: Source,
+    /// Bytes still to send: the body's exact length, for `content-length`.
+    remaining: u64,
+    sending: Option<Sending>,
+}
+
+enum Source {
+    Bytes(Bytes),
+    File { file: tokio::fs::File, buf: Vec<u8> },
+}
+
+impl OutBody {
+    fn bytes(body: Bytes) -> Self {
+        Self { remaining: body.len() as u64, source: Source::Bytes(body), sending: None }
+    }
+
+    fn file(file: std::fs::File, len: u64) -> Self {
+        Self {
+            remaining: len,
+            source: Source::File { file: tokio::fs::File::from_std(file), buf: Vec::new() },
+            sending: None,
+        }
+    }
+
+    /// Hold the connection's send clock until the body is done.
+    fn arm(&mut self, sending: Sending) {
+        if self.remaining > 0 {
+            self.sending = Some(sending);
+        }
+    }
+
+    fn took(&mut self, n: usize) {
+        self.remaining = self.remaining.saturating_sub(n as u64);
+        if let Some(s) = &self.sending {
+            s.progress();
+        }
+        if self.remaining == 0 {
+            self.sending = None;
+        }
+    }
+}
+
+impl hyper::body::Body for OutBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+        use std::task::Poll;
+        let this = &mut *self;
+        if this.remaining == 0 {
+            this.sending = None;
+            return Poll::Ready(None);
+        }
+        let want = BODY_CHUNK.min(usize::try_from(this.remaining).unwrap_or(BODY_CHUNK));
+        let chunk = match &mut this.source {
+            Source::Bytes(bytes) => bytes.split_to(want.min(bytes.len())),
+            Source::File { file, buf } => {
+                buf.resize(want, 0);
+                let mut read = tokio::io::ReadBuf::new(buf);
+                match tokio::io::AsyncRead::poll_read(std::pin::Pin::new(file), cx, &mut read) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                    Poll::Ready(Ok(())) => Bytes::copy_from_slice(read.filled()),
+                }
+            }
+        };
+        if chunk.is_empty() {
+            // The file shrank after its length was sent.
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the file got shorter while it was being sent",
+            ))));
+        }
+        this.took(chunk.len());
+        Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.remaining)
     }
 }
 
@@ -443,7 +630,7 @@ async fn shutdown_signal() {
     }
 }
 
-async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Response<Full<Bytes>> {
+async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Response<OutBody> {
     let started = std::time::Instant::now();
     // The server speaks plain HTTP; TLS ends at a proxy, which says so. A
     // forged header only earns its sender an HSTS header their own browser
@@ -478,7 +665,7 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
         .catch_unwind()
         .await;
 
-    let (mut res, principal_id) = match outcome {
+    let (reply, principal_id) = match outcome {
         Ok(v) => v,
         Err(payload) => {
             let detail = panic_message(&payload);
@@ -490,10 +677,14 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
                 "request handler panicked; returning 500"
             );
             (
-                WebCortexResponse::coded(500, "WC001", "internal error"),
+                Reply::Full(WebCortexResponse::coded(500, "WC001", "internal error")),
                 "panic".to_string(),
             )
         }
+    };
+    let (mut res, mut file) = match reply {
+        Reply::Full(res) => (res, None),
+        Reply::File { head, file, len } => (head, Some((file, len))),
     };
 
     strip_framing_headers(&mut res);
@@ -511,6 +702,7 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
             "handler produced a response that cannot be sent; returning 500"
         );
         res = WebCortexResponse::coded(500, "WC001", format!("the handler's response could not be sent: {problem}"));
+        file = None;
     }
 
     // Applied on every exit path, including errors and rejections. The id is
@@ -551,7 +743,7 @@ async fn handle(app: Arc<App>, req: Request<Incoming>, client_ip: String) -> Res
         elapsed_us,
         "request"
     );
-    to_hyper(res)
+    to_hyper(res, file)
 }
 
 async fn route_request(
@@ -559,7 +751,7 @@ async fn route_request(
     mut req: Request<Incoming>,
     client_ip: &str,
     request_id: &str,
-) -> (WebCortexResponse, String) {
+) -> (Reply, String) {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
@@ -586,11 +778,11 @@ async fn route_request(
     if preflight && app.manifest.cors.enabled {
         if let Some(cors_headers) = app.cors.preflight(origin.as_deref()) {
             return (
-                WebCortexResponse { status: 204, headers: cors_headers, body: Bytes::new() },
+                Reply::Full(WebCortexResponse { status: 204, headers: cors_headers, body: Bytes::new() }),
                 "-".into(),
             );
         }
-        return (WebCortexResponse::coded(403, "WC606", "origin not allowed"), "-".into());
+        return (Reply::Full(WebCortexResponse::coded(403, "WC606", "origin not allowed")), "-".into());
     }
 
     // 1b. Cross-origin protection. A browser sends a "simple" cross-site POST
@@ -613,19 +805,24 @@ async fn route_request(
             );
             let mut res = WebCortexResponse::coded(403, "WC605", "cross-origin request refused");
             finish_cors(app, &mut res, origin.as_deref());
-            return (res, "-".into());
+            return (Reply::Full(res), "-".into());
         }
     }
 
     // A browser cannot set headers on a WebSocket, so an upgrade may carry its
-    // key in the query string instead. Only for upgrades, and only when no
-    // header credential is present; the request log records the path, never
-    // the query.
+    // credential in the query string instead. Only for upgrades, and only when
+    // no header credential is present; the request log records the path,
+    // never the query. A bearer token (RFC 6750 §2.3) is read as one when the
+    // app accepts them; anything else is an API key.
     if upgrade {
         let key_header = app.authenticator.api_key_header().to_string();
         if !headers.contains_key(&key_header) && !headers.contains_key("authorization")
             && let Some(token) = query.get("access_token") {
-                headers.insert(key_header, token.clone());
+                if app.authenticator.accepts_bearer_tokens() && crate::auth::looks_like_jwt(token) {
+                    headers.insert("authorization".into(), format!("Bearer {token}"));
+                } else {
+                    headers.insert(key_header, token.clone());
+                }
             }
     }
 
@@ -641,7 +838,7 @@ async fn route_request(
                 if !decision.allowed {
                     let mut res = rate_limited(&decision);
                     finish_cors(app, &mut res, origin.as_deref());
-                    return (res, "invalid".into());
+                    return (Reply::Full(res), "invalid".into());
                 }
             }
             let mut res = WebCortexResponse::coded(e.status(), "WC603", e.message());
@@ -650,31 +847,33 @@ async fn route_request(
                 "Bearer realm=\"webcortex\"".into(),
             ));
             finish_cors(app, &mut res, origin.as_deref());
-            return (res, "invalid".into());
+            return (Reply::Full(res), "invalid".into());
         }
     };
     let principal_id = principal.id.clone();
 
     // 3. Rate limit, keyed by principal so one tenant cannot exhaust another,
     //    falling back to client IP for anonymous traffic.
+    let rate_key = if principal.is_anonymous() {
+        format!("ip:{client_ip}")
+    } else {
+        format!("id:{}", principal.id)
+    };
     if let Some(limiter) = &app.rate_limiter {
-        let key = if principal.is_anonymous() {
-            format!("ip:{client_ip}")
-        } else {
-            format!("id:{}", principal.id)
-        };
-        let decision = limiter.check(&key);
+        let decision = limiter.check(&rate_key);
         if !decision.allowed {
             let mut res = rate_limited(&decision);
             finish_cors(app, &mut res, origin.as_deref());
-            return (res, principal_id);
+            return (Reply::Full(res), principal_id);
         }
     }
 
     if upgrade {
-        let mut res = crate::ws::accept(app.clone(), &mut req, &headers, &path, &query, principal);
+        // The socket charges each agent turn after the first to the same bucket.
+        let rate_key = app.rate_limiter.is_some().then_some(rate_key);
+        let mut res = crate::ws::accept(app.clone(), &mut req, &headers, &path, &query, principal, rate_key);
         finish_cors(app, &mut res, origin.as_deref());
-        return (res, principal_id);
+        return (Reply::Full(res), principal_id);
     }
 
     // A model loop routinely outlasts an ordinary handler's ceiling, and a
@@ -686,6 +885,26 @@ async fn route_request(
         limits.request_timeout_secs
     };
 
+    // 4. Refuse what can be refused without the body — no route, a method
+    //    the route does not take, a scope the caller lacks, the e-stop, the
+    //    control plane's admin scope — before reading a byte of it. Through
+    //    2.8.0 up to 32 MB was buffered (and `100 Continue` sent) first, from
+    //    anyone, for a request that was always going to be refused.
+    let control = control_path(&path, &app.manifest.server.control_prefix);
+    let refused = match control {
+        Some(rest) => control_refusal(app, rest, &principal),
+        None => app.refusal(&method, &path, &principal),
+    };
+    if let Some(mut res) = refused {
+        // An unread body leaves the connection unusable for another request.
+        use hyper::body::Body as _;
+        if req.version() < hyper::Version::HTTP_2 && !req.body().is_end_stream() {
+            res.headers.push(("connection".into(), "close".into()));
+        }
+        finish_cors(app, &mut res, origin.as_deref());
+        return (Reply::Full(res), principal_id);
+    }
+
     // The body is read under the same limit: a client that announces a body
     // and then sends it a byte at a time must not hold the request open.
     let body_timeout = std::time::Duration::from_secs(secs.max(1));
@@ -693,22 +912,26 @@ async fn route_request(
         Ok(Ok(b)) => b,
         Ok(Err(mut res)) => {
             finish_cors(app, &mut res, origin.as_deref());
-            return (res, principal_id);
+            return (Reply::Full(res), principal_id);
         }
         Err(_) => {
             let mut res =
                 WebCortexResponse::coded(408, "WC216", "the request body did not arrive within the request timeout");
             res.headers.push(("connection".into(), "close".into()));
             finish_cors(app, &mut res, origin.as_deref());
-            return (res, principal_id);
+            return (Reply::Full(res), principal_id);
         }
     };
 
-    let mut res = if let Some(rest) = control_path(&path, &app.manifest.server.control_prefix) {
-        control_plane(app, &method, rest, &body, &principal, request_id).await
+    let mut reply = if let Some(rest) = control {
+        Reply::Full(control_plane(app, &method, rest, &body, &principal, request_id).await)
     } else {
         let timeout = std::time::Duration::from_secs(secs);
-        let dispatch = app.dispatch(WebCortexRequest {
+        // The run a request starts writes its trace id here, so a 504 can
+        // still name it: the run's own response, which carries the header,
+        // is never built once the timeout drops it.
+        let edge_trace = crate::app::EdgeTrace::default();
+        let dispatch = crate::app::with_edge_trace(edge_trace.clone(), app.dispatch_reply(WebCortexRequest {
             method,
             path,
             path_params: Default::default(),
@@ -721,16 +944,41 @@ async fn route_request(
             depth: 0,
             budget: None,
             trace: None,
-        });
+        }));
         // A handler that hangs must not hold a connection forever.
         match tokio::time::timeout(timeout, dispatch).await {
             Ok(r) => r,
-            Err(_) => WebCortexResponse::coded(504, "WC203", "handler exceeded the request timeout"),
+            Err(_) => {
+                let trace = edge_trace.lock().unwrap_or_else(|p| p.into_inner()).take();
+                Reply::Full(timed_out(trace))
+            }
         }
     };
 
-    finish_cors(app, &mut res, origin.as_deref());
-    (res, principal_id)
+    match &mut reply {
+        Reply::Full(res) | Reply::File { head: res, .. } => finish_cors(app, res, origin.as_deref()),
+    }
+    (reply, principal_id)
+}
+
+/// The 504 for a request that outlasted its timeout. When it had started an
+/// agent, flow or behaviour run, the run's trace (which records the
+/// cancellation) is named in `x-webcortex-trace` and as `error.trace_id`.
+fn timed_out(trace: Option<String>) -> WebCortexResponse {
+    let message = "handler exceeded the request timeout";
+    let Some(id) = trace else {
+        return WebCortexResponse::coded(504, "WC203", message);
+    };
+    let mut res = WebCortexResponse::json(
+        504,
+        &serde_json::json!({"error": {
+            "status": 504, "message": message, "code": "WC203",
+            "hint": crate::errors::hint("WC203"), "trace_id": id,
+        }}),
+    );
+    res.headers.push(("x-webcortex-error".into(), "WC203".into()));
+    res.headers.push(("x-webcortex-trace".into(), id));
+    res
 }
 
 fn rate_limited(decision: &middleware::RateDecision) -> WebCortexResponse {
@@ -958,15 +1206,8 @@ async fn control_plane(
     request_id: &str,
 ) -> WebCortexResponse {
     let auth_configured = !app.manifest.auth.api_keys.is_empty() || app.manifest.auth.jwt.is_some();
-    let admin_required = auth_configured && rest != "/health";
-    if admin_required && !principal.has_scope("webcortex:admin") {
-        let status = if principal.is_anonymous() { 401 } else { 403 };
-        let code = if status == 401 { "WC604" } else { "WC602" };
-        return WebCortexResponse::coded(
-            status,
-            code,
-            "the webcortex control plane requires the 'webcortex:admin' scope",
-        );
+    if let Some(refused) = control_refusal(app, rest, principal) {
+        return refused;
     }
 
     // HEAD is GET without the body; hyper drops the body.
@@ -1210,6 +1451,19 @@ async fn control_plane(
     }
 }
 
+/// The refusal for a control-plane request the caller may not make: every
+/// endpoint but `/health` needs `webcortex:admin` once any authentication is
+/// configured.
+fn control_refusal(app: &App, rest: &str, principal: &Principal) -> Option<WebCortexResponse> {
+    let auth_configured = !app.manifest.auth.api_keys.is_empty() || app.manifest.auth.jwt.is_some();
+    if !auth_configured || rest == "/health" || principal.has_scope("webcortex:admin") {
+        return None;
+    }
+    let status = if principal.is_anonymous() { 401 } else { 403 };
+    let code = if status == 401 { "WC604" } else { "WC602" };
+    Some(WebCortexResponse::coded(status, code, "the webcortex control plane requires the 'webcortex:admin' scope"))
+}
+
 /// Best-effort extraction of a panic message for the log. Never surfaced to the
 /// client, which only ever sees "internal error".
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -1222,15 +1476,19 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     "non-string panic payload".to_string()
 }
 
-fn to_hyper(res: WebCortexResponse) -> Response<Full<Bytes>> {
+fn to_hyper(res: WebCortexResponse, file: Option<(std::fs::File, u64)>) -> Response<OutBody> {
     let mut builder = Response::builder().status(res.status);
     for (k, v) in &res.headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    builder.body(Full::new(res.body)).unwrap_or_else(|e| {
+    let body = match file {
+        Some((file, len)) => OutBody::file(file, len),
+        None => OutBody::bytes(res.body),
+    };
+    builder.body(body).unwrap_or_else(|e| {
         Response::builder()
             .status(500)
-            .body(Full::new(Bytes::from(format!("response build failed: {e}"))))
+            .body(OutBody::bytes(Bytes::from(format!("response build failed: {e}"))))
             .expect("500 response is always constructible")
     })
 }
@@ -1358,6 +1616,81 @@ mod tests {
         assert!(!forwarded_https(&h(&[("x-forwarded-proto", "http")])));
         assert!(forwarded_https(&h(&[("forwarded", "for=1.2.3.4;proto=\"https\";host=a")])));
         assert!(!forwarded_https(&h(&[("forwarded", "for=1.2.3.4;proto=http")])));
+    }
+
+    /// Every frame of a body, polled to the end.
+    async fn frames(mut body: OutBody) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        while let Some(frame) = body.frame().await {
+            out.push(frame.expect("frame").into_data().expect("data"));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_body_goes_out_in_pieces_and_holds_the_send_clock_until_it_ends() {
+        let activity = Arc::new(Activity::new());
+        assert!(activity.send_stalled_for().is_none(), "nothing being sent");
+        let data = Bytes::from(vec![1u8; BODY_CHUNK * 2 + 10]);
+        let mut body = OutBody::bytes(data.clone());
+        assert_eq!(hyper::body::Body::size_hint(&body).exact(), Some(data.len() as u64));
+        body.arm(activity.start_sending());
+        assert!(activity.send_stalled_for().is_some(), "a body is being sent");
+        assert_eq!(activity.idle_for(), std::time::Duration::ZERO, "a connection sending is not idle");
+        let got = frames(body).await;
+        assert_eq!(got.iter().map(|b| b.len()).collect::<Vec<_>>(), vec![BODY_CHUNK, BODY_CHUNK, 10]);
+        assert_eq!(got.concat(), data.to_vec());
+        assert!(activity.send_stalled_for().is_none(), "released at the end of the body");
+
+        // An empty body never holds it; a dropped one releases it.
+        let mut empty = OutBody::bytes(Bytes::new());
+        empty.arm(activity.start_sending());
+        assert!(activity.send_stalled_for().is_none());
+        let mut dropped = OutBody::bytes(Bytes::from_static(b"abc"));
+        dropped.arm(activity.start_sending());
+        assert!(activity.send_stalled_for().is_some());
+        drop(dropped);
+        assert!(activity.send_stalled_for().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_most_stalled_body_sets_the_send_clock() {
+        let activity = Arc::new(Activity::new());
+        let mut stalled = OutBody::bytes(Bytes::from(vec![0u8; BODY_CHUNK * 3]));
+        stalled.arm(activity.start_sending());
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        // Another body on the connection making progress does not hide it.
+        let mut moving = OutBody::bytes(Bytes::from(vec![0u8; BODY_CHUNK * 3]));
+        moving.arm(activity.start_sending());
+        let _ = moving.frame().await;
+        assert!(activity.send_stalled_for().unwrap() >= std::time::Duration::from_millis(100));
+        // Progress on the stalled one resets it.
+        let _ = stalled.frame().await;
+        assert!(activity.send_stalled_for().unwrap() < std::time::Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn a_file_body_is_read_from_disk_as_it_is_taken() {
+        let path = std::env::temp_dir().join(format!("webcortex-outbody-{}", uuid::Uuid::new_v4()));
+        let data: Vec<u8> = (0..(BODY_CHUNK * 2 + 123)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let got = frames(OutBody::file(file, data.len() as u64)).await;
+        assert!(got.len() >= 3 && got.iter().all(|b| b.len() <= BODY_CHUNK));
+        assert_eq!(got.concat(), data);
+        // A file that got shorter than its announced length is an error, not
+        // a short body the client would mistake for the whole file.
+        let file = std::fs::File::open(&path).unwrap();
+        let mut long = OutBody::file(file, data.len() as u64 + 5);
+        let mut failed = false;
+        while let Some(frame) = long.frame().await {
+            if frame.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

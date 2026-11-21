@@ -29,10 +29,18 @@ pub struct App {
     router: Router,
     routes_by_id: HashMap<u32, Route>,
     tools_by_name: HashMap<String, u32>,
+    /// For each tool that would reach an approval-gated tool without an
+    /// agent asking a human first, that gated tool (see
+    /// [`Manifest::gated_tool_behind`]).
+    gated_behind: HashMap<String, String>,
     #[cfg(feature = "sqlite")]
     db: Option<Db>,
     bridge: Arc<dyn PyBridge>,
     client: reqwest::Client,
+    /// The client proxy routes use: it never follows a redirect and never
+    /// sends a Referer, so an upstream's 3xx reaches the caller instead of
+    /// being fetched — with the upstream's credentials — from wherever it points.
+    proxy_client: reqwest::Client,
     upstream_tokens: HashMap<String, String>,
 
     pub authenticator: Authenticator,
@@ -69,8 +77,73 @@ pub struct App {
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
+/// Load the app's templates and check every page's template parses — what a
+/// boot does, and what `webcortex check` does too, so a typo or a missing
+/// file is reported there rather than first by `webcortex run`.
+pub fn load_templates(manifest: &Manifest) -> Result<Option<Templates>, String> {
+    let Some(cfg) = &manifest.templates else { return Ok(None) };
+    let t = Templates::load(cfg)?;
+    // Verify every declared template parses now, so a typo is a boot
+    // failure rather than a 500 for whoever visits that page first.
+    let names: Vec<String> = manifest
+        .routes
+        .iter()
+        .filter_map(|r| match &r.op {
+            Op::Page { template, .. } => Some(template.clone()),
+            _ => None,
+        })
+        .collect();
+    t.verify(&names)?;
+    Ok(Some(t))
+}
+
+/// What an HTTP request's dispatch produced: a whole response, or a static
+/// file's response head and the open file to stream after it.
+pub enum Reply {
+    Full(WebCortexResponse),
+    File { head: WebCortexResponse, file: std::fs::File, len: u64 },
+}
+
+/// Most runs waiting on a human at once, across every caller.
+const MAX_APPROVALS: usize = 1000;
+
+/// Most of those one root principal (the human or service behind a chain of
+/// agents) may hold. Past it the principal's own oldest is evicted, never
+/// another principal's.
+pub(crate) const MAX_APPROVALS_PER_PRINCIPAL: usize = 100;
+
 /// A connection's place under `max_connections`, released on drop.
 pub struct ConnectionSlot(#[allow(dead_code)] Option<tokio::sync::OwnedSemaphorePermit>);
+
+/// Where the trace id of the run an HTTP request started is written, so the
+/// server can still name it when the request times out and the run's own
+/// response is never built.
+pub type EdgeTrace = Arc<Mutex<Option<String>>>;
+
+tokio::task_local! {
+    static EDGE_TRACE: EdgeTrace;
+}
+
+/// Run `f` (a request's dispatch) with `slot` receiving the trace id of the
+/// agent, flow or behaviour run it starts at the edge.
+pub async fn with_edge_trace<F: std::future::Future>(slot: EdgeTrace, f: F) -> F::Output {
+    EDGE_TRACE.scope(slot, f).await
+}
+
+/// Record the trace an edge run (depth 0) started. The first one wins; outside
+/// [`with_edge_trace`] this does nothing.
+pub(crate) fn note_edge_trace(depth: u32, span: Option<&crate::trace::TraceCtx>) {
+    if depth != 0 {
+        return;
+    }
+    let Some(span) = span else { return };
+    let _ = EDGE_TRACE.try_with(|slot| {
+        let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some(span.trace_id.to_string());
+        }
+    });
+}
 
 impl App {
     pub async fn build(manifest: Manifest, bridge: Arc<dyn PyBridge>) -> Result<Self, String> {
@@ -84,6 +157,10 @@ impl App {
             .iter()
             .filter(|r| r.tool.expose)
             .map(|r| (r.tool_name(), r.id))
+            .collect();
+        let gated_behind: HashMap<String, String> = tools_by_name
+            .keys()
+            .filter_map(|name| manifest.gated_tool_behind(name).map(|gated| (name.clone(), gated)))
             .collect();
 
         #[cfg(feature = "sqlite")]
@@ -107,24 +184,7 @@ impl App {
             }
         }
 
-        let templates = match &manifest.templates {
-            Some(cfg) => {
-                let t = Templates::load(cfg)?;
-                // Verify every declared template parses now, so a typo is a boot
-                // failure rather than a 500 for whoever visits that page first.
-                let names: Vec<String> = manifest
-                    .routes
-                    .iter()
-                    .filter_map(|r| match &r.op {
-                        Op::Page { template, .. } => Some(template.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                t.verify(&names)?;
-                Some(t)
-            }
-            None => None,
-        };
+        let templates = load_templates(&manifest)?;
 
         let mut file_servers = HashMap::new();
         for r in &manifest.routes {
@@ -176,6 +236,12 @@ impl App {
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| format!("http client build failed: {e}"))?;
+        let proxy_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false)
+            .build()
+            .map_err(|e| format!("http client build failed: {e}"))?;
         let manifest_start_halted = manifest.server.start_halted;
         let manifest_max_connections = manifest.server.max_connections;
         let devices = crate::devices::DeviceHub::new(&manifest.devices, client.clone());
@@ -187,10 +253,12 @@ impl App {
             router,
             routes_by_id,
             tools_by_name,
+            gated_behind,
             #[cfg(feature = "sqlite")]
             db,
             bridge,
             client,
+            proxy_client,
             upstream_tokens,
             authenticator,
             cors,
@@ -292,14 +360,23 @@ impl App {
         let ttl = Duration::from_secs(self.manifest.server.approval_ttl_secs);
         let mut map = self.approvals.lock().unwrap_or_else(|p| p.into_inner());
         map.retain(|_, r| r.created.elapsed() <= ttl);
-        if map.len() >= 1000
-            && let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, r)| r.created)
-                .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
-            }
+        // One caller's runs make room among themselves. Through 2.8.0 the
+        // store evicted the oldest approval of anyone's, so one principal
+        // that suspended a thousand runs threw away every other principal's
+        // pending approvals (and their runs) and filled the approver's queue.
+        let owner = run.root().to_string();
+        let mine = map.values().filter(|r| r.root() == owner).count();
+        let evict = if mine >= MAX_APPROVALS_PER_PRINCIPAL {
+            map.iter().filter(|(_, r)| r.root() == owner).min_by_key(|(_, r)| r.created).map(|(k, _)| k.clone())
+        } else if map.len() >= MAX_APPROVALS {
+            map.iter().min_by_key(|(_, r)| r.created).map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+        if let Some(oldest) = evict {
+            tracing::warn!(approval = %oldest, principal = %owner, "pending approval evicted to make room");
+            map.remove(&oldest);
+        }
         map.insert(run.approval_id.clone(), run);
     }
 
@@ -367,7 +444,9 @@ impl App {
     /// Where a model-backed op's span attaches: under the span of the call
     /// that reached it, or, at the edge, under the caller's `traceparent`.
     fn span_for(&self, req: &WebCortexRequest, kind: &'static str, name: &str) -> Option<crate::trace::TraceCtx> {
-        self.tracer.begin(req.trace.as_ref(), req.headers.get("traceparent").map(String::as_str), kind, name)
+        let span = self.tracer.begin(req.trace.as_ref(), req.headers.get("traceparent").map(String::as_str), kind, name);
+        note_edge_trace(req.depth, span.as_ref());
+        span
     }
 
     /// The live system view: requests, failures, runs, spend, e-stop, devices.
@@ -399,8 +478,7 @@ impl App {
             .ok_or_else(|| WebCortexResponse::error(500, "router matched an unknown route id"))?;
         let missing = principal.missing_scopes(&Self::required_scopes(route));
         if !missing.is_empty() {
-            let status = if principal.is_anonymous() { 401 } else { 403 };
-            return Err(scope_refusal(status, &missing));
+            return Err(scope_refusal_for(principal, &missing));
         }
         Ok(route)
     }
@@ -501,12 +579,25 @@ impl App {
         self.tools_by_name.get(name).and_then(|id| self.routes_by_id.get(id))
     }
 
+    /// The approval-gated tool calling `name` would run with no human asked:
+    /// `name` itself when gated, or a gated step inside it when it is a flow.
+    /// Every entry point that dispatches a tool by name without suspending
+    /// for approval (MCP, behaviours, flow steps) refuses when this is `Some`.
+    pub fn gated_tool_behind(&self, name: &str) -> Option<&str> {
+        self.gated_behind.get(name).map(String::as_str)
+    }
+
     pub fn exposed_tools(&self) -> Vec<&Route> {
         self.manifest.routes.iter().filter(|r| r.tool.expose).collect()
     }
 
     pub fn agent(&self, name: &str) -> Option<&crate::manifest::AgentDef> {
         self.manifest.agents.iter().find(|a| a.name == name)
+    }
+
+    /// All scopes a route demands, from either declaration site.
+    pub fn scopes_of(route: &Route) -> Vec<String> {
+        Self::required_scopes(route)
     }
 
     /// All scopes a route demands, from either declaration site.
@@ -555,28 +646,37 @@ impl App {
         None
     }
 
-    pub async fn dispatch(&self, mut req: WebCortexRequest) -> WebCortexResponse {
-        let matched = match self.router.find(&req.method, &req.path) {
+    /// Everything dispatch decides before an op runs: the route (404, 405,
+    /// or OPTIONS's `Allow`), that a tool call's arguments address the route
+    /// it named, the caller's scopes (401/403), and the emergency stop (423).
+    fn admit(
+        &self,
+        method: &str,
+        path: &str,
+        principal: &Principal,
+        expected: Option<u32>,
+    ) -> Result<(&Route, std::collections::BTreeMap<String, String>), WebCortexResponse> {
+        let matched = match self.router.find(method, path) {
             Ok(m) => m,
-            Err(MatchError::NotFound) => return self.no_route(&req.method, &req.path),
+            Err(MatchError::NotFound) => return Err(self.no_route(method, path)),
             Err(MatchError::MethodNotAllowed) => {
-                let allowed = self.router.allowed_methods(&req.path).join(", ");
+                let allowed = self.router.allowed_methods(path).join(", ");
                 // OPTIONS asks what a path supports; the answer is the Allow
                 // header, not a 405 for having asked.
-                if req.method.eq_ignore_ascii_case("OPTIONS") {
-                    return WebCortexResponse {
+                if method.eq_ignore_ascii_case("OPTIONS") {
+                    return Err(WebCortexResponse {
                         status: 204,
                         headers: vec![("allow".into(), allowed)],
                         body: bytes::Bytes::new(),
-                    };
+                    });
                 }
                 let mut res = WebCortexResponse::coded(
                     405,
                     "WC202",
-                    format!("{} not allowed on {}; try: {}", req.method, req.path, allowed),
+                    format!("{method} not allowed on {path}; try: {allowed}"),
                 );
                 res.headers.push(("allow".into(), allowed));
-                return res;
+                return Err(res);
             }
         };
 
@@ -585,30 +685,27 @@ impl App {
         // the path onto a different route — `id = "purge"` landing on a static
         // `/notes/purge`, say — refuse rather than run it: approval gates are
         // checked against the tool that was named, so this would be a way round them.
-        if req.route_id.is_some_and(|expected| expected != matched.route_id) {
-            return WebCortexResponse::coded(
+        if expected.is_some_and(|expected| expected != matched.route_id) {
+            return Err(WebCortexResponse::coded(
                 400,
                 "WC208",
                 "the arguments do not address this tool's route; a path argument may not \
                  select a different route",
-            );
+            ));
         }
-        req.path_params = matched.path_params;
-        req.route_id = Some(matched.route_id);
 
         let Some(route) = self.routes_by_id.get(&matched.route_id) else {
-            return WebCortexResponse::error(500, "router matched an unknown route id");
+            return Err(WebCortexResponse::error(500, "router matched an unknown route id"));
         };
 
         let required = Self::required_scopes(route);
         if !required.is_empty() {
-            let missing = req.principal.missing_scopes(&required);
+            let missing = principal.missing_scopes(&required);
             if !missing.is_empty() {
                 // 401 when nobody is authenticated (the client can fix it by
                 // logging in); 403 when a known principal simply lacks the
                 // scope. Collapsing both to 403 makes auth bugs hard to debug.
-                let status = if req.principal.is_anonymous() { 401 } else { 403 };
-                return scope_refusal(status, &missing);
+                return Err(scope_refusal_for(principal, &missing));
             }
         }
 
@@ -617,13 +714,56 @@ impl App {
         // approvals resumed after the halt — they all come through dispatch.
         if route.actuator
             && let Some(refusal) = self.halt_gate().refusal() {
-                return WebCortexResponse::coded(423, "WC502", refusal);
+                return Err(WebCortexResponse::coded(423, "WC502", refusal));
             }
+        Ok((route, matched.path_params))
+    }
 
+    /// The answer dispatch would give this request without running anything
+    /// — no route, a method it does not take, a scope the caller lacks, the
+    /// e-stop — or `None` when it would go on to run the op. The server asks
+    /// before reading a request body, so a body for a route the caller may
+    /// not use is never read: through 2.8.0 up to 32 MB of it was buffered
+    /// first, from anyone.
+    pub fn refusal(&self, method: &str, path: &str, principal: &Principal) -> Option<WebCortexResponse> {
+        self.admit(method, path, principal, None).err()
+    }
+
+    pub async fn dispatch(&self, mut req: WebCortexRequest) -> WebCortexResponse {
+        let (route, path_params) = match self.admit(&req.method, &req.path, &req.principal, req.route_id) {
+            Ok(v) => v,
+            Err(res) => return res,
+        };
+        req.path_params = path_params;
+        req.route_id = Some(route.id);
         match self.execute(&route.op, req).await {
             Ok(res) => res,
             Err(e) => WebCortexResponse::coded(500, op_failure_code(&route.op, &e), e),
         }
+    }
+
+    /// [`Self::dispatch`] for the HTTP server: the same, except that a static
+    /// file is opened rather than read, so it can be streamed from disk.
+    pub async fn dispatch_reply(&self, mut req: WebCortexRequest) -> Reply {
+        let (route, path_params) = match self.admit(&req.method, &req.path, &req.principal, req.route_id) {
+            Ok(v) => v,
+            Err(res) => return Reply::Full(res),
+        };
+        req.path_params = path_params;
+        req.route_id = Some(route.id);
+        if let Op::Files { .. } = route.op
+            && let Some(server) = self.file_servers.get(&route.id)
+        {
+            let relative = req.path_params.values().next().cloned().unwrap_or_else(|| "/".into());
+            return match server.open(&relative, &req.path, req.headers.get("if-none-match").map(|s| s.as_str())) {
+                crate::files::FileReply::Done(res) => Reply::Full(res),
+                crate::files::FileReply::Stream { head, file, len } => Reply::File { head, file, len },
+            };
+        }
+        Reply::Full(match self.execute(&route.op, req).await {
+            Ok(res) => res,
+            Err(e) => WebCortexResponse::coded(500, op_failure_code(&route.op, &e), e),
+        })
     }
 
     async fn execute(&self, op: &Op, req: WebCortexRequest) -> Result<WebCortexResponse, String> {
@@ -646,16 +786,23 @@ impl App {
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.as_ref().ok_or("no database configured")?;
+                    let route = req.route_id.and_then(|id| self.routes_by_id.get(&id));
+                    if let Some(refused) = route.and_then(|r| body_refusal(r, &req)) {
+                        return Ok(refused);
+                    }
                     let bindings = match req.bind(params) {
                         Ok(b) => b,
                         Err(e) => return Ok(WebCortexResponse::coded(400, "WC205", e)),
                     };
-                    let value = match db.run(sql, &bindings, *returns).await {
+                    let mut value = match db.run(sql, &bindings, *returns).await {
                         Ok(v) => v,
                         Err(e) => return Ok(WebCortexResponse::coded(e.status(), e.code(), e.message())),
                     };
                     if value.is_null() && *returns == crate::manifest::QueryReturns::One {
                         return Ok(WebCortexResponse::coded(404, "WC207", "not found"));
+                    }
+                    if let Some(schema) = route.and_then(|r| r.output_schema.as_ref()) {
+                        restore_booleans(&mut value, schema);
                     }
                     Ok(WebCortexResponse::json(200, &value))
                 }
@@ -786,7 +933,13 @@ impl App {
             .clone();
         let input = req.json_body().unwrap_or(serde_json::Value::Null);
         let span = self.span_for(&req, "flow", &format!("flow {}", def.name));
+        // A request timeout or a client that leaves drops this future before
+        // the flow returns; the guard then ends the span as cancelled. 2.8.0
+        // left it open for good, and it was never exported.
+        let mut guard = SpanGuard { tracer: &self.tracer, span: span.clone(), outcome: None };
         let outcome = crate::flow::run(self, &def, input, &req.principal, req.depth, req.budget.clone(), span.clone()).await;
+        // Finished: ended below, with the flow's own attributes.
+        guard.span = None;
         let mut res = match outcome {
             Ok(mut value) => {
                 if let Some(span) = &span {
@@ -1099,7 +1252,7 @@ impl App {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| format!("bad method: {e}"))?;
         let mut builder = self
-            .client
+            .proxy_client
             .request(method, &url)
             .timeout(Duration::from_millis(up.timeout_ms));
 
@@ -1141,6 +1294,17 @@ impl App {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
+        // A redirect is the caller's to follow, not ours: 2.8.0 followed it to
+        // any host — loopback, a metadata address — sending the upstream's
+        // static headers and a Referer there, and relayed what it found. One
+        // pointing back into the upstream is rewritten to the path a caller
+        // would use here, so the upstream's own address is not handed out.
+        let location = res.status().is_redirection().then(|| {
+            res.headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|loc| relay_location(&up.base_url, res.url(), loc, &self.proxy_mounts(upstream_name, req.route_id)))
+        }).flatten();
         // Buffered, so bounded: a declared length over the cap is refused
         // before reading, and an undeclared one is cut off once it passes it.
         let cap = up.max_response_bytes;
@@ -1170,11 +1334,35 @@ impl App {
         }
         let body = buf.freeze();
 
-        Ok(WebCortexResponse {
-            status,
-            headers: vec![("content-type".into(), content_type)],
-            body,
-        })
+        let mut headers = vec![("content-type".into(), content_type)];
+        if let Some(location) = location {
+            headers.push(("location".into(), location));
+        }
+        Ok(WebCortexResponse { status, headers, body })
+    }
+
+    /// How this app's proxy routes map onto `upstream`, as (route path,
+    /// upstream path template) pairs: the route that made the request first,
+    /// then the upstream's other GET routes. Used to map a redirect back.
+    fn proxy_mounts(&self, upstream: &str, current: Option<u32>) -> Vec<(&str, &str)> {
+        fn mount<'r>(r: &'r Route, upstream: &str) -> Option<(&'r str, &'r str)> {
+            match &r.op {
+                Op::Proxy { upstream: u, rewrite } if u == upstream => {
+                    Some((r.path.as_str(), rewrite.as_deref().unwrap_or(r.path.as_str())))
+                }
+                _ => None,
+            }
+        }
+        let mut mounts: Vec<(&str, &str)> =
+            current.and_then(|id| self.routes_by_id.get(&id)).and_then(|r| mount(r, upstream)).into_iter().collect();
+        for r in &self.manifest.routes {
+            if Some(r.id) != current && r.method.eq_ignore_ascii_case("GET")
+                && let Some(m) = mount(r, upstream)
+            {
+                mounts.push(m);
+            }
+        }
+        mounts
     }
 
     /// Invoke an exposed route by tool name, as a given principal.
@@ -1419,22 +1607,37 @@ pub fn run_result_response(result: &RunResult) -> WebCortexResponse {
 }
 
 /// 401 (nobody authenticated) or 403 (a known caller without the scope), with
-/// a hint naming the scopes to hold.
-fn scope_refusal(status: u16, missing: &[String]) -> WebCortexResponse {
+/// a hint naming the scopes to hold — and, when the caller is an agent or a
+/// behaviour acting for someone, which delegate lacks them and where to add
+/// them, rather than blaming a key that may well hold them.
+pub fn scope_refusal_for(principal: &Principal, missing: &[String]) -> WebCortexResponse {
+    let status = if principal.is_anonymous() { 401 } else { 403 };
     let code = if status == 401 { "WC601" } else { "WC602" };
-    let hint = if status == 401 {
-        format!(
+    let hint = scope_hint(principal, missing);
+    WebCortexResponse::coded_with_hint(status, code, format!("missing required scope(s): {}", missing.join(", ")), &hint)
+}
+
+/// What to do about `missing` scopes, for this principal.
+pub fn scope_hint(principal: &Principal, missing: &[String]) -> String {
+    let quoted = missing.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", ");
+    if principal.is_anonymous() {
+        return format!(
             "Authenticate: send an API key (x-api-key) or a bearer token whose scopes include {}.",
             missing.join(", ")
-        )
-    } else {
-        format!(
-            "This caller lacks {}. Use a key registered with app.api_key(..., scopes=[{}]).",
-            missing.join(", "),
-            missing.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", ")
-        )
-    };
-    WebCortexResponse::coded_with_hint(status, code, format!("missing required scope(s): {}", missing.join(", ")), &hint)
+        );
+    }
+    if principal.kind == crate::auth::PrincipalKind::Agent {
+        let agent = principal.claims.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
+        let held = if principal.scopes.is_empty() { "none".to_string() } else { principal.scopes.join(", ") };
+        return format!(
+            "{agent:?} acts with scopes [{held}]: its own scopes= intersected with its caller's. \
+             Add {quoted} to {agent:?}'s scopes= (the caller must hold them too)."
+        );
+    }
+    format!(
+        "This caller lacks {}. Use a key registered with app.api_key(..., scopes=[{quoted}]).",
+        missing.join(", ")
+    )
 }
 
 /// The code for an op that failed with an `Err` string rather than a response.
@@ -1453,6 +1656,177 @@ fn op_failure_code(op: &Op, message: &str) -> &'static str {
         Op::Agent { .. } => "WC300",
         Op::Device { .. } if message.contains("unknown device") => "WC501",
         _ => "WC001",
+    }
+}
+
+/// The `Location` to relay for an upstream redirect. One that resolves under
+/// the upstream's `base_url` is mapped back through the app's proxy routes
+/// (`mounts`, see [`App::proxy_mounts`]) to the path a caller uses here; one
+/// under the base that no route maps becomes the path beneath the base; any
+/// other is relayed as the upstream sent it, for the caller to judge.
+fn relay_location(base_url: &str, requested: &reqwest::Url, location: &str, mounts: &[(&str, &str)]) -> String {
+    let base = base_url.trim_end_matches('/');
+    let Ok(resolved) = requested.join(location) else { return location.to_string() };
+    let resolved = resolved.as_str();
+    let rest = match resolved.strip_prefix(base) {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '?', '#']) => rest,
+        _ => return location.to_string(),
+    };
+    let (path, suffix) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
+    let path = if path.is_empty() { "/" } else { path };
+    for (route_path, upstream_template) in mounts {
+        // A rewrite may spell the route's catch-all `{rest}` rather than
+        // `{*rest}`; it carries the rest of the path all the same.
+        let template: String = upstream_template
+            .split('/')
+            .map(|seg| match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                Some(n) if !n.starts_with('*') && route_path.contains(&format!("{{*{n}}}")) => format!("{{*{n}}}"),
+                _ => seg.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if let Some(params) = match_template(&template, path) {
+            return format!("{}{suffix}", fill_template(route_path, &params));
+        }
+    }
+    format!("{path}{suffix}")
+}
+
+/// The parameters `path` binds when it matches a route-style `template`
+/// (`{name}` takes one segment, `{*name}` the rest), or `None`. Values are
+/// kept as they appear in the path, still percent-encoded.
+fn match_template(template: &str, path: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut want = template.split('/').filter(|s| !s.is_empty());
+    let got: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut params = std::collections::BTreeMap::new();
+    let mut i = 0;
+    while let Some(seg) = want.next() {
+        let name = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}'));
+        match name {
+            Some(n) if n.starts_with('*') => {
+                if want.next().is_some() {
+                    return None;
+                }
+                params.insert(n.trim_start_matches('*').to_string(), got.get(i..).unwrap_or_default().join("/"));
+                return Some(params);
+            }
+            Some(n) => {
+                params.insert(n.to_string(), (*got.get(i)?).to_string());
+            }
+            None if got.get(i) == Some(&seg) => {}
+            None => return None,
+        }
+        i += 1;
+    }
+    (i == got.len()).then_some(params)
+}
+
+/// `template` with each `{name}` / `{*name}` replaced by its value as given.
+fn fill_template(template: &str, params: &std::collections::BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for seg in template.split('/').filter(|s| !s.is_empty()) {
+        let value = match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            Some(n) => params.get(n.trim_start_matches('*')).map(String::as_str).unwrap_or_default(),
+            None => seg,
+        };
+        if !value.is_empty() {
+            out.push('/');
+            out.push_str(value);
+        }
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// The 422 for a native query route's body that does not match the route's
+/// `input_schema`, or `None` when it matches (or there is nothing to check).
+///
+/// Only routes that take a body (POST, PUT, PATCH) are checked, and only the
+/// body: a parameter the path or query string supplies counts as present and
+/// is not checked here (binding takes that value, and a path value is text
+/// until it is bound), even if the body repeats it. Through 2.8.0 the
+/// advertised schema was never applied: `{}` inserted a row of NULLs, a
+/// misspelt key on PUT wiped every field, and `"lol"` was stored in a REAL
+/// column.
+fn body_refusal(route: &Route, req: &WebCortexRequest) -> Option<WebCortexResponse> {
+    let schema = route.input_schema.as_ref()?;
+    if !matches!(req.method.to_ascii_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
+        return None;
+    }
+    let from_url = |name: &str| req.path_params.contains_key(name) || req.query.contains_key(name);
+    let body = if req.body.is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&req.body) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.retain(|k, _| !from_url(k));
+                serde_json::Value::Object(map)
+            }
+            // Not an object, or not JSON: binding refuses it with WC205.
+            _ => return None,
+        }
+    };
+    let mut schema = schema.clone();
+    if let Some(serde_json::Value::Array(required)) = schema.get_mut("required") {
+        required.retain(|name| name.as_str().is_none_or(|n| !from_url(n)));
+    }
+    let problems = crate::schema::validate(&schema, &body);
+    if problems.is_empty() {
+        return None;
+    }
+    let message = format!(
+        "the request body does not match the input schema of {} {}: {}",
+        route.method,
+        route.path,
+        problems.join("; ")
+    );
+    let mut res = WebCortexResponse::json(
+        422,
+        &serde_json::json!({"error": {
+            "status": 422, "message": message, "code": "WC206",
+            "hint": crate::errors::hint("WC206"), "problems": problems,
+        }}),
+    );
+    res.headers.push(("x-webcortex-error".into(), "WC206".into()));
+    Some(res)
+}
+
+/// Turn the 0 and 1 SQLite stores for a boolean back into `false` and `true`
+/// wherever `schema` (a route's `output_schema`) declares a boolean: a row,
+/// or each row of a list. SQLite has no boolean type, so a resource's `bool`
+/// field read back as an integer, contradicting its own schema.
+fn restore_booleans(value: &mut serde_json::Value, schema: &serde_json::Value) {
+    let declares = |s: &serde_json::Value, t: &str| match s.get("type") {
+        Some(serde_json::Value::String(x)) => x == t,
+        Some(serde_json::Value::Array(xs)) => xs.iter().any(|x| x == t),
+        _ => false,
+    };
+    match value {
+        serde_json::Value::Array(items) => {
+            if let Some(item_schema) = schema.get("items") {
+                for item in items {
+                    restore_booleans(item, item_schema);
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else { return };
+            for (key, field) in map.iter_mut() {
+                let Some(sub) = props.get(key) else { continue };
+                if declares(sub, "boolean") {
+                    match field.as_i64() {
+                        Some(0) => *field = serde_json::Value::Bool(false),
+                        Some(1) => *field = serde_json::Value::Bool(true),
+                        _ => {}
+                    }
+                } else {
+                    restore_booleans(field, sub);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1570,6 +1944,118 @@ mod tests {
         assert_eq!(substitute_path("/echo/{slug}", &params), "/echo/a%2Fb%20c%3Bd%25");
         params.insert("slug".to_string(), "Frank-Herbert_1.0~:@".to_string());
         assert_eq!(substitute_path("/echo/{slug}", &params), "/echo/Frank-Herbert_1.0~:@");
+    }
+
+    #[test]
+    fn an_upstream_redirect_into_the_upstream_is_rewritten_and_any_other_relayed() {
+        let at = reqwest::Url::parse("http://10.0.0.5:8080/v2/login?x=1").unwrap();
+        let base = "http://10.0.0.5:8080/v2/";
+        // Mapped back through the app's proxy routes where one matches.
+        let mounts = [("/billing/login", "/login"), ("/billing/{*rest}", "/{rest}"), ("/inv/{id}", "/invoices/{id}")];
+        assert_eq!(relay_location(base, &at, "http://10.0.0.5:8080/v2/home?a=b", &mounts), "/billing/home?a=b");
+        assert_eq!(relay_location(base, &at, "dashboard/x%20y", &mounts), "/billing/dashboard/x%20y");
+        assert_eq!(relay_location(base, &at, "/v2/login", &mounts), "/billing/login");
+        let only_invoices = [("/inv/{id}", "/invoices/{id}")];
+        assert_eq!(relay_location(base, &at, "/v2/invoices/42#top", &only_invoices), "/inv/42#top");
+        // Under the base but no route maps it: the path beneath the base.
+        assert_eq!(relay_location(base, &at, "/v2/invoices/42/pdf", &only_invoices), "/invoices/42/pdf");
+        assert_eq!(relay_location(base, &at, "/v2", &[]), "/");
+        // Not under the base path: a sibling prefix, another host, metadata.
+        assert_eq!(relay_location(base, &at, "/v20/x", &mounts), "/v20/x");
+        assert_eq!(relay_location(base, &at, "http://169.254.169.254/latest", &mounts), "http://169.254.169.254/latest");
+        assert_eq!(relay_location(base, &at, "https://example.com/", &mounts), "https://example.com/");
+    }
+
+    #[test]
+    fn templates_match_and_fill_like_routes() {
+        let m = |t: &str, p: &str| match_template(t, p).map(|m| m.into_iter().collect::<Vec<_>>());
+        assert_eq!(m("/a/{id}", "/a/7"), Some(vec![("id".into(), "7".into())]));
+        assert_eq!(m("/a/{id}", "/a/7/8"), None);
+        assert_eq!(m("/a/{id}", "/b/7"), None);
+        assert_eq!(m("/a/{*rest}", "/a/x/y"), Some(vec![("rest".into(), "x/y".into())]));
+        assert_eq!(m("/a/{*rest}", "/a"), Some(vec![("rest".into(), "".into())]));
+        assert_eq!(m("/", "/"), Some(vec![]));
+        let p: std::collections::BTreeMap<String, String> = [("rest".to_string(), "x/y".to_string())].into();
+        assert_eq!(fill_template("/b/{*rest}", &p), "/b/x/y");
+        assert_eq!(fill_template("/b/{*rest}", &Default::default()), "/b");
+    }
+
+    async fn resource_app() -> App {
+        let manifest: Manifest = serde_json::from_value(json!({
+            "name": "r",
+            "database": {"url": "sqlite://:memory:", "schema": "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT, price REAL, ok INTEGER)"},
+            "routes": [
+                {"id": 0, "method": "POST", "path": "/items",
+                 "op": {"kind": "query", "sql": "INSERT INTO items (name, price, ok) VALUES (?, ?, ?) RETURNING *",
+                        "params": ["name", "price", "ok"], "returns": "one"},
+                 "input_schema": {"type": "object", "additionalProperties": false, "required": ["name", "price", "ok"],
+                                  "properties": {"name": {"type": "string"}, "price": {"type": "number"}, "ok": {"type": "boolean"}}},
+                 "output_schema": {"type": "object", "properties": {"id": {"type": "integer"}, "name": {"type": "string"},
+                                   "price": {"type": "number"}, "ok": {"type": "boolean"}}}},
+                {"id": 1, "method": "PUT", "path": "/items/{id}",
+                 "op": {"kind": "query", "sql": "UPDATE items SET name = ?, price = ?, ok = ? WHERE id = ? RETURNING *",
+                        "params": ["name", "price", "ok", "id"], "returns": "one"},
+                 "input_schema": {"type": "object", "additionalProperties": false, "required": ["id", "name", "price", "ok"],
+                                  "properties": {"id": {"type": "integer"}, "name": {"type": "string"}, "price": {"type": "number"},
+                                                 "ok": {"type": "boolean"}}},
+                 "output_schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}},
+                {"id": 2, "method": "GET", "path": "/items",
+                 "op": {"kind": "query", "sql": "SELECT * FROM items", "params": [], "returns": "many"},
+                 "output_schema": {"type": "array", "items": {"type": "object", "properties": {"ok": {"type": "boolean"}}}}}
+            ]
+        }))
+        .unwrap();
+        App::build_without_python(manifest).await.expect("app")
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_query_routes_body_is_held_to_its_input_schema_and_booleans_read_back() {
+        let app = resource_app().await;
+        let send = |method: &str, path: &str, body: serde_json::Value| WebCortexRequest {
+            method: method.into(),
+            path: path.into(),
+            path_params: Default::default(),
+            query: Default::default(),
+            query_all: Vec::new(),
+            headers: Default::default(),
+            body: if body.is_null() { bytes::Bytes::new() } else { bytes::Bytes::from(serde_json::to_vec(&body).unwrap()) },
+            route_id: None,
+            principal: Principal::anonymous(),
+            depth: 0,
+            budget: None,
+            trace: None,
+        };
+        // Through 2.8.0 each of these was stored: NULLs, text in a REAL
+        // column, a misspelt key silently ignored.
+        for (body, needle) in [
+            (json!({}), "missing required property \"name\""),
+            (json!({"name": "a", "price": "abc", "ok": true}), "$.price: expected number"),
+            (json!({"name": "a", "price": 1, "ok": true, "colour": "red"}), "colour"),
+            (json!({"name": "a", "price": 1, "ok": "yes"}), "$.ok: expected boolean"),
+        ] {
+            let res = app.dispatch(send("POST", "/items", body)).await;
+            assert_eq!(res.status, 422, "{}", String::from_utf8_lossy(&res.body));
+            let v = res.json_value();
+            assert_eq!(v["error"]["code"], "WC206");
+            assert!(v["error"]["message"].as_str().unwrap().contains(needle), "{v}");
+            assert!(!v["error"]["problems"].as_array().unwrap().is_empty());
+        }
+        let res = app.dispatch(send("POST", "/items", json!({"name": "a", "price": 1.5, "ok": true}))).await;
+        assert_eq!(res.status, 200);
+        assert_eq!(res.json_value()["ok"], json!(true), "a stored 1 reads back as true");
+        // The path supplies the id; the body need not repeat it, and a typo is refused.
+        let res = app.dispatch(send("PUT", "/items/1", json!({"name": "b", "price": 2, "ok": false}))).await;
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+        assert_eq!(res.json_value()["ok"], json!(false));
+        let res = app.dispatch(send("PUT", "/items/1", json!({"titel": "b", "price": 2, "ok": false}))).await;
+        assert_eq!(res.status, 422);
+        // A body that repeats what the path supplies is not held to it: the
+        // path's value is the one bound.
+        let res = app.dispatch(send("PUT", "/items/1", json!({"id": "1", "name": "b", "price": 2, "ok": false}))).await;
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+        let res = app.dispatch(send("GET", "/items", serde_json::Value::Null)).await;
+        assert_eq!(res.json_value(), json!([{"id": 1, "name": "b", "price": 2.0, "ok": false}]));
     }
 
     async fn notes_app() -> App {
