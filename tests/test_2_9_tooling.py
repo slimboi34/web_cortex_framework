@@ -512,6 +512,275 @@ def test_a_copied_env_example_leaves_the_starter_locked(tmp_path, monkeypatch, c
 
 
 # ======================================================================
+# L12: `context --json` does not print credentials
+# ======================================================================
+
+SECRET_APP = """
+import os
+from webcortex import WebCortex
+app = WebCortex("weather", database=os.environ.get("L12_DB", "sqlite://:memory:"))
+app.api_key("L12_ADMIN", id="admin", scopes=["devices:read"])
+app.upstream("wx", "https://user:pw-SECRET-1@api.weather.example", headers={"X-Api-Key": os.environ["WX_KEY"]},
+             bearer_env="WX_TOKEN")
+app.proxy("GET", "/wx/{city}", upstream="wx", rewrite="/v1/{city}")
+app.camera("lobby", source="http://cam:pw-SECRET-2@192.168.1.4/snap.jpg",
+           headers={"Authorization": "Basic SECRET-3"})
+app.agent("insp", tools=["lobby_snapshot"], scopes=["devices:read"], token_budget=1000)
+app.watch("w", device="lobby", agent="insp", input="x", every=15, scopes=["devices:read"],
+          webhook="https://hook:pw-SECRET-4@hooks.example/in")
+"""
+
+
+def test_context_json_redacts_credentials_unless_asked(tmp_path, monkeypatch, capsys):
+    _write(tmp_path, {"api.py": SECRET_APP})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WX_KEY", "wx-live-SECRET-0")
+    monkeypatch.setenv("L12_DB", "postgres://app:pw-SECRET-5@db.internal/app")
+    assert cli.main(["context", "--json"]) == 0
+    out = capsys.readouterr().out
+    assert "SECRET" not in out
+    manifest = json.loads(out)
+    assert manifest["upstreams"]["wx"]["headers"] == {"X-Api-Key": "<redacted>"}
+    assert manifest["upstreams"]["wx"]["bearer_env"] == "WX_TOKEN", "a variable's name is not a secret"
+    assert manifest["upstreams"]["wx"]["base_url"] == "https://<redacted>@api.weather.example"
+    assert manifest["devices"][0]["source"]["headers"] == {"Authorization": "<redacted>"}
+    assert manifest["devices"][0]["source"]["url"] == "http://<redacted>@192.168.1.4/snap.jpg"
+    assert manifest["watchers"][0]["webhook"]["url"] == "https://<redacted>@hooks.example/in"
+    assert manifest["database"]["url"] == "postgres://<redacted>@db.internal/app"
+
+    assert cli.main(["context", "--json", "--show-secrets"]) == 0
+    shown = capsys.readouterr().out
+    for n in range(6):
+        assert f"SECRET-{n}" in shown
+
+
+# ======================================================================
+# L14: the `claude mcp add` line is quoted
+# ======================================================================
+
+
+def test_mcp_config_prints_a_command_a_shell_reads_as_written(tmp_path, monkeypatch, capsys):
+    _write(tmp_path, {"api.py": "from webcortex import WebCortex\napp = WebCortex('My Shop; touch PWNED')\n"})
+    monkeypatch.chdir(tmp_path)
+    key = "k$(id)`whoami`'\"x"
+    monkeypatch.setenv("WEBCORTEX_API_KEY", key)
+    assert cli.main(["mcp-config"]) == 0
+    out = capsys.readouterr().out
+    config = json.loads(out.partition("\n# Claude Code")[0])
+    assert list(config["mcpServers"]) == ["My-Shop-touch-PWNED"]
+    line = next(l for l in out.splitlines() if l.startswith("claude mcp add"))
+    argv = shlex.split(line)
+    assert argv == ["claude", "mcp", "add", "--transport", "http", "My-Shop-touch-PWNED",
+                    config["mcpServers"]["My-Shop-touch-PWNED"]["url"], "--header", f"x-api-key: {key}"]
+
+    monkeypatch.delenv("WEBCORTEX_API_KEY")
+    assert cli.main(["mcp-config"]) == 0
+    line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("claude mcp add"))
+    # Without a key, the shell fills it in when the line is pasted.
+    assert line.endswith(' --header "x-api-key: $WEBCORTEX_API_KEY"')
+
+
+def test_mcp_server_names_are_one_word():
+    assert cli.mcp_server_name("demo") == "demo"
+    assert cli.mcp_server_name("My Shop") == "My-Shop"
+    assert cli.mcp_server_name("a_b-c.d") == "a_b-c-d"
+    assert cli.mcp_server_name(";;") == "webcortex" and cli.mcp_server_name(None) == "webcortex"
+
+
+# ======================================================================
+# L29 (CLI half): boot failures are coded errors, not tracebacks
+# ======================================================================
+
+
+def _boot(directory: Path, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("WEBCORTEX_")}
+    env["WEBCORTEX_LOG"] = "error"
+    proc = subprocess.Popen([sys.executable, "-m", "webcortex.cli", *args], cwd=directory, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        pytest.fail(f"the server booted instead of refusing:\n{out}\n{err}")
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+PAGE_APP = 'from webcortex import WebCortex\napp = WebCortex("t", templates="templates", port={port})\n' \
+           'app.page("/p", "p.html", data={{}})\n'
+
+
+@pytest.mark.parametrize("command", ["run", "dev"])
+def test_a_template_that_does_not_parse_is_wc004_with_file_and_line(tmp_path, command):
+    _write(tmp_path, {"api.py": PAGE_APP.format(port=_free_port()), "templates/p.html": "{{ a }}\n{% if %}\n"})
+    done = _boot(tmp_path, command)
+    assert done.returncode == 1
+    assert "Traceback" not in done.stderr
+    assert "error[WC004]:" in done.stderr and "(at templates/p.html:2)" in done.stderr
+
+
+def test_a_missing_template_and_other_boot_failures_are_coded(tmp_path):
+    _write(tmp_path, {"api.py": PAGE_APP.format(port=_free_port())})
+    (tmp_path / "templates").mkdir()
+    done = _boot(tmp_path, "run")
+    assert done.returncode == 1 and "Traceback" not in done.stderr
+    assert "error[WC004]:" in done.stderr and "(expected at templates/p.html)" in done.stderr
+
+    shutil.rmtree(tmp_path / "templates")
+    done = _boot(tmp_path, "run")
+    assert "error[WC107]:" in done.stderr and "Traceback" not in done.stderr
+
+    # A port someone else holds.
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        port = holder.getsockname()[1]
+        _write(tmp_path, {"api.py": f"from webcortex import WebCortex\napp = WebCortex('t', port={port})\n"})
+        done = _boot(tmp_path, "run")
+    assert done.returncode == 1 and "error[WC104]:" in done.stderr and "Traceback" not in done.stderr
+
+    _write(tmp_path, {"api.py": "from webcortex import WebCortex\napp = WebCortex('t', host='999.1.1.1')\n"})
+    done = _boot(tmp_path, "run")
+    assert done.returncode == 1 and "error[WC101]:" in done.stderr and "bad listen address" in done.stderr
+
+
+def test_boot_errors_map_to_catalogued_codes():
+    assert boot_error_code('template "p.html" failed to load: syntax error') == "WC004"
+    assert boot_error_code('invalid application: template "p.html" failed to load: x') == "WC004"
+    assert boot_error_code('template directory "t" does not exist') == "WC107"
+    assert boot_error_code("bind 127.0.0.1:80 failed: Address already in use (os error 48)") == "WC104"
+    assert boot_error_code("database connect failed: (code: 14) unable to open database file") == "WC107"
+    assert boot_error_code("invalid manifest: missing field") == "WC101"
+    assert boot_error_code("something new", default="WC001") == "WC001"
+
+
+# ======================================================================
+# L42: `webcortex check` prints the route table
+# ======================================================================
+
+
+def test_check_prints_a_route_table(tmp_path, monkeypatch, capsys):
+    _write(tmp_path, {"api.py": (
+        "from webcortex import WebCortex\n"
+        "app = WebCortex('routes', database='sqlite://:memory:')\n"
+        "app.api_key('L42_KEY', id='service', scopes=['read', 'write'])\n"
+        "app.resource('items', fields={'id': int, 'name': str}, tools=True, read_scopes=['read'],"
+        " write_scopes=['write'])\n"
+        "@app.get('/hello')\n"
+        "def hello() -> dict:\n"
+        "    return {}\n")})
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["check"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    table = report["route_table"]
+    assert isinstance(report["routes"], int) and report["routes"] == len(table), "the count is unchanged"
+    rows = {(r["method"], r["path"]): r for r in table}
+    assert rows[("GET", "/items")] == {"method": "GET", "path": "/items", "engine": "query",
+                                       "tool": "list_items", "scopes": ["read"]}
+    assert rows[("DELETE", "/items/{id}")]["scopes"] == ["write"]
+    assert rows[("GET", "/hello")] == {"method": "GET", "path": "/hello", "engine": "python", "tool": None,
+                                       "scopes": []}
+    assert all(set(r) == {"method", "path", "engine", "tool", "scopes"} for r in table)
+
+
+# ======================================================================
+# halt / release take --url
+# ======================================================================
+
+ESTOP_KEY = "estop-admin-key-0123456789abcdef"
+ESTOP_APP = """
+from webcortex import WebCortex
+app = WebCortex("estop", port={port})
+app.api_key("ESTOP_KEY", id="admin", scopes=["operate", "webcortex:admin"])
+
+@app.post("/arm", tool=True, tool_name="arm", actuator=True, approval="required", scopes=["operate"])
+def arm() -> dict:
+    return {{"moved": True}}
+"""
+
+
+@pytest.fixture(scope="module")
+def estop_server():
+    workdir = Path(tempfile.mkdtemp(prefix="webcortex-estop-"))
+    port = _free_port()
+    (workdir / "api.py").write_text(ESTOP_APP.format(port=port))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("WEBCORTEX_")}
+    env.update(ESTOP_KEY=ESTOP_KEY, WEBCORTEX_LOG="warn")
+    log = workdir / "server.log"
+    with log.open("w") as out:
+        proc = subprocess.Popen([sys.executable, "-m", "webcortex.cli", "run", "api.py"], cwd=workdir,
+                                stdout=out, stderr=subprocess.STDOUT, env=env)
+    base = f"http://127.0.0.1:{port}"
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            pytest.fail(f"server exited early:\n{log.read_text()}")
+        try:
+            with urllib.request.urlopen(base + "/_webcortex/health", timeout=1):
+                break
+        except Exception:
+            time.sleep(0.1)
+    else:
+        proc.kill()
+        pytest.fail(f"server never became ready:\n{log.read_text()}")
+    yield base
+    proc.terminate()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def test_halt_and_release_reach_the_app_at_url(estop_server, tmp_path, monkeypatch, capsys):
+    _isolate(monkeypatch, "WEBCORTEX_API_KEY", "WEBCORTEX_TOKEN", "WEBCORTEX_HOST", "WEBCORTEX_PORT")
+    monkeypatch.chdir(tmp_path)                 # no api.py here: the URL and a key are enough
+    assert cli.main(["halt", "--url", estop_server, "--key", ESTOP_KEY, "--reason", "test"]) == 0
+    assert capsys.readouterr().out.startswith("HALTED: test.")
+    assert cli.main(["halt", "--status", "--url", estop_server + "/", "--key", ESTOP_KEY]) == 0
+    assert json.loads(capsys.readouterr().out)["halted"] is True
+    assert cli.main(["release", "--url", estop_server, "--key", ESTOP_KEY]) == 0
+    assert capsys.readouterr().out.strip() == "released: actuators enabled"
+
+    # An app module here that names another port: --url still wins.
+    _write(tmp_path, {"api.py": "from webcortex import WebCortex\napp = WebCortex('estop', port=9)\n"})
+    assert cli.main(["release", "--url", estop_server, "--key", ESTOP_KEY]) == 0
+    assert capsys.readouterr().out.strip() == "was not halted"
+    # The wrong key is the app's own coded refusal.
+    assert cli.main(["halt", "--url", estop_server, "--key", "wrong"]) == 1
+    assert "error[WC603]" in capsys.readouterr().err
+
+
+def test_halt_at_a_url_that_is_not_webcortex_is_wc108(tmp_path, monkeypatch, capsys):
+    class Page(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("content-length") or 0))
+            page = b"<html>not an app</html>"
+            self.send_response(200)
+            self.send_header("content-type", "text/html")
+            self.send_header("content-length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+        do_POST = do_GET  # noqa: N815
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Page)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.chdir(tmp_path)
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        assert cli.main(["halt", "--url", url, "--key", "k"]) == 1
+        err = capsys.readouterr().err
+        assert "error[WC108]" in err and "not with a WebCortex document" in err
+        assert cli.main(["release", "--url", "http://[bad", "--key", "k"]) == 1
+        assert "error[WC108]" in capsys.readouterr().err
+    finally:
+        server.shutdown()
+
+
+# ======================================================================
 # K8 (doctor half): a bad OTLP endpoint is reported
 # ======================================================================
 

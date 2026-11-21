@@ -54,4 +54,5 @@ def test_mcp_config_command_prints_json_and_the_claude_line(tmp_path, monkeypatc
     cfg = json.loads(body)
     assert cfg["mcpServers"]["demo"]["headers"]["x-api-key"] == "test-key-abcdefghijklmnop"
     assert "claude mcp add --transport http demo http://" in tail
-    assert '--header "x-api-key: test-key-abcdefghijklmnop"' in tail
+    # Quoted for the shell (2.9): a key holding `$` or a backtick is passed as written.
+    assert "--header 'x-api-key: test-key-abcdefghijklmnop'" in tail
