@@ -26,7 +26,7 @@
 
 use crate::manifest::TracingConfig;
 use serde_json::{Map, Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -102,6 +102,13 @@ struct ExportSpan {
 pub struct Tracer {
     cfg: TracingConfig,
     traces: Mutex<VecDeque<TraceRecord>>,
+    /// Open spans of traces that left the ring before they finished, held
+    /// only so they can still be exported when they end. More concurrent runs
+    /// than `keep` evict running traces; before 2.9 their unfinished spans
+    /// were never exported, and nothing counted them. Only used when an
+    /// exporter is configured, and bounded by [`MAX_DETACHED`]. Always locked
+    /// after `traces`, never before.
+    detached: Mutex<HashMap<(Arc<str>, u64), SpanRecord>>,
     export: OnceLock<tokio::sync::mpsc::Sender<ExportSpan>>,
     exported: AtomicU64,
     export_failed: AtomicU64,
@@ -152,6 +159,7 @@ impl Tracer {
         Self {
             cfg: cfg.clone(),
             traces: Mutex::new(VecDeque::new()),
+            detached: Mutex::new(HashMap::new()),
             export: OnceLock::new(),
             exported: AtomicU64::new(0),
             export_failed: AtomicU64::new(0),
@@ -184,25 +192,7 @@ impl Tracer {
             (None, None) => Arc::from(uuid::Uuid::new_v4().simple().to_string().as_str()),
         };
         let span_id = new_span_id();
-        let mut traces = self.traces.lock().unwrap_or_else(|p| p.into_inner());
-        let at = match traces.iter().rposition(|t| t.trace_id == trace_id) {
-            Some(i) => i,
-            None => {
-                while traces.len() >= self.cfg.keep.max(1) {
-                    traces.pop_front();
-                }
-                traces.push_back(TraceRecord { trace_id: trace_id.clone(), spans: Vec::new(), dropped: 0 });
-                traces.len() - 1
-            }
-        };
-        let record = &mut traces[at];
-        if record.spans.len() >= self.cfg.max_spans.max(1) {
-            record.dropped = record.dropped.saturating_add(1);
-            // Children still learn which trace they belong to (and are
-            // dropped in turn); they hang off the nearest recorded ancestor.
-            return Some(TraceCtx { trace_id, span_id: parent.map(|p| p.span_id).unwrap_or(span_id), recorded: false });
-        }
-        record.spans.push(SpanRecord {
+        let span = SpanRecord {
             span_id,
             parent: parent.map(|p| p.span_id),
             remote_parent: remote.map(|(_, span)| span),
@@ -213,8 +203,76 @@ impl Tracer {
             status: SpanStatus::Open,
             code: None,
             attrs: Map::new(),
-        });
+        };
+        // Children still learn which trace they belong to (and are dropped
+        // in turn); they hang off the nearest recorded ancestor.
+        let unrecorded = |trace_id: Arc<str>| TraceCtx {
+            trace_id,
+            span_id: parent.map(|p| p.span_id).unwrap_or(span_id),
+            recorded: false,
+        };
+        let mut traces = self.traces.lock().unwrap_or_else(|p| p.into_inner());
+        let at = match traces.iter().rposition(|t| t.trace_id == trace_id) {
+            Some(i) => i,
+            // A child of a trace that has left the ring: it is not put back
+            // (that would evict another running trace in its place), but it
+            // is still exported when it ends.
+            None if parent.is_some() => {
+                return Some(if self.hold_detached(trace_id.clone(), span) {
+                    TraceCtx { trace_id, span_id, recorded: true }
+                } else {
+                    unrecorded(trace_id)
+                });
+            }
+            None => {
+                while traces.len() >= self.cfg.keep.max(1) {
+                    if let Some(evicted) = traces.pop_front() {
+                        self.detach(evicted);
+                    }
+                }
+                traces.push_back(TraceRecord { trace_id: trace_id.clone(), spans: Vec::new(), dropped: 0 });
+                traces.len() - 1
+            }
+        };
+        let record = &mut traces[at];
+        if record.spans.len() >= self.cfg.max_spans.max(1) {
+            record.dropped = record.dropped.saturating_add(1);
+            if self.export.get().is_some() {
+                // Never exported either: say so where the export is reported.
+                self.export_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            return Some(unrecorded(trace_id));
+        }
+        record.spans.push(span);
         Some(TraceCtx { trace_id, span_id, recorded: true })
+    }
+
+    /// A trace leaves the ring. Its finished spans were exported as they
+    /// ended; its open ones are held so they can be when they end too.
+    fn detach(&self, record: TraceRecord) {
+        if self.export.get().is_none() {
+            return;
+        }
+        for span in record.spans.into_iter().filter(|s| s.end_ns.is_none()) {
+            self.hold_detached(record.trace_id.clone(), span);
+        }
+    }
+
+    /// Hold an open span outside the ring until it ends. False (and counted
+    /// as dropped) when no exporter would ever take it, or the holding area
+    /// is full.
+    fn hold_detached(&self, trace_id: Arc<str>, span: SpanRecord) -> bool {
+        if self.export.get().is_none() {
+            return false;
+        }
+        let mut detached = self.detached.lock().unwrap_or_else(|p| p.into_inner());
+        if detached.len() >= MAX_DETACHED {
+            drop(detached);
+            self.export_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        detached.insert((trace_id, span.span_id), span);
+        true
     }
 
     /// Open a span that ends when the guard is dropped, as cancelled unless
@@ -241,13 +299,7 @@ impl Tracer {
         if !ctx.recorded {
             return;
         }
-        let finished = {
-            let mut traces = self.traces.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(record) = traces.iter_mut().rev().find(|t| t.trace_id == ctx.trace_id) else { return };
-            let Some(span) = record.spans.iter_mut().rev().find(|s| s.span_id == ctx.span_id) else { return };
-            if span.end_ns.is_some() {
-                return;
-            }
+        let close = |span: &mut SpanRecord, attrs: Vec<(&str, Value)>| {
             // Never before the start, whatever the wall clock did meanwhile.
             span.end_ns = Some(now_ns().max(span.start_ns));
             span.status = status;
@@ -255,7 +307,31 @@ impl Tracer {
             for (k, v) in attrs {
                 span.attrs.insert(k.to_string(), v);
             }
-            self.export.get().map(|_| span.clone())
+        };
+        let finished = {
+            let mut traces = self.traces.lock().unwrap_or_else(|p| p.into_inner());
+            let held = traces
+                .iter_mut()
+                .rev()
+                .find(|t| t.trace_id == ctx.trace_id)
+                .and_then(|record| record.spans.iter_mut().rev().find(|s| s.span_id == ctx.span_id));
+            match held {
+                Some(span) => {
+                    if span.end_ns.is_some() {
+                        return;
+                    }
+                    close(span, attrs);
+                    self.export.get().map(|_| span.clone())
+                }
+                // Its trace left the ring while it ran: export it from the
+                // holding area instead.
+                None => {
+                    let mut detached = self.detached.lock().unwrap_or_else(|p| p.into_inner());
+                    let Some(mut span) = detached.remove(&(ctx.trace_id.clone(), ctx.span_id)) else { return };
+                    close(&mut span, attrs);
+                    Some(span)
+                }
+            }
         };
         if let (Some(span), Some(tx)) = (finished, self.export.get())
             && tx.try_send(ExportSpan { trace_id: ctx.trace_id.clone(), span }).is_err()
@@ -333,37 +409,57 @@ impl Tracer {
     /// endpoint, else `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (used as given),
     /// else `OTEL_EXPORTER_OTLP_ENDPOINT` (with `/v1/traces` appended).
     /// Headers come from the variable the manifest names, else
-    /// `OTEL_EXPORTER_OTLP_HEADERS`, in its `k=v,k2=v2` form.
+    /// `OTEL_EXPORTER_OTLP_HEADERS`, in its `k=v,k2=v2` form with
+    /// percent-encoded values. An endpoint that is set but cannot be used,
+    /// and a header entry that cannot be sent, are logged once as warnings
+    /// rather than silently ignored.
     pub fn export_target(&self, env: impl Fn(&str) -> Option<String>) -> Option<ExportTarget> {
+        let (target, warnings) = self.export_plan(env);
+        for warning in warnings {
+            tracing::warn!("{warning}");
+        }
+        target
+    }
+
+    /// [`Self::export_target`], with the warnings returned instead of logged.
+    pub fn export_plan(&self, env: impl Fn(&str) -> Option<String>) -> (Option<ExportTarget>, Vec<String>) {
+        let mut warnings = Vec::new();
         if !self.cfg.enabled {
-            return None;
+            return (None, warnings);
         }
         let with_path = |base: &str| {
             let base = base.trim_end_matches('/');
             if base.ends_with("/v1/traces") { base.to_string() } else { format!("{base}/v1/traces") }
         };
         let nonempty = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let url = match nonempty(self.cfg.otlp_endpoint.clone()) {
-            Some(declared) => with_path(&declared),
+        let (source, url) = match nonempty(self.cfg.otlp_endpoint.clone()) {
+            Some(declared) => ("the app's tracing otlp_endpoint", with_path(&declared)),
             None => match nonempty(env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")) {
-                Some(exact) => exact,
-                None => with_path(&nonempty(env("OTEL_EXPORTER_OTLP_ENDPOINT"))?),
+                Some(exact) => ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", exact),
+                None => match nonempty(env("OTEL_EXPORTER_OTLP_ENDPOINT")) {
+                    Some(base) => ("OTEL_EXPORTER_OTLP_ENDPOINT", with_path(&base)),
+                    None => return (None, warnings),
+                },
             },
         };
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return None;
+        let problem = if !(url.starts_with("http://") || url.starts_with("https://")) {
+            Some("it has no http:// or https:// scheme (OTLP/HTTP needs one, e.g. http://collector:4318)".to_string())
+        } else {
+            match reqwest::Url::parse(&url) {
+                Ok(parsed) if parsed.host_str().is_some_and(|h| !h.is_empty()) => None,
+                Ok(_) => Some("it names no host".to_string()),
+                Err(e) => Some(format!("it is not a valid URL ({e})")),
+            }
+        };
+        if let Some(why) = problem {
+            // The value helps unless it carries credentials.
+            let shown = if url.contains('@') { String::new() } else { format!(" ({url:?})") };
+            warnings.push(format!("traces are not exported: {source}{shown} cannot be used: {why}"));
+            return (None, warnings);
         }
         let var = self.cfg.otlp_headers_env.as_deref().unwrap_or("OTEL_EXPORTER_OTLP_HEADERS");
-        let headers = env(var)
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|pair| {
-                let (k, v) = pair.split_once('=')?;
-                let (k, v) = (k.trim(), v.trim());
-                (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
-            })
-            .collect();
-        Some(ExportTarget { url, headers })
+        let headers = parse_headers(&env(var).unwrap_or_default(), var, &mut warnings);
+        (Some(ExportTarget { url, headers }), warnings)
     }
 
     /// Start exporting finished spans to `target` in batches. Called once, by
@@ -434,9 +530,48 @@ impl Tracer {
 }
 
 const EXPORT_QUEUE: usize = 4096;
+/// Open spans held for export after their trace left the ring.
+const MAX_DETACHED: usize = 4096;
 const EXPORT_BATCH: usize = 256;
 const EXPORT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 const EXPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Export headers in the `OTEL_EXPORTER_OTLP_HEADERS` form: `k=v` pairs
+/// separated by commas, each key and value trimmed and then percent-decoded
+/// (`Authorization=Bearer%20abc`), as the OpenTelemetry specification says.
+/// An entry that is not `key=value`, does not decode to UTF-8, or is not a
+/// valid HTTP header is skipped with a warning that names its position, never
+/// its contents, which are usually a credential.
+fn parse_headers(raw: &str, var: &str, warnings: &mut Vec<String>) -> Vec<(String, String)> {
+    let decode = |s: &str| percent_encoding::percent_decode_str(s.trim()).decode_utf8().map(|d| d.into_owned());
+    let mut out = Vec::new();
+    for (i, entry) in raw.split(',').enumerate() {
+        if entry.trim().is_empty() {
+            continue;
+        }
+        let n = i + 1;
+        let Some((k, v)) = entry.split_once('=') else {
+            warnings.push(format!("{var}: entry {n} is not key=value; it was skipped"));
+            continue;
+        };
+        let (Ok(k), Ok(v)) = (decode(k), decode(v)) else {
+            warnings.push(format!("{var}: entry {n} does not percent-decode to UTF-8; it was skipped"));
+            continue;
+        };
+        if k.is_empty() {
+            warnings.push(format!("{var}: entry {n} has an empty key; it was skipped"));
+            continue;
+        }
+        if reqwest::header::HeaderName::from_bytes(k.as_bytes()).is_err()
+            || reqwest::header::HeaderValue::from_str(&v).is_err()
+        {
+            warnings.push(format!("{var}: entry {n} is not a valid HTTP header name and value; it was skipped"));
+            continue;
+        }
+        out.push((k, v));
+    }
+    out
+}
 
 /// A span that closes itself. See [`Tracer::scoped`].
 pub struct Scoped<'a> {
@@ -711,6 +846,132 @@ mod tests {
                                              ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://other")])).unwrap().url,
                    "https://c.example/custom");
         assert!(plain.export_target(env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4317")])).is_none());
+    }
+
+    #[test]
+    fn an_endpoint_that_cannot_be_used_is_a_warning_naming_where_it_came_from() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        let plain = tracer(10, 10);
+        let (target, warnings) = plain.export_plan(env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4317")]));
+        assert!(target.is_none());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("OTEL_EXPORTER_OTLP_ENDPOINT") && warnings[0].contains("http://"), "{warnings:?}");
+        assert!(warnings[0].contains("collector:4317"), "{warnings:?}");
+        let (_, warnings) = plain.export_plan(env(&[("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://")]));
+        assert!(warnings[0].contains("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"), "{warnings:?}");
+        let (_, warnings) = plain.export_plan(env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "ftp://user:secret@c")]));
+        assert!(!warnings[0].contains("secret"), "credentials are not echoed: {warnings:?}");
+        let declared = Tracer::new(&TracingConfig { otlp_endpoint: Some("otel:4318".into()), ..Default::default() });
+        let (target, warnings) = declared.export_plan(env(&[]));
+        assert!(target.is_none() && warnings[0].contains("otlp_endpoint"), "{warnings:?}");
+        // Nothing configured, or a good endpoint: no warning.
+        assert_eq!(plain.export_plan(env(&[])), (None, vec![]));
+        let (target, warnings) = plain.export_plan(env(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318")]));
+        assert!(target.is_some() && warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn export_headers_are_percent_decoded_and_bad_entries_skipped_with_a_warning() {
+        let mut warnings = Vec::new();
+        let headers = parse_headers(
+            "Authorization=Bearer%20abc, x-team = core%2Cplatform ,api-key=a%3Db,,bad,=empty,x-nl=a%0Ab,x-bin=%FF,",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            &mut warnings,
+        );
+        assert_eq!(headers, vec![
+            ("Authorization".to_string(), "Bearer abc".to_string()),
+            ("x-team".to_string(), "core,platform".to_string()),
+            ("api-key".to_string(), "a=b".to_string()),
+        ]);
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(warnings[0].contains("entry 5 is not key=value"), "{warnings:?}");
+        assert!(warnings[1].contains("entry 6 has an empty key"), "{warnings:?}");
+        assert!(warnings[2].contains("entry 7 is not a valid HTTP header"), "{warnings:?}");
+        assert!(warnings[3].contains("entry 8 does not percent-decode"), "{warnings:?}");
+        assert!(warnings.iter().all(|w| !w.contains("Bearer") && !w.contains("a%0Ab")), "{warnings:?}");
+    }
+
+    fn exporting(keep: usize, max_spans: usize) -> (Tracer, tokio::sync::mpsc::Receiver<ExportSpan>) {
+        let t = tracer(keep, max_spans);
+        let (tx, rx) = tokio::sync::mpsc::channel(EXPORT_QUEUE);
+        assert!(t.export.set(tx).is_ok());
+        (t, rx)
+    }
+
+    fn received(rx: &mut tokio::sync::mpsc::Receiver<ExportSpan>) -> Vec<ExportSpan> {
+        let mut out = Vec::new();
+        while let Ok(span) = rx.try_recv() {
+            out.push(span);
+        }
+        out
+    }
+
+    #[test]
+    fn traces_evicted_while_running_are_still_exported_when_they_finish() {
+        let (t, mut rx) = exporting(2, 100);
+        // Ten runs at once with room for two: eight are evicted while open.
+        let roots: Vec<TraceCtx> = (0..10).map(|i| t.begin(None, None, "agent", &format!("run {i}")).unwrap()).collect();
+        assert_eq!(t.list()["kept"], 2);
+        for (i, root) in roots.iter().enumerate() {
+            let model = t.scoped(Some(root), "model", &format!("chat {i}"));
+            let nested = t.begin(model.ctx(), None, "tool", "tool t").unwrap();
+            t.end(&nested, SpanStatus::Ok, None, vec![]);
+            model.ok();
+            t.end(root, SpanStatus::Ok, None, vec![("webcortex.run.status", json!("completed"))]);
+            t.end(root, SpanStatus::Error, None, vec![]); // a second end is still a no-op
+        }
+        let spans = received(&mut rx);
+        assert_eq!(spans.len(), 30, "every span of every run is exported");
+        let roots_out: Vec<&ExportSpan> = spans.iter().filter(|s| s.span.parent.is_none()).collect();
+        assert_eq!(roots_out.len(), 10);
+        assert!(roots_out.iter().all(|s| s.span.status == SpanStatus::Ok && s.span.attrs["webcortex.run.status"] == "completed"));
+        let mut ids: Vec<&str> = spans.iter().map(|s| &*s.trace_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 10);
+        // Children of evicted traces did not push live traces out of the ring.
+        assert_eq!(t.list()["traces"][0]["name"], "run 9");
+        assert_eq!(t.list()["traces"][1]["name"], "run 8");
+        assert!(t.detached.lock().unwrap().is_empty(), "nothing is left held");
+        assert_eq!(t.list()["export"]["spans_dropped"], 0);
+    }
+
+    #[test]
+    fn without_an_exporter_nothing_is_held_for_evicted_traces() {
+        let t = tracer(1, 100);
+        let first = t.begin(None, None, "agent", "one").unwrap();
+        t.begin(None, None, "agent", "two").unwrap();
+        let child = t.begin(Some(&first), None, "tool", "late child").unwrap();
+        t.end(&child, SpanStatus::Ok, None, vec![]);
+        t.end(&first, SpanStatus::Ok, None, vec![]);
+        assert!(t.detached.lock().unwrap().is_empty());
+        assert_eq!(t.list()["kept"], 1);
+        assert_eq!(t.list()["traces"][0]["name"], "two", "a late child does not evict the live trace");
+        assert_eq!(t.list()["export"]["spans_dropped"], 0);
+    }
+
+    #[test]
+    fn spans_that_cannot_be_exported_are_counted_as_dropped() {
+        let (t, mut rx) = exporting(1, 2);
+        let root = t.begin(None, None, "agent", "a").unwrap();
+        let child = t.begin(Some(&root), None, "tool", "t1").unwrap();
+        // Over max_spans: not recorded, so never exported, and counted.
+        let over = t.begin(Some(&root), None, "tool", "t2").unwrap();
+        t.end(&over, SpanStatus::Ok, None, vec![]);
+        assert_eq!(t.list()["export"]["spans_dropped"], 1);
+        // Fill the holding area past its bound by evicting open traces: the
+        // first run's two open spans, then one per run, four too many.
+        for i in 0..MAX_DETACHED + 3 {
+            t.begin(None, None, "agent", &format!("r{i}")).unwrap();
+        }
+        assert_eq!(t.detached.lock().unwrap().len(), MAX_DETACHED);
+        assert_eq!(t.list()["export"]["spans_dropped"], 1 + 4);
+        t.end(&child, SpanStatus::Ok, None, vec![]);
+        t.end(&root, SpanStatus::Ok, None, vec![]);
+        let names: Vec<String> = received(&mut rx).into_iter().map(|s| s.span.name).collect();
+        assert_eq!(names, ["t1", "a"], "the first run's spans were held and exported");
     }
 
     #[test]
