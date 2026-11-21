@@ -41,6 +41,12 @@ KEY = "wcx_docs-test-key-0123456789abcdefghijklmnop"
 # that brings the fix turns this into an unexpected pass and the marker comes off.
 NEEDS_2_9_CORE = pytest.mark.xfail(
     strict=True, reason="needs the 2.9.0 core: WC602 before an approval is created")
+# The same for the Python halves that batches C and D add. Only a missing name
+# counts as the expected failure; a wrong number in a page still fails.
+NEEDS_BATCH_C = pytest.mark.xfail(
+    strict=True, raises=AttributeError, reason="needs batch C: webcortex._bridge.behaviour_limit")
+NEEDS_BATCH_D = pytest.mark.xfail(
+    strict=True, raises=AttributeError, reason="needs batch D: webcortex.cli.route_table")
 
 
 # ---------------------------------------------------------------- helpers
@@ -425,6 +431,42 @@ def test_api_reference_names_every_public_parameter():
             if not re.search(rf"\b{re.escape(pname)}\b", doc):
                 missing.append(f"{name}({pname}=)")
     assert not missing, f"docs/api-reference.md does not mention: {missing}"
+
+
+@NEEDS_BATCH_D
+def test_check_route_table_sample_is_what_check_prints(tutorial):
+    section = _section(_read("cli.md"), "## `webcortex check`")
+    claimed = [json.loads(line.strip().rstrip(","))
+               for line in _blocks(section, "console")[0][1].splitlines()
+               if line.strip().startswith('{"method"')]
+    assert claimed, "the check sample shows no route_table rows"
+    assert "`route_table`" in section
+    rows = cli.route_table(tutorial["step7"])
+    by_route = {(r["method"], r["path"]): r for r in rows}
+    for row in claimed:
+        assert set(row) == set(rows[0])
+        assert by_route[(row["method"], row["path"])] == row
+
+
+@NEEDS_BATCH_C
+def test_behaviour_pool_limit_is_what_the_pages_say(monkeypatch):
+    for page in ("behaviours.md", "security.md", "deployment.md"):
+        doc = _read(page)
+        for phrase in ("max(32, workers × 8)", "WEBCORTEX_MAX_BEHAVIOURS", "WC215"):
+            assert phrase in doc, (page, phrase)
+    from webcortex import _bridge
+    monkeypatch.delenv("WEBCORTEX_MAX_BEHAVIOURS", raising=False)
+    for workers in (1, 2, 4, 8, 16):
+        assert _bridge.behaviour_limit(workers) == max(32, workers * 8)
+    monkeypatch.setenv("WEBCORTEX_MAX_BEHAVIOURS", "5")
+    assert _bridge.behaviour_limit(4) == 5
+
+
+def test_json_filter_advice_quotes_attributes_with_single_quotes():
+    filters = _section(_read("frontend.md"), "### Filters")
+    assert "single-quoted" in filters
+    assert "='{{ ticket | json }}'" in filters
+    assert re.search(r"never `[^`]*=\"\{\{ ticket \| json \}\}\"`", filters)
 
 
 def test_cli_reference_has_a_section_for_every_command():

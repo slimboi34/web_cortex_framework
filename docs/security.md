@@ -236,7 +236,7 @@ means the TLS proxy in front of it said so with `X-Forwarded-Proto: https` or
 | Open connections | 10,000, WebSockets included | `max_connections`; past it a 503 `WC218` and close |
 | Proxied response body | 64 MiB | `app.upstream(..., max_response_bytes=...)`; past it a 502 `WC217` |
 | Invocation depth | 8 | not yet (`server.max_invocation_depth`) |
-| Concurrent behaviour runs | the behaviour pool's size, separate from Python route handlers | past it a `503`, not a queue |
+| Concurrent behaviour runs | `max(32, workers × 8)`, on threads separate from Python route handlers; past it a 503 `WC215`, not a queue | `WEBCORTEX_MAX_BEHAVIOURS` |
 | Pending approvals and sessions | 1,000 each, with a share per caller | not yet; a caller over its share evicts its own oldest entry, never another caller's |
 
 ## What has been tested

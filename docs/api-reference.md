@@ -160,7 +160,7 @@ app.models(default="claude-opus-5", fast="claude-haiku-4-5-20251001", local="oll
 Reachable as `<name>/<model>`. `kind` is `"openai"` or `"anthropic"`. `options` are extra
 request-body fields for every call to it.
 
-### `app.request_options(provider, **options)`
+### `app.request_options(provider, /, **options)`
 
 Extra top-level request-body fields for every call to one provider: a declared one, or the
 built-in `"anthropic"`, `"openai"` or `"ollama"`. `None` removes a field the runtime would

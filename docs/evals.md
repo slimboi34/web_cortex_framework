@@ -106,7 +106,9 @@ Also: `--only NAME` (repeatable), `--dir DIR` (default `evals`), `--list`, `--js
 A cassette that cannot be read or written (unreadable, a directory, not valid JSON) is
 `WC320` with its path, never a traceback. The other ways a run can fail before it starts, such
 as an `--only` name no eval has, are coded too: the command exits 1, and with `--json` prints
-`{"ok": false, "error": {...}}` on stdout.
+`{"ok": false, "error": {...}}` on stdout. `--record` with no reachable provider fails with the
+run's own code (`WC301`-`WC305`) and writes **no** cassette, so a half-recorded file cannot fail
+every later replay with `WC319`. Cassettes are written whole, through a temporary file.
 
 Under `WEBCORTEX_FAKE_PROVIDER=1` "the providers" is the deterministic fake, so evals written
 in its command language (`tool:<name> {…}`, `handoff:<agent>`) need no cassette at all.
@@ -215,7 +217,9 @@ assert report["ok"], [r["failures"] for r in report["results"] if not r["ok"]]
 `run_evals(mode=, directory=, only=)` returns `{"ok", "total", "passed", "failed", "tokens",
 "mode", "directory", "results"}`; each result has `name`, `target`, `mode` (the one actually
 used), `ok`, `failures`, `status`, `code`, `tokens`, `model_calls`, `duration_ms`, `trace_id`,
-`cassette` and `result` (the response body). That makes a pytest wrapper three lines:
+`cassette`, `result` (the response body) and, since 2.9, `error`: `null`, or
+`{"code", "message", "hint"}` when the eval could not be run or trusted (a missing or unreadable
+cassette, an exception in `check`). That makes a pytest wrapper three lines:
 
 ```python
 from api import app

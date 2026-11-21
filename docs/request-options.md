@@ -30,7 +30,7 @@ provider does not know is the provider's error to report (`WC304`, with its mess
 | --- | --- |
 | `app.agent(..., options={...})` | every model call that agent makes |
 | `@app.behaviour(..., options={...})` | every `ctx.ask` / `ctx.ask_many` in that behaviour |
-| `app.request_options(provider, **options)` or `app.provider(..., options={...})` | every call to that provider, from anything |
+| `app.request_options(provider, /, **options)` or `app.provider(..., options={...})` | every call to that provider, from anything (`provider` is positional, so an option may itself be called `provider`) |
 
 Provider options sit **beneath** an agent's or behaviour's own: the two are merged key by key
 and the agent wins.

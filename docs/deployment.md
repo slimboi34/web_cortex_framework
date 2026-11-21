@@ -60,6 +60,7 @@ Everything overridable by environment, so one image runs everywhere:
 | `WEBCORTEX_DATABASE_URL` | Overrides the declared database |
 | `WEBCORTEX_LOG` | `error` / `warn` / `info` / `debug` |
 | `WEBCORTEX_DEBUG_ERRORS` | **Never set in production** — returns tracebacks |
+| `WEBCORTEX_MAX_BEHAVIOURS` | Behaviour runs in progress at once (default `max(32, workers × 8)`); past it a 503 `WC215` |
 | `ANTHROPIC_API_KEY` | For `claude-*` and `anthropic/…` models; `ANTHROPIC_BASE_URL` for a gateway |
 | `OPENAI_API_KEY` | For `gpt-*` and `openai/…` models; `OPENAI_BASE_URL` for a gateway |
 | `OLLAMA_HOST` | Where `ollama/…` models are served (default `http://127.0.0.1:11434`) |

@@ -226,11 +226,14 @@ but its model calls are not held to anything but the budget.
 
 Behaviours run on a thread pool of their own, separate from the one that runs
 sync route handlers, so a behaviour's `ctx.call` to a sync route always finds a
-thread. When every behaviour thread is busy, a new run is refused with `503`
-rather than queued. `ctx.call`, `ctx.gather`, `ctx.ask` and `ctx.ask_many` wait
-at most for the request's remaining time, then raise, so a stuck call cannot
-hold a thread forever. (In 2.8, a handful of concurrent behaviours calling sync
-routes could deadlock the shared pool for good.)
+thread. The pool runs at most `max(32, workers × 8)` behaviours at once
+(`WEBCORTEX_MAX_BEHAVIOURS` sets another limit). Past that, a new run is refused
+at once with **503 `WC215`** rather than queued, so a behaviour that calls a
+behaviour cannot wait for a slot its own caller holds. `ctx.call`, `ctx.gather`,
+`ctx.ask` and `ctx.ask_many` wait at most for the request's remaining time,
+then raise, so a stuck call cannot hold a thread forever. (In 2.8, eight
+concurrent behaviours calling sync routes could deadlock the shared pool for
+good, and the process then ignored SIGTERM.)
 
 ## Worked example: refund processing
 

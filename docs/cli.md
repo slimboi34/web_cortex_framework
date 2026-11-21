@@ -85,13 +85,19 @@ $ webcortex check
   "native_routes": 10,
   "tools": ["list_tickets", "get_tickets", "..."],
   "agents": ["assistant"],
+  "route_table": [
+    {"method": "GET", "path": "/tickets", "engine": "query", "tool": "list_tickets", "scopes": ["read"]},
+    {"method": "GET", "path": "/tickets/{id}/summary", "engine": "python", "tool": "get_tickets_by_id_summary", "scopes": ["read"]},
+    ...
+  ],
   "security": { "auth_configured": true, "public_routes": [], ... }
 }
 ```
 
-Since 2.9 it also prints the route table it promises: every route with its
-method, path, the engine that serves it (`query`, `python`, `agent`, …) and the
-scopes it needs, and the same rows are in the JSON.
+`route_table` (since 2.9) has one row per route: its method, path, the engine
+that serves it (the op kind: `query`, `python`, `static`, `proxy`, `page`,
+`agent`, `flow`, …), the tool it is exposed as (`null` if none) and the scopes
+it requires. `routes` is still the count.
 
 Catches: duplicate routes, duplicate tool names, agents referencing tools,
 handoffs or context providers that do not exist (with suggestions), flows whose
@@ -187,9 +193,12 @@ $ webcortex context > CONTEXT.md
 $ webcortex context --json        # the raw manifest instead
 ```
 
-`--json` replaces the value of every upstream header (`app.upstream(...,
-headers=...)`) with `"<redacted>"`, so the output is safe to paste into a chat
-or a ticket; `--show-secrets` prints them as declared.
+`--json` replaces the value of every header given to `app.upstream(...,
+headers=...)` or `app.camera(..., headers=...)`, and any `user:password@` in an
+upstream, camera, webhook or database URL, with `"<redacted>"` (since 2.9), so
+the output is safe to paste into a chat or a ticket. Header names and
+environment variable names stay. `--show-secrets` prints the manifest as
+declared. The Markdown context pack never included those values.
 
 ## `webcortex mcp-config`
 

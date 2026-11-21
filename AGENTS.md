@@ -388,7 +388,7 @@ U+2029 come out as `\uXXXX`, and it returns a safe string. **Never generate
 ```python
 app.models(**aliases)                      # e.g. default=..., fast=..., local="ollama/qwen3.5:9b"
 app.provider(name, *, base_url, kind="openai", api_key_env=None, options=None)
-app.request_options(provider, **options)   # extra request-body fields per provider (§8c)
+app.request_options(provider, /, **options)   # extra request-body fields per provider (§8c); provider is positional-only
 app.pricing(model, *, input_per_mtok, output_per_mtok,
             cache_read_per_mtok=0.0, cache_write_per_mtok=0.0)
 ```
@@ -531,8 +531,9 @@ Behaviours run on a thread pool of their own (2.9: separate from the sync
 handler pool, so a nested `ctx.call` to a sync route always has a thread) and
 block on `Handle::block_on`; `gather`/`ask_many` block once on a `join_all`.
 Every such block has a deadline (the request's remaining time), and a run that
-finds the behaviour pool full is refused with 503 instead of queued. Never run a
-behaviour on an event loop, and never add an unbounded `block_on`.
+finds the behaviour pool full (`max(32, workers × 8)`, or `WEBCORTEX_MAX_BEHAVIOURS`)
+is refused with 503 `WC215` instead of queued. Never run a behaviour on an event
+loop, and never add an unbounded `block_on`.
 
 A behaviour with no `scopes` and no `expose_scopes` is a public route.
 
@@ -853,7 +854,7 @@ values are type-checked at declaration; `true` never equals `1` in `data`; an ex
 
 | call | returns |
 | --- | --- |
-| `app.check()` | validated report: routes, tools, agents, behaviours, flows, contexts. Raises on any invalid declaration (2.9: including a page template that is missing or does not parse). `webcortex check` also prints the route table: method, path, engine, scopes |
+| `app.check()` | validated report: routes, tools, agents, behaviours, flows, contexts. Raises on any invalid declaration (2.9: including a page template that is missing or does not parse). `webcortex check` also prints `route_table`: one `{method, path, engine, tool, scopes}` per route |
 | `app.manifest()` / `app.manifest_json()` | the manifest the Rust runtime executes |
 | `app.openapi()` | OpenAPI document, with `x-webcortex-tool` and `x-webcortex-op` extensions |
 | `app.schema_sql` | property — DDL for declared resources and memories |
@@ -934,8 +935,9 @@ always for `check`).
 `$WEBCORTEX_API_KEY`, at `--url` (2.9), else `WEBCORTEX_HOST`/`WEBCORTEX_PORT` or
 the app's own over plain HTTP.
 
-`context --json` replaces upstream header values with `"<redacted>"` unless
-`--show-secrets` is passed. `mcp-config` prints the `mcpServers` entry and a
+`context --json` replaces upstream and camera header values, and any
+`user:password@` in an upstream, camera, webhook or database URL, with
+`"<redacted>"` unless `--show-secrets` is passed. `mcp-config` prints the `mcpServers` entry and a
 shell-quoted `claude mcp add` command (server name reduced to `[A-Za-z0-9_-]`).
 `dev` does not reload; restart it after editing `api.py`.
 

@@ -40,6 +40,14 @@ app.query(
 from the path, then the query string, then the JSON body — so a caller (or a
 model) can supply them wherever is natural.
 
+With no `input_schema=`, the route advertises one derived from `params` (since
+2.9; before, MCP clients, OpenAPI and agents saw an empty object): one property
+per name, `@principal` left out, required when it is a `{name}` in the path,
+typed from a resource field of the same name when the SQL names that resource's
+table, otherwise a string (or any JSON value in a `POST`, `PUT` or `PATCH`
+body). The description defaults to `summary`, else the first line of the SQL.
+An explicit `input_schema=` still wins.
+
 `returns` controls the shape:
 
 | Value | Response |
@@ -201,7 +209,7 @@ or `@app.route(method, path)`.
 | `req.query_list(name)` | `list[str]` | Every value of a query key, in order (`?tag=a&tag=b`) |
 | `req.headers` | `dict` | Lower-cased keys |
 | `req.body` | `bytes` | Raw |
-| `req.json()` | `Any` | Parsed and cached |
+| `req.json()` | `Any` | Parsed and cached. A body that is not JSON, or (since 2.9) is nested too deeply to parse, raises a `ValueError` that answers 400 `WC205` if you let it propagate |
 | `req.user` | `dict` | `{id, authenticated, scopes}` |
 | `req.scopes` | `list` | Convenience |
 | `req.get(name, default)` | `Any` | Path → query → body |
@@ -291,6 +299,9 @@ Refused by the runtime: path traversal in **any** encoding (double-encoded,
 overlong UTF-8, `..;/`, NUL truncation), symlinks pointing outside the root, and
 dotfiles — so a stray `.env` or `.git` under a static root cannot leak.
 
+Since 2.9 static files are streamed from disk rather than read into memory
+whole, with the same ETags and traversal checks.
+
 ## Proxy
 
 The gateway primitive.
@@ -358,5 +369,14 @@ Omit `tool_name` and it is generated from method and path:
 | `DELETE /a/b/{c}` | `delete_a_b_by_c` |
 
 Two routes claiming the same name is a boot error, not an ambiguous tool call.
+
+### How a request path is matched
+
+A request path is normalised before it is matched (since 2.9): percent-encoded
+unreserved characters are decoded and hex is upper-cased, so `/p%69ng` is
+`/ping`, and a route with a non-ASCII literal segment (`/café/{n}`) answers
+whether the client sends raw UTF-8, `%C3%A9` or `%c3%a9`. `%2F`, `%5C` and
+`%25` stay encoded, so an encoded separator never splits a segment, and a
+parameter is still decoded exactly once.
 
 [Database :material-arrow-right:](database.md){ .md-button .md-button--primary }
