@@ -46,7 +46,7 @@ model) can supply them wherever is natural.
 |---|---|
 | `"many"` | JSON array of row objects |
 | `"one"` | Single object, or **404** when nothing matches |
-| `"affected"` | `{"affected": n, "last_insert_id": m}` |
+| `"affected"` | `{"affected": n, "last_insert_id": m}`; `m` is `null` unless the statement inserted a row |
 
 !!! danger "Parameters are data, never syntax"
     Values are always bound, never interpolated. `?limit=1 OR 1=1` reaches
@@ -79,6 +79,24 @@ Five routes, five tools, zero interpreter involvement:
 | POST | `/tickets` | `create_tickets` | `write_scopes` |
 | PUT | `/tickets/{id}` | `update_tickets` | `write_scopes` |
 | DELETE | `/tickets/{id}` | `delete_tickets` | `write_scopes` |
+
+### What the generated routes accept
+
+Each route advertises an input schema, and since 2.9 a body that breaks it is
+refused with **422** (`WC206`, naming the field) before any SQL runs: a missing
+required field, a key the resource does not declare, or a value of the wrong
+type. `POST` needs every field except a generated integer key. `PUT` replaces
+the whole row, so it needs every writable field too; there is no partial
+update (`PATCH`) yet, so send the row back with your change:
+
+```python
+row = ctx.call("get_tickets", id=41)
+ctx.call("update_tickets", **{**row, "priority": 1})
+```
+
+`GET /tickets` is newest first (by primary key, descending). `limit` defaults
+to 50 and is clamped to 1–1000; `offset` defaults to 0 and is never negative.
+A `bool` field reads back as `true`/`false`, not SQLite's `1`/`0`.
 
 ### Options
 
@@ -142,8 +160,20 @@ or `@app.route(method, path)`.
         return {"id": id, "verbose": verbose}
     ```
 
-    Parameters are bound by name and coerced from the annotation. The signature
-    **becomes the tool schema**, so an agent gets a precise contract for free.
+    Parameters are bound by name and converted to their annotations. The
+    signature **becomes the tool schema**, so an agent gets a precise contract
+    for free.
+
+    A conversion is not a validation. A value that cannot be converted reaches
+    the handler **unchanged**: `/tickets/abc` calls `get_ticket` with
+    `id == "abc"`, and `verbose=maybe` arrives as the string `"maybe"`. The
+    same holds for a dataclass body parameter: a body with a key the class does
+    not declare, or without a required field, arrives as the raw `dict`, and a
+    field that cannot be converted keeps the value that was sent. Check what you
+    rely on, raise `HTTPError(422, ...)` when it is wrong, and never put a
+    parameter into SQL, a shell command or a file path on the strength of its
+    annotation. A model's tool call is bound the same way, so the same applies
+    when an agent is the caller.
 
 === "Raw request"
 
@@ -242,7 +272,9 @@ Every template also receives:
 ```
 
 `.html`, `.htm`, `.xhtml`, `.xml` and `.svg` templates autoescape (also as
-`page.html.j2`). Template inheritance,
+`page.html.j2`), and since 2.9 the template's extension also sets the response's
+content type, so a `.txt` or `.json` page is no longer served as HTML. Template
+inheritance,
 `{% extends %}`, `{% block %}`, and filters all work. See
 [Frontend](frontend.md).
 
@@ -279,6 +311,11 @@ The proxy forwards only `content-type` and `accept`. It never forwards the
 caller's `Authorization` header: the upstream sees *your* credentials, not
 whatever the client happened to send.
 
+Redirects are relayed, never followed. Since 2.9 a `3xx` from the upstream goes
+back to the caller with its `Location` header (rewritten when it points inside
+the upstream's `base_url`), and the proxy sends no `Referer`. Following it would
+have sent your upstream credentials to whatever host the redirect named.
+
 !!! danger "Path parameters are attacker-controlled"
     A parameter containing `..` or `/` is rejected with **400** before the
     request is issued, checked raw and after double percent-decoding. Without
@@ -304,7 +341,7 @@ Every route-declaring function accepts:
 | `tool` | `False` | Expose as an agent tool |
 | `tool_name` | derived | Override the generated name |
 | `scopes` | `()` | Scopes required to reach it at all |
-| `approval` | `"never"` | `"required"` gates agent invocation |
+| `approval` | `"never"` | `"required"` gates agent, behaviour and MCP calls (not a direct HTTP call) |
 | `read_only` | by method | MCP hint |
 | `idempotent` | by method | MCP hint |
 | `summary` | docstring | |
