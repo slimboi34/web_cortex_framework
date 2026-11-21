@@ -22,7 +22,50 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-__all__ = ["doctor", "fetch_status", "app_url", "render_doctor", "render_status"]
+__all__ = ["doctor", "fetch_status", "app_url", "render_doctor", "render_status", "boot_error_code",
+           "is_placeholder_secret"]
+
+
+# What the runtime says when an app cannot boot, and the catalogued code for
+# each. First match wins; the messages are the core's own (app.rs, server.rs,
+# templates.rs, db.rs).
+_BOOT_ERRORS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"^bind "), "WC104"),
+    (re.compile(r"template directory .* does not exist"), "WC107"),
+    (re.compile(r"template .* failed to load"), "WC004"),
+    (re.compile(r"unable to open database file"), "WC107"),
+    (re.compile(r"^(invalid application|invalid manifest)"), "WC101"),
+)
+
+
+def boot_error_code(message: str, default: str = "WC101") -> str:
+    """The error code for a message the runtime raised while building the app.
+
+    Args:
+        message: The text of the ``RuntimeError`` or ``ValueError`` (from
+            ``app.run()``, ``app.check()`` or an eval).
+        default: The code when nothing more specific matches.
+
+    Returns:
+        ``WC104`` for a listen address that cannot be bound, ``WC004`` for a
+        page template that is missing or does not parse, ``WC107`` for a
+        templates directory or SQLite file that cannot be opened, ``WC101``
+        for an invalid manifest, else ``default``.
+
+    Example::
+
+        boot_error_code('template "p.html" failed to load: syntax error')   # "WC004"
+    """
+    for pattern, code in _BOOT_ERRORS:
+        if pattern.search(message):
+            return code
+    return default
+
+
+def is_placeholder_secret(value: str | None) -> bool:
+    """True for a credential that is empty or still the ``replace-me`` text of a
+    starter's ``.env.example``: present, but not a secret anyone generated."""
+    return not (value or "").strip() or (value or "").strip().lower().startswith("replace-me")
 
 
 def _check(id: str, status: str, message: str, hint: str = "", code: str | None = None) -> dict:
@@ -224,16 +267,30 @@ def doctor(app: Any, *, online: bool = False, url: str | None = None, key: str |
                        code="WC106"))
 
     # -- credentials named by the app (presence only) ---------------------------
+    # A value is never printed, but a placeholder is recognised: the text of a
+    # starter's .env.example is public, so a key equal to it is no secret.
     for env, spec in manifest["auth"]["api_keys"].items():
-        if os.environ.get(env):
+        value = os.environ.get(env)
+        if value and not is_placeholder_secret(value):
             add(_check(f"api_key:{env}", "ok", f"{env} is set (principal {spec['id']!r})"))
+        elif value and value.strip():
+            add(_check(f"api_key:{env}", "fail",
+                       f"{env} is still the placeholder from .env.example: anyone who has read the "
+                       f"starter holds principal {spec['id']!r}",
+                       f"export {env}=$(webcortex keygen), or put a generated key in .env", code="WC106"))
         else:
             add(_check(f"api_key:{env}", "fail",
-                       f"{env} is not set: principal {spec['id']!r} cannot authenticate",
+                       f"{env} is {'empty' if value is not None else 'not set'}: principal "
+                       f"{spec['id']!r} cannot authenticate",
                        f"export {env}=$(webcortex keygen)", code="WC106"))
     jwt = manifest["auth"].get("jwt")
-    if jwt and not os.environ.get(jwt.get("secret_env", "")):
-        add(_check("jwt", "fail", f"{jwt.get('secret_env')} (the JWT secret) is not set", code="WC106"))
+    secret_env = (jwt or {}).get("secret_env", "")
+    if jwt and is_placeholder_secret(os.environ.get(secret_env)):
+        raw = os.environ.get(secret_env)
+        what = ("is still the placeholder from .env.example" if (raw or "").strip()
+                else "is empty" if raw is not None else "is not set")
+        add(_check("jwt", "fail", f"{secret_env} (the JWT secret) {what}",
+                   f"export {secret_env}=$(webcortex keygen)", code="WC106"))
     for name, up in (manifest.get("upstreams") or {}).items():
         env = up.get("bearer_env")
         if env and not os.environ.get(env):
@@ -247,6 +304,10 @@ def doctor(app: Any, *, online: bool = False, url: str | None = None, key: str |
         add(_check("tracing", "warn",
                    f"tracing names {headers_env} for its export headers, which is not set: spans "
                    f"will be sent without them", code="WC106"))
+    if tracing.get("enabled", True):
+        export = _otlp_check(tracing)
+        if export is not None:
+            add(export)
 
     # -- security posture --------------------------------------------------------
     sec = app.security_report()
@@ -357,6 +418,48 @@ def doctor(app: Any, *, online: bool = False, url: str | None = None, key: str |
         add(_check("port", "ok", f"{probe_host}:{port} is free"))
 
     return _summarise(checks)
+
+
+def _without_userinfo(url: str) -> str:
+    """``url`` with any ``user:password@`` replaced, so a check can name it."""
+    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@", r"\1<redacted>@", url)
+
+
+def _otlp_check(tracing: dict) -> dict | None:
+    """Where spans will be exported, and whether that address can work.
+
+    Mirrors the core's choice (trace.rs ``export_target``): the endpoint in
+    ``app.tracing(otlp_endpoint=)``, else ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``,
+    else ``OTEL_EXPORTER_OTLP_ENDPOINT``. The core drops an endpoint that is
+    not ``http(s)://`` without a word, so this is where a typo shows up.
+    """
+    import urllib.parse
+
+    sources = [("app.tracing(otlp_endpoint=)", tracing.get("otlp_endpoint")),
+               ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
+               ("OTEL_EXPORTER_OTLP_ENDPOINT", os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"))]
+    found = next(((where, value.strip()) for where, value in sources if value and value.strip()), None)
+    if found is None:
+        return None
+    where, endpoint = found
+    shown = _without_userinfo(endpoint)
+    problem = None
+    try:
+        parts = urllib.parse.urlsplit(endpoint)
+        parts.port  # noqa: B018 - raises ValueError for a port that is not a number in range
+    except ValueError as e:
+        problem = f"does not parse as a URL ({e})"
+    else:
+        if parts.scheme not in ("http", "https"):
+            problem = "has no http:// or https:// scheme"
+        elif not parts.hostname:
+            problem = "names no host"
+    if problem:
+        return _check("tracing.export", "warn",
+                      f"the OTLP endpoint from {where} ({shown}) {problem}: spans will not be exported",
+                      "Give the collector's full URL with its scheme, e.g. http://127.0.0.1:4318; spans "
+                      "are sent as OTLP over HTTP.")
+    return _check("tracing.export", "ok", f"spans are exported to {shown} (from {where})")
 
 
 def _summarise(checks: list[dict]) -> dict:

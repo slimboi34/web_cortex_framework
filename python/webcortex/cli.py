@@ -10,6 +10,8 @@ import argparse
 import importlib.util
 import json
 import os
+import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -296,12 +298,20 @@ def _strip_fence(text: str) -> str:
     return t
 
 
+def mcp_server_name(name: str | None) -> str:
+    """The app's name as an MCP server name: letters, digits, ``_`` and ``-``
+    only, so it is one word in a shell command and a plain key in a config."""
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name or "").strip("-")
+    return slug or "webcortex"
+
+
 def mcp_config(app: Any, key: str | None = None) -> dict:
     """The `mcpServers` entry an MCP client needs to reach this app.
 
     Streamable HTTP at the app's MCP endpoint; the API key travels as the same
     `x-api-key` header the REST side uses, so the client gets exactly the scopes
-    that key has and nothing more.
+    that key has and nothing more. The server is named after the app, reduced
+    to ``[A-Za-z0-9_-]`` (see :func:`mcp_server_name`).
     """
     from .app import resolve_port
 
@@ -309,43 +319,165 @@ def mcp_config(app: Any, key: str | None = None) -> dict:
     port = resolve_port(app.port)
     prefix = getattr(app, "control_prefix", "/_webcortex")
     url = f"http://{host}:{port}{prefix}/mcp"
-    name = getattr(app, "name", None) or "webcortex"
+    name = mcp_server_name(getattr(app, "name", None))
     return {"mcpServers": {name: {"type": "http", "url": url, "headers": {"x-api-key": key} if key else {}}}}
 
 
+def claude_mcp_add_command(name: str, url: str, key: str | None) -> str:
+    """The `claude mcp add` line for this app, quoted for a POSIX shell.
+
+    Every argument is quoted with :func:`shlex.join`, so a name, URL or key
+    holding a space, ``;``, ``$`` or a backtick is passed as written rather
+    than run or expanded. Without a key the header is left as
+    ``"x-api-key: $WEBCORTEX_API_KEY"`` in double quotes, for the shell to fill
+    in from the environment when the line is pasted.
+    """
+    words = ["claude", "mcp", "add", "--transport", "http", name, url, "--header"]
+    header = shlex.quote(f"x-api-key: {key}") if key else '"x-api-key: $WEBCORTEX_API_KEY"'
+    return f"{shlex.join(words)} {header}"
+
+
 def _control(app: Any, method: str, path: str, body: dict | None = None,
-             key: str | None = None) -> dict:
-    """Call the running app's control plane with the operator's API key."""
+             key: str | None = None, url: str | None = None) -> dict:
+    """Call the running app's control plane with the operator's API key.
+
+    ``url`` is the running app's base URL (``--url``), which replaces the
+    address derived from WEBCORTEX_HOST/PORT or the app; ``app`` may be None
+    when it is given, and the control prefix is then the default.
+    """
     import urllib.error
     import urllib.request
 
-    from .app import resolve_port
+    from .diagnostics import app_url, credential_headers, operator_credential
 
-    host = os.environ.get("WEBCORTEX_HOST", app.host)
-    port = resolve_port(app.port)
-    url = f"http://{host}:{port}{app.control_prefix}{path}"
+    prefix = getattr(app, "control_prefix", "/_webcortex") if app is not None else "/_webcortex"
+    base = app_url(app, url) if app is not None else (url or "http://127.0.0.1:8000").rstrip("/")
+    target = f"{base}{prefix}{path}"
     data = json.dumps(body or {}).encode() if method == "POST" else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"content-type": "application/json"})
-    from .diagnostics import credential_headers, operator_credential
-
+    try:
+        req = urllib.request.Request(target, data=data, method=method,
+                                     headers={"content-type": "application/json"})
+    except ValueError as e:
+        raise CLIError("WC108", f"{target} is not a URL: {e}",
+                       "Pass the running app's base URL, e.g. --url https://app.example.com") from None
     for name, value in credential_headers(operator_credential(key)).items():
         req.add_header(name, value)
+    not_webcortex = ("Check --url (or WEBCORTEX_HOST/WEBCORTEX_PORT) points at the running WebCortex app, "
+                     "without a path.")
     try:
         with urllib.request.urlopen(req, timeout=5) as res:
-            return json.loads(res.read() or b"{}")
+            raw = res.read()
     except urllib.error.HTTPError as e:
         raw = e.read().decode(errors="replace")
         try:
             err = json.loads(raw).get("error", {})
         except (ValueError, AttributeError):
             err = {}
+        if not isinstance(err, dict) or not err:
+            if e.code == 404:
+                raise CLIError("WC108", f"{target} answered 404, and not with a WebCortex error",
+                               not_webcortex) from None
+            err = {}
         from .errors import code_for_status
 
-        raise CLIError(err.get("code") or code_for_status(e.code), f"{url} answered {e.code}: "
-                       f"{err.get('message', raw)}", err.get("hint"))
+        raise CLIError(err.get("code") or code_for_status(e.code), f"{target} answered {e.code}: "
+                       f"{err.get('message', raw)}", err.get("hint")) from None
     except urllib.error.URLError as e:
-        raise CLIError("WC108", f"cannot reach {url}: {e.reason}")
+        raise CLIError("WC108", f"cannot reach {target}: {e.reason}") from None
+    except OSError as e:
+        raise CLIError("WC108", f"cannot reach {target}: {e}") from None
+    try:
+        document = json.loads(raw or b"{}")
+    except ValueError:
+        document = None
+    if not isinstance(document, dict):
+        raise CLIError("WC108", f"{target} answered, but not with a WebCortex document", not_webcortex)
+    return document
+
+
+_REDACTED = "<redacted>"
+
+
+def _redact_url(url: Any) -> Any:
+    """A URL with any ``user:password@`` replaced."""
+    if not isinstance(url, str):
+        return url
+    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@", rf"\1{_REDACTED}@", url)
+
+
+def redacted_manifest(manifest: dict) -> dict:
+    """The manifest with the credentials an app may have written into it hidden.
+
+    `app.upstream(headers=...)` and `app.camera(headers=...)` hold header values
+    as given, which for an API that authenticates with a header is the
+    credential itself; a URL may carry ``user:password@``. Those values become
+    ``"<redacted>"``. The names stay, so the shape of the app is still there to
+    read, and environment variable *names* (``bearer_env``, ``api_key_env``)
+    are not secrets.
+    """
+    m = json.loads(json.dumps(manifest))
+    for up in (m.get("upstreams") or {}).values():
+        up["headers"] = {k: _REDACTED for k in (up.get("headers") or {})}
+        up["base_url"] = _redact_url(up.get("base_url"))
+    for device in m.get("devices") or []:
+        source = device.get("source")
+        if isinstance(source, dict):
+            source["headers"] = {k: _REDACTED for k in (source.get("headers") or {})}
+            source["url"] = _redact_url(source.get("url"))
+    for watcher in m.get("watchers") or []:
+        hook = watcher.get("webhook")
+        if isinstance(hook, dict):
+            hook["url"] = _redact_url(hook.get("url"))
+    database = m.get("database")
+    if isinstance(database, dict):
+        database["url"] = _redact_url(database.get("url"))
+    return m
+
+
+def route_table(app: Any) -> list[dict]:
+    """Every route the app serves: method, path, the engine that executes it,
+    the tool it is exposed as (or None) and the scopes it requires."""
+    from .contextpack import _derive_tool_name
+
+    rows = []
+    for r in app.manifest()["routes"]:
+        tool = r.get("tool") or {}
+        name = (tool.get("name") or _derive_tool_name(r["method"], r["path"])) if tool.get("expose") else None
+        rows.append({"method": r["method"], "path": r["path"], "engine": (r.get("op") or {}).get("kind"),
+                     "tool": name, "scopes": list(r.get("scopes") or [])})
+    return rows
+
+
+def _boot_failure(app: Any, message: str, default: str = "WC101") -> CLIError:
+    """A runtime refusal to build or serve the app, as a coded CLI error that
+    names the file (and line) to fix instead of a Python traceback."""
+    from .diagnostics import boot_error_code
+
+    code = boot_error_code(message, default)
+    hint = None
+    if code == "WC104" and not any(t in message for t in ("in use", "os error 48", "os error 98",
+                                                          "os error 10048")):
+        hint = ("The address cannot be listened on. Choose another with --host/--port (or "
+                "WEBCORTEX_HOST/WEBCORTEX_PORT); ports below 1024 need extra privileges.")
+    if code == "WC004":
+        message = _template_location(app, message)
+    return CLIError(code, message, hint)
+
+
+def _template_location(app: Any, message: str) -> str:
+    """Point a template error at the file: ``(in p.html:3)`` becomes
+    ``(at templates/p.html:3)``; a missing template names where it was looked for."""
+    directory = getattr(app, "templates_dir", None)
+    if not directory:
+        return message
+    at = re.search(r"\(in ([^():]+):(\d+)\)", message)
+    if at:
+        where = Path(directory) / at.group(1)
+        return f"{message[:at.start()]}(at {where}:{at.group(2)}){message[at.end():]}"
+    missing = re.search(r'template "([^"]+)" failed to load: .*(not found|does not exist)', message)
+    if missing:
+        return f"{message} (expected at {Path(directory) / missing.group(1)})"
+    return message
 
 
 def _cmd_new(args: argparse.Namespace) -> int:
@@ -450,10 +582,16 @@ def _parser() -> argparse.ArgumentParser:
         if name == "typegen":
             p.add_argument("--out", "-o", default="client/api.ts")
         if name == "context":
-            p.add_argument("--json", action="store_true", help="emit the raw manifest instead")
+            p.add_argument("--json", action="store_true",
+                           help="emit the raw manifest instead (credential values redacted)")
+            p.add_argument("--show-secrets", action="store_true",
+                           help="with --json, print upstream and camera header values and URL passwords as "
+                                "declared instead of <redacted>")
         if name in ("halt", "release"):
             p.add_argument("--key", default=None,
                            help="admin API key or JWT bearer token (default: $WEBCORTEX_API_KEY, then $WEBCORTEX_TOKEN)")
+            p.add_argument("--url", default=None,
+                           help="the running app's base URL (default: WEBCORTEX_HOST/PORT or the app's own)")
         if name == "halt":
             p.add_argument("--reason", "-r", default="", help="recorded in the audit log")
             p.add_argument("--status", action="store_true", help="only report whether it is halted")
@@ -584,16 +722,39 @@ def _cmd_trace(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_estop(args: argparse.Namespace) -> int:
+    """`webcortex halt` / `webcortex release`: the emergency stop of a running app.
+
+    With ``--url`` and no app module here, the operator needs nothing but the
+    address and an admin credential, which is what an e-stop should need.
+    """
+    app = None
+    if not (args.url and args.target == DEFAULT_MODULE and not Path(DEFAULT_MODULE).exists()):
+        app = _load_app(args.target)
+    if args.command == "release":
+        state = _control(app, "POST", "/release", key=args.key, url=args.url)
+        print("released: actuators enabled" if state.get("was_halted") else "was not halted")
+        return 0
+    if args.status:
+        print(json.dumps(_control(app, "GET", "/halt", key=args.key, url=args.url), indent=2))
+        return 0
+    state = _control(app, "POST", "/halt", {"reason": args.reason}, key=args.key, url=args.url)
+    print(f"HALTED: {(state.get('state') or {}).get('reason', '')}. Actuators refuse to run "
+          f"until `webcortex release`.")
+    return 0
+
+
 def _cmd_eval(app: Any, args: argparse.Namespace) -> int:
     """`webcortex eval`: run the declared evals; exit 1 when any fails."""
-    from .evals import cassette_path, render_report, run_evals
+    from .evals import _exists, cassette_path, render_report, run_evals
 
     if args.list:
         cases = [{"name": c.name, "target": c.target, "description": c.description,
-                  "expect": c.expect, "cassette": cassette_path(args.dir, c.name).exists()}
+                  "expect": c.expect, "cassette": _exists(cassette_path(args.dir, c.name))}
                  for c in app._evals]
         if args.json:
-            print(json.dumps({"evals": cases}, indent=2))
+            print(json.dumps({"evals": cases}, indent=2,
+                             default=lambda v: sorted(v) if isinstance(v, (set, frozenset)) else str(v)))
         else:
             for c in cases:
                 print(f"  {c['name']:<32} → {c['target']}  "
@@ -632,6 +793,8 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return _cmd_status(args)
     if args.command == "trace":
         return _cmd_trace(args)
+    if args.command in ("halt", "release"):
+        return _cmd_estop(args)
     app = _load_app(args.target)
 
     if args.command == "eval":
@@ -653,37 +816,23 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         try:
             _banner(app)
         except ValueError as e:
-            raise CLIError("WC101", str(e)) from None
+            raise _boot_failure(app, str(e)) from None
         try:
             app.run()
-        except RuntimeError as e:
-            msg = str(e)
-            if msg.startswith("bind") and any(t in msg for t in ("in use", "os error 48", "os error 98",
-                                                                  "os error 10048")):
-                raise CLIError("WC104", msg) from None
-            raise
-        return 0
-
-    if args.command == "halt":
-        if args.status:
-            print(json.dumps(_control(app, "GET", "/halt", key=args.key), indent=2))
-            return 0
-        state = _control(app, "POST", "/halt", {"reason": args.reason}, key=args.key)
-        print(f"HALTED: {state.get('state', {}).get('reason', '')}. Actuators refuse to run "
-              f"until `webcortex release`.")
-        return 0
-
-    if args.command == "release":
-        state = _control(app, "POST", "/release", key=args.key)
-        print("released: actuators enabled" if state.get("was_halted") else "was not halted")
+        except (RuntimeError, ValueError) as e:
+            # Whatever the runtime refused at boot (a template that does not
+            # parse, an address that cannot be bound, a database that will not
+            # open) is a coded error naming what to fix, not a traceback.
+            raise _boot_failure(app, str(e)) from None
         return 0
 
     if args.command == "check":
         try:
             report = app.check()
+            table = route_table(app)
         except ValueError as e:
-            raise CLIError("WC101", str(e)) from None
-        print(json.dumps({**report, "security": app.security_report()}, indent=2))
+            raise _boot_failure(app, str(e)) from None
+        print(json.dumps({**report, "route_table": table, "security": app.security_report()}, indent=2))
         return 0
 
     if args.command == "openapi":
@@ -724,7 +873,8 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
 
     if args.command == "context":
         if args.json:
-            print(json.dumps(app.manifest(), indent=2))
+            manifest = app.manifest()
+            print(json.dumps(manifest if args.show_secrets else redacted_manifest(manifest), indent=2))
         else:
             print(app.context_pack(), end="")
         return 0
@@ -734,9 +884,8 @@ def _run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         cfg = mcp_config(app, key)
         name = next(iter(cfg["mcpServers"]))
         url = cfg["mcpServers"][name]["url"]
-        header = f'"x-api-key: {key}"' if key else '"x-api-key: $WEBCORTEX_API_KEY"'
         print(json.dumps(cfg, indent=2))
-        print(f"\n# Claude Code:\nclaude mcp add --transport http {name} {url} --header {header}")
+        print(f"\n# Claude Code:\n{claude_mcp_add_command(name, url, key)}")
         if not key:
             print("# (set WEBCORTEX_API_KEY to fill the header in)", file=sys.stderr)
         return 0
