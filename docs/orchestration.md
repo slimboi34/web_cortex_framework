@@ -185,9 +185,15 @@ default, the flow fails and says which label was chosen.
 ```
 
 `status` is `budget_exhausted` when the shared budget ran out mid-way; the
-output so far is still returned. A step that suspends on an approval gate
-fails the flow with the approval id — a flow cannot wait for a human, so keep
-gated tools out of flow steps or resume that run directly.
+output so far is still returned.
+
+A flow cannot wait for a human. So a flow whose steps include an
+approval-gated tool — directly, in a parallel branch or a route, or through a
+nested flow — is a **boot error** naming the flow and the tool, and the runtime
+refuses such a step again before running it. (Before 2.9 the step ran without
+approval.) Put the gated tool in an agent's `tools=` instead. An agent step
+whose own run suspends on a gate still fails the flow and reports the approval
+id; resume that run directly.
 
 ---
 
@@ -210,7 +216,9 @@ never see each other's history. Anonymous callers share one identity, so a
 
 Sessions live in memory — bounded (`session_capacity`, default 1000) and
 expiring (`session_ttl_secs`, default 3600), both fixed for now rather than
-settable from `WebCortex(...)` — and do not survive a restart. Each one
+settable from `WebCortex(...)` — and do not survive a restart. Each caller has
+a share of that capacity: a caller that fills its share evicts its own least
+recently used session, never another caller's. Each one
 keeps at most its newest 400 messages (8 MB): past that the oldest whole
 turns are dropped, never a tool call apart from its result.
 That is stated rather than hidden: durable conversation state is application
@@ -246,9 +254,17 @@ The response is the continued run. Three things are true about it:
 - **A decision is consumed.** A second POST with the same id is a 404.
 
 Suspended runs are held in memory for `approval_ttl_secs` (3600 seconds, not
-yet settable from `WebCortex(...)`).
+yet settable from `WebCortex(...)`), at most 1000 at once, with a share per
+caller: a caller over its share loses its own oldest request, not anyone
+else's.
 Deciding requires the `webcortex:admin` scope; the run itself resumes as the
-delegated principal of whoever started it, not as the approver.
+delegated principal of whoever started it, not as the approver. So an approval
+is only created when that principal holds the gated route's scopes; otherwise
+the call is refused at once with `WC602`. See
+[Approval gates](agents.md#approval-gates).
+
+Only models are held at the gate. A direct HTTP call to the route by a caller
+holding its scopes runs at once.
 
 ---
 

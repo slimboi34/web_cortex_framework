@@ -72,15 +72,21 @@ app.agent("librarian", description="Finds and pitches books.",
           memory="notes", scopes=["read"], token_budget=60_000)
 
 app.agent("front_desk", handoffs=["librarian"], scopes=["read"],
-          context_window=40_000, expose_at="/ask")             # hands off; compacts
+          context_window=40_000, token_budget=60_000,
+          expose_at="/ask")                                     # hands off; compacts
 
-app.flow("pitch_all", parallel=["librarian", "librarian"])      # orchestration as data
+app.flow("pitch_all", parallel=["librarian", "librarian"],
+         token_budget=120_000)                                  # orchestration as data
+
+# anonymous_scopes("read") above means anyone, with no key, may start /ask,
+# /agents/librarian and /flows/pitch-all: the token budgets and the rate limit
+# are what bound that. Use expose_scopes=["write"] to keep a run for key holders.
 ```
 
 Every one of those is a route, a tool, and an MCP entry. The front desk hands
 a conversation to the librarian; the librarian remembers what it learned about
-the caller; the whole run is bounded by one budget; and `webcortex context`
-prints the lot in a form a coding model can extend.
+the caller; the whole run, handoff included, is bounded by one budget; and
+`webcortex context` prints the lot in a form a coding model can extend.
 
 ---
 
@@ -133,6 +139,7 @@ concurrently:
 
 ```python
 @app.behaviour("triage", tools=["list_tickets", "update_tickets"],
+               scopes=["read", "write"],                       # unscoped = anyone may start it
                model="fast", max_steps=200, token_budget=100_000)
 def triage(ctx, input):
     """Classify every open ticket at once and escalate the urgent ones."""
@@ -150,7 +157,7 @@ def triage(ctx, input):
                  if v["urgency"] >= input.get("threshold", 7)]
 
     ctx.gather(*[                                                # fifty writes, one wait
-        ("update_tickets", {"id": t["id"], "body": t["body"], "urgency": v["urgency"],
+        ("update_tickets", {**t, "urgency": v["urgency"], "category": v["category"],
                             "state": "escalated" if t["id"] in escalated else "triaged"})
         for t, v in zip(tickets, verdicts)
     ])
@@ -363,10 +370,12 @@ handoff intersects again. An anonymous caller cannot launch a privileged agent.
 
 **Human approval gates.** Mark a route `approval="required"` and an agent asking
 for it does not get it. An agent's run suspends until a human decides, then
-resumes with the rest of its turn. Every other path is refused: a direct MCP
-call is rejected, a behaviour (alone or in `gather`) halts, and a flow step
-fails. Resuming continues the agent that hit the gate, not a supervisor that
-called it, so give gated tools to the agents people call directly.
+resumes with the rest of its turn. Every other path a model could take is
+refused: a direct MCP call is rejected, a behaviour (alone or in `gather`)
+halts, and a flow that contains a gated tool does not boot. Resuming continues
+the agent that hit the gate, not a supervisor that called it, so give gated
+tools to the agents people call directly. The gate governs models, not people:
+a caller holding the route's scopes can still call it over plain HTTP.
 
 **Runtime-enforced budgets that compose.** `max_steps` per run;
 `token_budget` for the run and everything under it.
@@ -459,7 +468,8 @@ app.watch("dock_watch", device="dock", agent="inspector", every=15,
 
 Deny-by-default throughout; relaxing something costs a line, tightening it costs
 nothing. API keys are referenced by environment variable, hashed with SHA-256,
-and compared in constant time. JWT (HS/RS) with mandatory expiry validation.
+and compared in constant time. JWT (HS, RS, ES and EdDSA) with mandatory expiry,
+and audience and issuer enforced whenever they are configured.
 Per-principal token-bucket rate limiting. Security headers on every response.
 CORS that refuses `*` with credentials *at boot*. Path traversal, symlink
 escapes, and dotfiles refused by the static server. The control plane —
@@ -513,12 +523,13 @@ reviewer that leaves suggestions for the framework's own next iteration.
 ## Commands
 
 ```
-webcortex new <name>      scaffold a project (api | fullstack | agent | behaviour | orchestration)
+webcortex new <name>      scaffold a project (api | fullstack | agent | behaviour | orchestration | robotics | hub)
 webcortex dev             run with a startup report
-webcortex check           routes, tools, agents, flows, and the public attack surface
+webcortex check           validate; the route table, tools, agents, flows and public surface
 webcortex security        what is reachable without a credential
 webcortex tools           the agent tool manifest
 webcortex context         the context pack, for an AI coding tool
+webcortex mcp-config      the MCP client config and `claude mcp add` command for this app
 webcortex evolve "…"      ask a model to propose an extension
 webcortex typegen         generate a typed TypeScript client
 webcortex openapi         the OpenAPI 3.1 document

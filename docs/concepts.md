@@ -163,6 +163,7 @@ built, not when a request arrives:
   mean?" suggestion)
 - two routes claiming the same tool name
 - an approval gate on a route no agent can call
+- a flow that contains an approval-gated tool, which a flow could never wait for
 - a query route with no database configured
 - a page whose template does not parse
 - CORS with `*` origins *and* credentials, which browsers reject anyway

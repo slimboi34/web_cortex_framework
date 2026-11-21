@@ -110,11 +110,12 @@ What it checks:
 | `app`, `manifest` | the module does not import (`WC102`) or a declaration is invalid (`WC101`) |
 | `model:<name>` | a model an agent, behaviour, compaction or flow classifier uses does not resolve: a missing key (`WC301`), an undeclared provider prefix (`WC302`). This is the runtime's own routing, so the message is exactly what a run would fail with |
 | `online:<url>` | with `--online`: a provider endpoint does not answer within 3 s (`WC303`) |
-| `api_key:<ENV>`, `jwt`, `upstream:<name>`, `provider:<name>` | an environment variable the app names is unset (`WC106`). Only presence is read; values never appear in the report |
+| `api_key:<ENV>`, `jwt`, `upstream:<name>`, `provider:<name>` | an environment variable the app names is unset (`WC106`). For a key or JWT secret, also empty or still a starter placeholder starting `replace-me` (since 2.9). Values never appear in the report |
 | `security.*` | no authentication (`WC608`), no rate limit, `cors("*")`, every actuator warning from `security_report()` |
 | `estop` | actuators that are armed at boot (`start_halted=False`) |
 | `watcher:<name>`, `device:<name>` | a watcher whose agent has no `token_budget`, a plain-http webhook, a camera `bearer_env` that is unset |
 | `budgets` | agents or behaviours without `token_budget` |
+| `tracing` | (since 2.9) an OTLP endpoint, declared or in `OTEL_EXPORTER_OTLP_*`, that has no `http://` or `https://` scheme or does not parse, so nothing would be exported (warns) |
 | `database`, `templates` | a SQLite directory or templates directory that does not exist (`WC107`) |
 | `port` / `running` | the port is taken by something that is not this app (`WC104`); when this app is already running, it reports its version and live e-stop state |
 

@@ -38,12 +38,34 @@ app.sensor("dock_env", description="temperature and humidity")
 | `keep` | `8` | Frames held in the ring buffer |
 | `max_fps` | `30` | Ingest ceiling. Faster frames are dropped (WebSocket) or refused with 429 (HTTP). A frame may arrive up to half an interval early, so a camera sending at exactly `max_fps` with ordinary jitter keeps every frame; the long-run rate never exceeds it |
 | `max_frame_bytes` | 5 MB | Frames larger than this are refused (422 over HTTP; over the socket, a message past it closes the connection with 1009 and a warning in the log) |
-| `ingest_scopes` | `["devices:ingest"]` | Required to send frames and telemetry |
+| `ingest_scopes` | `["devices:ingest"]` | Required to send frames and telemetry. The default is shared by every device that keeps it |
 | `read_scopes` | `["devices:read"]` | Required to read anything back |
 | `tool` | `True` | Whether agents get the device's tools |
+| `prefix` | `/devices` | Where the device's routes are mounted |
 
-Give each device its own key with only the ingest scope. A stolen camera key
-can then send frames but cannot read anything back.
+### One key per device
+
+Give each device its own key with only an ingest scope. A stolen camera key can
+then send frames but cannot read anything back.
+
+That alone does not tie the key to *its* camera. Ingest is authorised by scope,
+and every device that keeps the default `ingest_scopes` accepts the same
+`devices:ingest`, so a key stolen from the cheapest camera could also send
+forged frames and telemetry to every other device, and to the watchers and
+agents that act on them. To bind each key to one device, give each device a
+scope of its own:
+
+```python
+app.api_key("DOCK_CAMERA_KEY",  id="dock-camera",  scopes=["devices:ingest:dock"])
+app.api_key("VAULT_CAMERA_KEY", id="vault-camera", scopes=["devices:ingest:vault"])
+
+app.camera("dock",  ingest_scopes=["devices:ingest:dock"])
+app.camera("vault", ingest_scopes=["devices:ingest:vault"])
+```
+
+Now the dock's key gets `403` from `/devices/vault/frames`. The default is kept
+for compatibility with existing device keys, so a shared scope is still what you
+get unless you ask for this.
 
 Each device gets these routes (prefix `/devices/<name>`):
 
@@ -127,6 +149,7 @@ app.watch(
     agent="inspector",
     input="Anything unsafe or unusual at the dock right now?",
     every=15,                          # seconds
+    only_on_change=True,               # the default: skip a tick when nothing changed
     scopes=["devices:read"],           # the authority the agent runs with
     max_runs_per_hour=120,             # the spend ceiling
     webhook="https://ops.example.com/hooks/dock",
@@ -135,9 +158,11 @@ app.watch(
 
 Every `every` seconds the watcher takes the newest frame (pulling it, for an IP
 camera) and the newest telemetry, and **skips the tick if nothing changed**.
-Changed means different bytes, not a new sequence number. Otherwise it runs the
-agent with the frame attached and the telemetry in the input, and publishes the
-answer as an **insight**:
+Changed means different bytes, not a new sequence number. Pass
+`only_on_change=False` to run the agent on every tick regardless, for a
+periodic report on a scene that rarely changes; the hourly ceiling still
+applies. Otherwise it runs the agent with the frame attached and the telemetry
+in the input, and publishes the answer as an **insight**:
 
 ```json
 {"type": "insight", "watcher": "dock_watch", "device": "dock", "agent": "inspector",
@@ -199,15 +224,26 @@ with AgentSocket("https://hub.example.com", "/agents/inspector", key=KEY) as age
 |---|---|
 | `{"input": "…", "images"?: […], "session_id"?: "…", "reset"?: false}` | `{"type": "step", "run_id", "agent", "step": {…}}` for each step, then `{"type": "result", "result": {…}}` |
 
+Each turn is held to the app's rate limit, exactly as a separate HTTP request
+would be (since 2.9): a turn over the limit is not run, and the socket answers
+with an error carrying `WC401` and `retry_after`, then closes if the client
+keeps going.
+
 ## Authentication for sockets
 
 A WebSocket upgrade is authenticated exactly like an HTTP request, and a socket
 is held to the scopes of the route it is mounted on. Browsers cannot set
-headers on a WebSocket, so an upgrade request may pass its key as
-`?access_token=` instead. This is accepted only on upgrades and only when no
-header credential is present. The request log records the path, never the
-query, but a proxy in front of the hub may log full URLs: give browsers keys
-with the narrowest scope that works.
+headers on a WebSocket, so an upgrade request may pass its credential as
+`?access_token=` instead: an API key, or (since 2.9, when `app.jwt(...)` is
+configured) a JWT, recognised by its three dot-separated segments. This is
+accepted only on upgrades and only when no header credential is present. The
+request log records the path, never the query, but a proxy in front of the hub
+may log full URLs: give browsers keys with the narrowest scope that works.
+
+A socket opened with a JWT holds that token's authority only until it expires
+(plus `leeway_secs`). After that an agent socket refuses the next turn with
+`WC603` and closes with 1008, and a stream or ingest socket is closed. Open a
+new socket with a fresh token.
 
 A browser opening a socket from another origin is refused (`403`) unless that
 origin is listed in `app.cors(...)`, so a page elsewhere cannot open the

@@ -70,13 +70,18 @@ once more with what the previous agent held.
 
     They default to the same set, because an endpoint that spends tokens and
     exercises tools should not be less guarded than the tools themselves.
-    Passing `expose_scopes=[]` makes the endpoint public, which
-    `webcortex security` reports.
+    Passing `expose_scopes=[]` makes the endpoint public, and so does leaving
+    both unset; `webcortex security` reports either. So does an
+    `expose_scopes` that `app.anonymous_scopes(...)` covers: anyone may start
+    that agent, so give it a `token_budget`.
 
 ### 3. Budgets are enforced by the runtime — and they compose
 
 `max_steps` and `token_budget` are checked before each provider call. A looping
 model costs a bounded amount rather than whatever the provider will sell you.
+`max_steps` counts model calls, not tool calls: one response may ask for several
+tools, and all of them run, so it bounds rounds rather than tool executions.
+Scopes and approval gates are what bound which tools can run.
 The budget of the outermost run is shared by every agent, behaviour and flow it
 calls; see [Budgets compose](orchestration.md#budgets-compose).
 
@@ -178,13 +183,30 @@ A human decides at `POST /_webcortex/approvals/b71e…` with
 rest of the turn it was interrupted in. See
 [Approvals that resume](orchestration.md#approvals-that-resume).
 
-The gate holds on every path:
+The run must also hold the route's scopes. If it does not (an agent declared
+with `scopes=["read"]` asking for a tool that needs `admin`, or a caller who
+holds only `read`), the call is refused at once with `WC602` and no approval is
+created, because approving a call the run could never make would only fail
+afterwards. Since 2.9 the hint names the agent and the scopes it holds, and
+says to add the scope to its `scopes=`. To let an agent propose a gated action,
+give it the route's scopes; the intersection with the caller's scopes still
+decides whether a given run can.
 
-- Directly over **MCP** — refused, because honouring it only inside the agent
-  loop would leave an obvious way around
+The gate holds on every path a model can take:
+
+- Directly over **MCP** — refused (`WC309`), because honouring it only inside
+  the agent loop would leave an obvious way around
 - Wrapped in a **Behaviour**, alone or inside `ctx.gather` — the Behaviour
   halts
-- As a **flow step** — the flow fails and reports the approval id
+- As a **flow step**, directly or through a nested flow, a parallel branch or a
+  route — a **boot error**. A flow cannot wait for a human, so such a flow is
+  refused when the app starts, and MCP and behaviours refuse to start a flow
+  that contains one. (Before 2.9 the gated step ran without approval.)
+
+It does not apply to a person calling the route **directly over HTTP**. A
+caller holding the route's scopes gets it at once, like any other route:
+`scopes` decide who may call it at all, and the gate decides that a model may
+not call it unattended.
 
 An approval gate on a route that is not exposed as a tool is a **boot error**:
 a gate that can never fire is dead configuration giving false confidence.
@@ -244,6 +266,7 @@ a gate that can never fire is dead configuration giving false confidence.
 | `temperature` | `None` | Sent only when set; Claude Opus 5, Opus 4.7/4.8 and Sonnet 5 reject it |
 | `reasoning` | `None` | `none`, `low`, `medium` or `high`; sent as `reasoning_effort` to OpenAI-compatible providers. `none` makes a local thinking model answer at once |
 | `max_tokens` | `16000` | Per response, thinking included |
+| `max_images` | `4` | Images kept in the conversation as pixels; older ones become placeholders. See [Vision and robotics](vision-and-robotics.md#frames-are-expensive-context) |
 | `expose_at` | `/agents/<name-with-hyphens>` | The POST route |
 | `tool` | `True` | Expose under the agent's own name |
 | `output` | `None` | A dataclass, `TypedDict` or object schema the answer must match; the validated value is `data` in the result. See [Structured output](structured-output.md) |
@@ -274,6 +297,13 @@ serving.
   bounded and expiring, and do not survive a restart. Durable, resumable runs
   mean building a small workflow engine with exactly-once tool execution;
   that is deliberately not in v2.
+- **Each caller has a share of those stores.** Since 2.9 a caller (the root
+  principal) that fills its share of the session or approval store evicts its
+  own oldest entry, never another caller's, so one key cannot push everyone
+  else's pending approvals out.
+- **Turns over a WebSocket count against the rate limit**, and a socket opened
+  with a JWT stops at the token's expiry. See
+  [Security](security.md#websockets).
 - **Responses are returned whole.** Token-level SSE streaming is the next
   invasive change and is not claimed.
 

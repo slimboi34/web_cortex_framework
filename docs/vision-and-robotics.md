@@ -69,10 +69,13 @@ curl -X POST localhost:8000/agents/inspector -H "x-api-key: $WEBCORTEX_API_KEY" 
 Each image is either `{"media_type", "data"}` or `{"url"}`. A malformed one is
 rejected with a 400 that names the bad item (`images[2]: …`). Each image can be
 at most 5 MB. A `url` sent with a request may not name a loopback, private,
-link-local or metadata address (`localhost`, `10.x`, `169.254.169.254`, …):
-OpenAI-compatible servers fetch image URLs themselves, from inside their own
-network. Send the bytes instead. (Since 2.4.1. Image URLs a *tool* returns are
-the tool author's and are not checked.)
+link-local or metadata address (`localhost`, `10.x`, `169.254.169.254`, …),
+however it is spelled: since 2.9 that includes IPv4-compatible IPv6
+(`[::7f00:1]`), an internal IPv4 address inside the NAT64 prefix `64:ff9b::/96`
+or a 6to4 address (`2002::/16`), the local-use NAT64 prefix `64:ff9b:1::/48`
+and site-local `fec0::/10`. OpenAI-compatible servers fetch image URLs
+themselves, from inside their own network. Send the bytes instead. (Since
+2.4.1. Image URLs a *tool* returns are the tool author's and are not checked.)
 
 ## Frames are expensive context
 

@@ -26,10 +26,16 @@ $ webcortex keygen
 wcx_rU2Y-W1mTd2Jw4FdlYAaAJYFM5P_CE69sCwNhRG4aPk
 ```
 
-Presented as `x-api-key` by default (`api_key_header` to change).
+Presented as `x-api-key` by default. To read keys from another header, pass
+`WebCortex(..., api_key_header="x-service-key")` (since 2.9); the name must be a
+valid header name, and `authorization`, `cookie` and other reserved names are
+refused.
 
 A missing or empty env var logs a loud warning at boot — a silently missing key
-means an endpoint you believe is reachable is not.
+means an endpoint you believe is reachable is not. A value that still starts
+with `replace-me` (a starter's placeholder) is treated the same way: the key is
+not registered, so a copied `.env.example` can never become a working admin
+key.
 
 ### JWT
 
@@ -44,8 +50,16 @@ Presented as `Authorization: Bearer <token>`. Scopes are read from the standard
 
 - `exp` is **required** and always validated
 - `nbf` is validated
-- HS256/384/512, RS256/384/512, ES, and EdDSA are supported
+- `aud` and `iss` are **required** whenever `audience` or `issuer` is set: a
+  token that leaves the claim out is refused (401), exactly like one that
+  carries the wrong value. Before 2.9 a token without the claim was accepted
+- HS256, HS384, HS512, RS256, RS384, RS512, ES256, ES384 and EdDSA are
+  supported; any other `algorithm` is a `ValueError` at declaration. For the
+  asymmetric ones `secret_env` holds the PEM public key
 - HMAC secrets under 32 bytes are rejected at boot as brute-forceable
+- A token whose `sub` equals the `id` of a configured API key, or starts with
+  `watcher:`, is refused (401). Sessions, memory and `@principal` are keyed by
+  that id, so such a token would otherwise act as the service or the watcher
 
 !!! note "Expiry leeway is explicit"
     The underlying library defaults to **60 seconds** of grace on `exp`, so a
@@ -60,6 +74,13 @@ app.anonymous_scopes("read")   # empty by default
 
 Empty by default: unauthenticated means unprivileged. Use sparingly — this is
 how a route you believed was protected becomes public.
+
+Every route whose scopes are all in `anonymous_scopes` is public, and since 2.9
+`webcortex security` lists it under `public_routes` alongside the unscoped ones.
+That includes agents, behaviours and flows: with `anonymous_scopes("read")`, an
+agent whose `expose_scopes` is `["read"]` can be started, and can spend tokens,
+by anyone. Give such an agent a `token_budget`, or expose it under a scope
+anonymous callers do not hold.
 
 ### Error semantics
 
@@ -95,6 +116,29 @@ app.resource("invoices", fields={...},
 
 Agents and Behaviours run with **intersected** scopes — never more than the
 caller. See [Agents](agents.md#2-authority-is-delegated-never-granted).
+
+### Admin keys and MCP clients
+
+The control plane (`/_webcortex/...`) needs `webcortex:admin` once any
+authentication is configured, and that includes the MCP endpoint. A key you
+give an MCP client (Claude Code, Cursor, a coding agent) is therefore a full
+admin credential: with it the client can also decide approvals, halt and
+release actuators, and read the audit log and traces. Give it only to tools you
+would trust with that, and prefer a key of its own so it can be revoked alone.
+
+### WebSockets
+
+A socket is authenticated once, at the upgrade, and held to its route's scopes.
+Since 2.9 two more limits apply for its whole life:
+
+- **Each agent turn is rate limited** like a separate request. A turn over the
+  limit is not run; the socket answers with `WC401` and `retry_after`.
+- **A JWT's authority ends at its expiry.** After `exp` (plus `leeway_secs`) an
+  agent socket refuses the next turn with `WC603` and closes with 1008, and a
+  stream or ingest socket is closed.
+
+`?access_token=` on an upgrade accepts an API key or, when JWT is configured, a
+JWT. See [The device hub](device-hub.md#authentication-for-sockets).
 
 ## Transport hardening
 
@@ -184,13 +228,16 @@ means the TLS proxy in front of it said so with `X-Forwarded-Proto: https` or
 
 | Limit | Default | Configurable |
 |---|---|---|
-| Body size | 32 MB | compile-time |
+| Body size | 32 MB | compile-time; since 2.9 a body is read only after the route matched and the caller passed its scope check, so a 401, 403, 404 or 405 is answered without reading it |
+| Sending a response | a connection whose client stops reading the response body is closed after a short period with no progress; reads and pings from that client do not count | not yet |
 | Request timeout | 30s | `request_timeout` (`agent_timeout` on agent, behaviour and flow routes); the body must arrive within it too, or 408 `WC216` |
 | Header read / idle connection | the request timeout, at most 30s | `request_timeout` |
 | Shutdown drain | 25s | `shutdown_timeout`; WebSockets are closed with 1001 (going away) |
 | Open connections | 10,000, WebSockets included | `max_connections`; past it a 503 `WC218` and close |
 | Proxied response body | 64 MiB | `app.upstream(..., max_response_bytes=...)`; past it a 502 `WC217` |
 | Invocation depth | 8 | not yet (`server.max_invocation_depth`) |
+| Concurrent behaviour runs | `max(32, workers × 8)`, on threads separate from Python route handlers; past it a 503 `WC215`, not a queue | `WEBCORTEX_MAX_BEHAVIOURS` |
+| Pending approvals and sessions | 1,000 each, with a share per caller | not yet; a caller over its share evicts its own oldest entry, never another caller's |
 
 ## What has been tested
 
@@ -207,6 +254,9 @@ nested JSON; malformed MCP payloads; CORS origin reflection.
 
 Full detail — **including what was not tested** — in
 [SECURITY.md](https://github.com/slimboi34/web_cortex_framework/blob/main/SECURITY.md).
+Its 2.9.0 section covers the stress test behind this release: an approval gate
+bypass through a flow step, a slow-read denial of service and a worker-pool
+deadlock, all fixed, and the behaviour changes that came with them.
 
 ## Checklist before you ship
 
@@ -219,8 +269,12 @@ $ webcortex security
 - [ ] No `POST`/`PUT`/`DELETE` route appears in `public_routes`
 - [ ] `rate_limited` is `true`
 - [ ] `anonymous_scopes` is empty, or deliberately minimal
+- [ ] Every agent, behaviour and flow in `public_routes` has a `token_budget`
 - [ ] Every agent's `scopes` is the minimum it needs
-- [ ] Destructive tools carry `approval="required"`
+- [ ] Destructive tools carry `approval="required"`, and the people who can
+      call them directly hold the scope on purpose
+- [ ] With JWT, `audience` and `issuer` are set
+- [ ] Keys given to MCP clients are separate admin keys you can revoke
 - [ ] Secrets come from the environment; none are in source
 - [ ] TLS terminates at a proxy in front of WebCortex
 - [ ] `WEBCORTEX_DEBUG_ERRORS` is **not** set in production
@@ -235,12 +289,21 @@ actually happens.
 Stated plainly, because a security page that only lists successes is marketing.
 
 - **No TLS.** WebCortex serves plaintext and expects a terminating proxy.
-- **No CSRF protection or sessions.** The page layer suits internal tools and
-  API-key clients, not public authenticated browser apps.
+- **No sessions or CSRF tokens.** Cross-origin state-changing requests are
+  refused (above), but the page layer suits internal tools and API-key clients,
+  not public authenticated browser apps.
 - **Rate limiting is per-process** and needs trusted-proxy configuration to be
   meaningful at an edge.
-- **No fuzzing.** The manifest parser, JSON-RPC surface, and router are all
-  reachable pre-auth and deserve a fuzz harness.
+- **No coverage-guided fuzzing.** The manifest parser, JSON-RPC surface, and
+  router are all reachable pre-auth and deserve a fuzz harness.
+- **Untested:** TLS (WebCortex never speaks it), the timing of key comparison
+  under statistical measurement, and behaviour against real model providers;
+  every agent test runs against the deterministic fake.
+- **Typed parameters are converted, not validated.** A value that cannot be
+  converted reaches the handler unchanged; see
+  [Routing](routing.md#two-handler-styles).
+- **Device keys share a scope by default.** See
+  [One key per device](device-hub.md#one-key-per-device).
 - **Approval resume is manual.** The runtime records the request; wiring
   approval into a UI is application work.
 
