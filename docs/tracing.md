@@ -30,6 +30,9 @@ measurement.)
 - A run result carries `trace_id`. So does a flow's envelope.
 - At the edge, the HTTP response carries the header `x-webcortex-trace`. That is the only way
   to learn a behaviour's trace, since a behaviour returns whatever its function returned.
+  Since 2.9 a 504 (`WC203`) for an agent, behaviour or flow run that timed out carries it too,
+  with `trace_id` in the error body. A flow that times out or loses its client ends its span
+  as cancelled, so it is exported; in 2.8 it stayed open.
 - `GET /_webcortex/status` lists `trace_id` on each recent run.
 - `"latest"` names the newest trace wherever an id is accepted.
 
@@ -126,6 +129,13 @@ webcortex run
 in WebCortex the credential is named, never embedded: `otlp_headers_env` is the name of a
 variable, and the manifest stays safe to log.
 
+The headers variable is read as the OpenTelemetry specification says: keys and values are
+trimmed and percent-decoded (`authorization=Bearer%20abc`), and an entry that is not
+`key=value` or not a valid header is skipped with a warning naming its position, never its
+value. An endpoint without `http://` or `https://` (`collector:4318`) cannot be used; since 2.9
+that is a warning at boot naming the variable it came from, rather than silence, and
+`webcortex doctor` reports it too.
+
 Spans are posted in batches (up to 256, at most about a second after the first one in the
 batch ended), with `service.name`, `service.version` (the app's version) and the scope
 `webcortex`. Model calls are `CLIENT` spans and everything else `INTERNAL`; a failed span has
@@ -134,8 +144,11 @@ status `ERROR` with its code as the message and as the attribute `webcortex.erro
 The exporter is deliberately lossy. A batch the collector refuses, or cannot be sent, is
 dropped and counted, never retried, and the queue between the runtime and the exporter is
 bounded (4096 spans): a collector that is down must not grow memory inside the app it
-observes. `GET /_webcortex/traces` reports `export: {configured, spans_exported, spans_failed,
-spans_dropped, last_error}`, and `webcortex trace` prints that line. On shutdown the exporter
+observes. A run pushed out of the in-memory ring (`keep`) while it is still running still
+exports its spans when they end; spans that cannot be exported (over `max_spans`, or more than
+4096 held aside at once) are counted as dropped. `GET /_webcortex/traces` reports
+`export: {configured, spans_exported, spans_failed, spans_dropped, last_error}`, and
+`webcortex trace` prints that line. On shutdown the exporter
 sends one last batch.
 
 Only the protocol's JSON encoding over HTTP is implemented, not protobuf or gRPC. Collectors

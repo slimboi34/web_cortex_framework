@@ -113,6 +113,8 @@ page was `text/html`, so an unescaped `.txt` page could run a script):
 | `.svg` | `image/svg+xml` | HTML |
 | `.txt` | `text/plain; charset=utf-8` | none |
 | `.json` | `application/json` | JSON: `{{ value }}` is written as a JSON value |
+| `.css`, `.js`, `.csv`, `.md` | `text/css`, `text/javascript`, `text/csv`, `text/markdown` (UTF-8) | none |
+| anything else | `text/plain; charset=utf-8` | none |
 
 In a `.json` template every `{{ value }}` is written as JSON, quotes and
 escapes included, so write `{"name": {{ name }}}`, not `{"name": "{{ name }}"}`.
@@ -126,16 +128,19 @@ Beyond the Jinja2 built-ins:
 
 | Filter | Example |
 |---|---|
-| `json` (alias `tojson`) | `<script>const d = {{ data | json }};</script>` |
+| `json` (alias `tojson`) | `<script>const d = {{ data | json }};</script>`; `json(2)` indents |
 | `currency` | `${{ price | currency }}` → `12.50` |
 | `truncate_words` | `{{ body | truncate_words(20) }}` |
 
-`| json` is safe inside a `<script>` block and inside an attribute: since 2.9 it
-writes `<`, `>`, `&`, `'` and the line separators U+2028 and U+2029 as `\uXXXX`
-escapes, so a value containing `</script>` cannot end the block, and its output
-is not HTML-escaped a second time. **Never add `| safe` after it**, or after
-anything else that holds user data: `| safe` turns escaping off, and in 2.8 the
-`| json | safe` combination was a cross-site scripting hole.
+`| json` is safe inside a `<script>` block and inside a **single-quoted**
+attribute: since 2.9 it writes `<`, `>`, `&`, `'` and the line separators U+2028
+and U+2029 as `\uXXXX` escapes, so a value containing `</script>` cannot end the
+block, and its output is not HTML-escaped a second time. It leaves the JSON's
+own `"` alone, so quote the attribute with `'`:
+`<div data-ticket='{{ ticket | json }}'>`, never `data-ticket="{{ ticket | json }}"`.
+**Never add `| safe` after it**, or after anything else that holds user data:
+`| safe` turns escaping off, and in 2.8 the `| json | safe` combination was a
+cross-site scripting hole.
 
 The set is deliberately small. Anything more expressive belongs in the data
 source, not the template.
@@ -199,6 +204,12 @@ export interface GetTicketsByIdSummaryParams {
 ```
 
 Pages and static mounts are excluded — they are not part of the JSON API.
+
+A path parameter is percent-encoded before it is sent, and since 2.9 the client
+throws a `WebCortexError` (status 0) without sending anything when a path
+parameter is `""`, `"."` or `".."`, or a `{*rest}` value has a `.` or `..`
+segment: `fetch()` resolves dot segments, so `{id: ".."}` on
+`/users/{id}/disable` would otherwise have been sent as `POST /disable`.
 
 ### Error handling
 
