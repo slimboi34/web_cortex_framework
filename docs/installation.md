@@ -119,7 +119,7 @@ $ export WEBCORTEX_API_KEY=$(webcortex keygen)
 $ webcortex dev
 ```
 
-Five starters are available:
+Seven starters are available (`webcortex new myapp --template <name>`):
 
 | Template | What you get |
 |---|---|
@@ -128,9 +128,13 @@ Five starters are available:
 | `agent` | The above, plus an agent with an approval-gated tool |
 | `behaviour` | The above, plus Behaviours — programmable procedures |
 | `orchestration` | Handoffs, flows, memory, context providers and a local-model tier |
+| `robotics` | A camera agents can see through, gated actuators and an emergency stop, booting halted ([Vision and robotics](vision-and-robotics.md)) |
+| `hub` | Cameras and sensors streaming to agents, with insights to subscribers and webhooks ([The device hub](device-hub.md)) |
 
 Every starter boots with authentication, rate limiting, and security headers
 already enabled. A starter that generates an insecure app teaches an insecure
-habit.
+habit. For the same reason the `.env.example` a starter writes leaves its keys
+empty: run `webcortex keygen` for each. A key that is empty or still starts with
+`replace-me` is never accepted, and `webcortex doctor` fails on it.
 
 [Tutorial :material-arrow-right:](tutorial.md){ .md-button .md-button--primary }

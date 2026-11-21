@@ -43,7 +43,7 @@ logging to `info`.
 
 ```console
 $ webcortex dev --port 3000
-  webcortex 0.1.0  ·  supportdesk
+  webcortex 2.9.0  ·  supportdesk 0.1.0
   python 3.14.4 (free-threaded)
   21 routes, 19 served without touching Python
   14 agent tools: list_tickets, get_tickets, create_tickets, … +9
@@ -68,6 +68,10 @@ $ webcortex dev --port 3000
 A `.env` file in the working directory is loaded automatically. The real
 environment always wins.
 
+`dev` does not reload: it reads `api.py` once, at boot. Restart it after an
+edit. A boot failure (a template that does not parse, say) prints
+`error[WCnnn]` with the file and line rather than a traceback.
+
 ## `webcortex check`
 
 Validate the application through the Rust runtime without binding a port. Exits
@@ -81,14 +85,21 @@ $ webcortex check
   "native_routes": 10,
   "tools": ["list_tickets", "get_tickets", "..."],
   "agents": ["assistant"],
-  "security": { "auth_configured": true, "public_routes": ["GET /"], ... }
+  "security": { "auth_configured": true, "public_routes": [], ... }
 }
 ```
 
+Since 2.9 it also prints the route table it promises: every route with its
+method, path, the engine that serves it (`query`, `python`, `agent`, …) and the
+scopes it needs, and the same rows are in the JSON.
+
 Catches: duplicate routes, duplicate tool names, agents referencing tools,
 handoffs or context providers that do not exist (with suggestions), flows whose
-steps are not tools or that contain themselves, approval gates on non-tools,
-queries without a database, templates that do not parse, and invalid CORS.
+steps are not tools, that contain themselves, or that contain an
+approval-gated tool, approval gates on non-tools, a typed agent that can hand
+off to an agent listing a `final_answer` route, a malformed output schema,
+queries without a database, page templates that are missing or do not parse,
+and invalid CORS.
 
 ## `webcortex security`
 
@@ -110,7 +121,10 @@ $ webcortex security
 ```
 
 Warns on stderr when no authentication is configured. `public_routes` is the
-list worth staring at before every deploy.
+list worth staring at before every deploy: every route a caller with no
+credential can reach, which includes every route whose scopes are all granted
+by `app.anonymous_scopes(...)` (since 2.9; before, only unscoped routes were
+listed).
 
 ## `webcortex openapi`
 
@@ -173,6 +187,45 @@ $ webcortex context > CONTEXT.md
 $ webcortex context --json        # the raw manifest instead
 ```
 
+`--json` replaces the value of every upstream header (`app.upstream(...,
+headers=...)`) with `"<redacted>"`, so the output is safe to paste into a chat
+or a ticket; `--show-secrets` prints them as declared.
+
+## `webcortex mcp-config`
+
+Print what an MCP client needs to reach this app: the `mcpServers` entry that
+Claude Desktop, Cursor and other clients read (Streamable HTTP at
+`{control_prefix}/mcp`), and the `claude mcp add` command for Claude Code.
+
+```console
+$ webcortex mcp-config
+{
+  "mcpServers": {
+    "supportdesk": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/_webcortex/mcp",
+      "headers": {}
+    }
+  }
+}
+
+# Claude Code:
+claude mcp add --transport http supportdesk http://127.0.0.1:8000/_webcortex/mcp --header "x-api-key: $WEBCORTEX_API_KEY"
+```
+
+With `WEBCORTEX_API_KEY` unset, as here, the header is left for your shell to
+fill in and a note goes to stderr. With it set, the key itself is written into
+both, so treat the output as a secret. The URL is built from `WEBCORTEX_HOST`
+and `WEBCORTEX_PORT` (or the app's own host and port) over plain HTTP; edit it
+for a deployment behind TLS. The server name is the app's name reduced to
+letters, digits, `_` and `-`, and the command is shell-quoted.
+
+!!! warning "The MCP endpoint is a control-plane route"
+    Once authentication is configured, `/_webcortex/mcp` needs
+    `webcortex:admin`, so the key you give an MCP client is an admin key: it can
+    also decide approvals, halt and release actuators, and read the audit log.
+    Give it to tools you would trust with that.
+
 ## `webcortex evolve`
 
 Ask a model to propose an extension, anchored on the context pack.
@@ -209,10 +262,12 @@ released: actuators enabled
 |---|---|---|
 | `--reason`, `-r` | `emergency stop` | Recorded in the audit log |
 | `--status` | off | Report the state without changing it |
-| `--key` | `$WEBCORTEX_API_KEY` | A key with `webcortex:admin` |
+| `--key` | `$WEBCORTEX_API_KEY`, then `$WEBCORTEX_TOKEN` | A key or token with `webcortex:admin` |
+| `--url` | the app's host and port | The running app's base URL, e.g. `https://cell.example.com` (since 2.9) |
 
-Both commands call the control plane of the app at `WEBCORTEX_HOST` and
-`WEBCORTEX_PORT`, or at the app's own host and port. See
+Without `--url`, both commands call the control plane of the app at
+`WEBCORTEX_HOST` and `WEBCORTEX_PORT`, or at the app's own host and port, over
+plain HTTP. Pass `--url` to reach a deployment behind TLS. See
 [Vision and robotics](vision-and-robotics.md).
 
 

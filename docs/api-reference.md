@@ -20,9 +20,16 @@ app = WebCortex(
     request_timeout=30,
     agent_timeout=600,       # agent, flow and behaviour routes
     shutdown_timeout=25,
+    start_halted=False,      # boot with the emergency stop engaged
     max_connections=10_000,  # open connections incl. WebSockets; past it 503 WC218; 0 = no cap
+    api_key_header="x-api-key",  # 2.9: the header API keys are read from
 )
 ```
+
+`start_halted=True` boots with every `actuator=True` route refusing (423 `WC502`) until
+`webcortex release`: see [Vision and robotics](vision-and-robotics.md#actuators-and-the-emergency-stop).
+`api_key_header` must be a valid HTTP header name; it is lower-cased, and `authorization`,
+`cookie` and other reserved names are refused (`ValueError`).
 
 ---
 
@@ -44,10 +51,14 @@ Shared options on every route-declaring call:
 | `tool` | `False` | Expose as an agent tool |
 | `tool_name` | derived | Override the generated name |
 | `scopes` | `()` | Required to reach the route at all |
-| `approval` | `"never"` | `"required"` gates agent invocation |
+| `approval` | `"never"` | `"required"` gates agent, behaviour and MCP calls, not a direct HTTP call; a flow may not contain such a tool (boot error) |
+| `actuator` | `False` | Moves hardware: refused with 423 `WC502` while the emergency stop is engaged ([details](vision-and-robotics.md#actuators-and-the-emergency-stop)) |
 | `read_only` | by method | MCP hint |
 | `idempotent` | by method | MCP hint |
 | `summary` | docstring | |
+
+Typed parameters are converted to their annotations, but a value that cannot be converted
+reaches the handler unchanged: see [Routing](routing.md#two-handler-styles).
 
 ### `app.static(method, path, body, *, status=200, **opts)`
 
@@ -55,8 +66,9 @@ Constant response, serialised at boot.
 
 ### `app.query(method, path, sql, *, params=(), returns="many", **opts)`
 
-Bind a route to SQL. `returns` is `"many"` · `"one"` · `"affected"`. A param
-named `@principal` binds the root principal's id.
+Bind a route to SQL. `returns` is `"many"` · `"one"` · `"affected"` (`{"affected", "last_insert_id"}`,
+with `last_insert_id` `null` unless a row was inserted). A param named `@principal` binds the
+root principal's id. An integer outside the 64-bit range is refused (400 `WC211`), not rounded.
 
 ### `app.resource(name, *, fields, **opts)`
 
@@ -74,7 +86,10 @@ app.resource(
 )
 ```
 
-Returns a `Resource`. Generates five routes.
+Returns a `Resource`. Generates five routes. Bodies are validated against the advertised
+schema (422 `WC206` for a missing field, an unknown key or a wrong type); `PUT` replaces every
+writable field; the list is newest first, `limit` 1–1000 (default 50). See
+[Routing](routing.md#resource).
 
 ### `app.page(path, template, **opts)`
 
@@ -84,7 +99,9 @@ app.page("/", "index.html",
          data=None, status=200, scopes=(), method="GET")
 ```
 
-Pass `sql=` **or** `data=`, never both.
+Pass `sql=` **or** `data=`, never both. The template's extension sets the content type
+(`.html` → `text/html`, `.txt` → `text/plain`, `.json` → `application/json`, `.xml`, `.svg`):
+see [Frontend](frontend.md#escaping).
 
 ### `app.page_handler(path, template, *, status=200, scopes=())`
 
@@ -99,13 +116,24 @@ Repeated query keys are forwarded as sent.
 
 ### `app.proxy(method, path, *, upstream, rewrite=None, **opts)`
 
+Forwards only `content-type` and `accept`, never the caller's credentials. A `3xx` from the
+upstream is relayed with its `Location`, never followed.
+
 ---
 
 ## Security
 
 ### `app.api_key(env_var, *, id, scopes=())`
 
+Read from the header `api_key_header` names (`x-api-key`). A secret starting `replace-me` is
+not registered.
+
 ### `app.jwt(*, secret_env, algorithm="HS256", audience=None, issuer=None, leeway_secs=30)`
+
+`algorithm` is one of HS256, HS384, HS512, RS256, RS384, RS512, ES256, ES384, EdDSA (anything
+else is a `ValueError`). With `audience` or `issuer` set, a token must carry a matching `aud`
+or `iss` claim. A token whose `sub` equals an API key's `id` is refused. See
+[Security](security.md#jwt).
 
 ### `app.anonymous_scopes(*scopes)`
 
@@ -197,13 +225,20 @@ app.agent(
     compact_with=None,       # defaults to the "fast" alias
     keep_recent=6,
     temperature=None,        # sent only when set
+    reasoning=None,          # "none" | "low" | "medium" | "high"
     max_tokens=16_000,
+    max_images=4,            # images kept in context as pixels
     expose_at=None,          # defaults to /agents/<name-with-hyphens>
     tool=True,
     output=None,             # a dataclass, TypedDict or object schema the answer must match
     options=None,            # extra provider request-body fields, e.g. {"seed": 7}
 )
 ```
+
+`reasoning` is sent as `reasoning_effort` on the OpenAI wire format: see
+[Models](models.md#local-models). `max_images` bounds how many images stay in the
+conversation as pixels: see [Vision and robotics](vision-and-robotics.md#frames-are-expensive-context).
+`max_steps` bounds model calls, not tool calls: one response can ask for several tools.
 
 The route takes `{"input": str, "session_id"?: str, "reset"?: bool, "images"?: [...]}` and
 answers `{run_id, agent, path, status, output, steps, usage, trace_id?, data?, code?, hint?,
@@ -226,8 +261,9 @@ holds it: see [Structured output](structured-output.md). `trace_id` names the ru
     model="default",
     max_tokens=16_000,
     temperature=None,        # sent only when set
+    reasoning=None,          # as on app.agent
     expose_at=None,
-    expose_scopes=None,
+    expose_scopes=None,      # defaults to scopes; empty means anyone may start it
     tool=True,               # Behaviours are agent tools by default
     options=None,            # extra provider request-body fields for ctx.ask calls
 )
@@ -240,7 +276,7 @@ def triage(ctx, input): ...
 |---|---|
 | `ctx.call` | `(tool, **kwargs) -> Any` |
 | `ctx.gather` | `(*items, return_exceptions=False) -> list` — items are `(tool, kwargs)`, a tool name, or `{"tool": ..., **kwargs}` |
-| `ctx.ask` | `(prompt, *, schema=None, system=None, model=None, max_tokens=None, temperature=None) -> Any` |
+| `ctx.ask` | `(prompt, *, schema=None, system=None, model=None, max_tokens=None, temperature=None) -> Any` — with `schema`, the answer is validated; two corrections, then it raises with `WC318` |
 | `ctx.ask_many` | `(prompts, *, schema=None, system=None, model=None, max_tokens=None, temperature=None, concurrency=8) -> list` |
 | `ctx.context` | `(name) -> Any` — only declared providers |
 | `ctx.run` | `(name, **kwargs) -> Any` |
@@ -278,7 +314,34 @@ app.flow(
 
 A step is a tool name or `{"tool": name, "input": {...}}`; template strings
 `"$"`, `"$.path"`, `"$input"`, `"$input.path"` resolve against the incoming
-value and the original input.
+value and the original input. A flow cannot wait for a human, so a flow whose steps include
+an approval-gated tool (directly or through a nested flow) is a boot error.
+
+---
+
+## Device hub
+
+See [The device hub](device-hub.md).
+
+### `app.camera(name, *, description="", source=None, headers=None, bearer_env=None, keep=8, max_fps=30.0, max_frame_bytes=5242880, ingest_scopes=("devices:ingest",), read_scopes=("devices:read",), tool=True, prefix="/devices")`
+
+A pushed camera, or a pulled one with `source=` (an HTTP snapshot URL; `headers` /
+`bearer_env` are its credentials). `keep` frames are held; `max_fps` and `max_frame_bytes`
+bound ingest. Routes live under `prefix` + `/<name>`; the tools are `<name>_snapshot`,
+`<name>_telemetry` and `<name>_insights`. `ingest_scopes` is shared by every device that
+keeps the default: give each device its own scope to bind a key to one device
+([why](device-hub.md#one-key-per-device)).
+
+### `app.sensor(name, *, description="", max_fps=30.0, ingest_scopes=("devices:ingest",), read_scopes=("devices:read",), tool=True, prefix="/devices")`
+
+Telemetry only, at most 64 KB per reading.
+
+### `app.watch(name, *, device, agent, input, every=10.0, only_on_change=True, scopes=(), max_runs_per_hour=60, webhook=None, webhook_bearer_env=None)`
+
+Every `every` seconds, run `agent` on the newest frame and telemetry of `device` and publish
+the answer as an insight. `only_on_change=True` skips a tick whose frame and telemetry are
+byte-for-byte unchanged. `scopes` is the run's whole authority; `max_runs_per_hour` caps
+spend; the insight is POSTed to `webhook` (bearer token from `webhook_bearer_env`).
 
 ---
 
@@ -323,9 +386,14 @@ trace_id, cassette, result}]}`.
 | `app.context_pack()` | The app described for an AI coding tool, as Markdown |
 | `app.openapi()` | OpenAPI 3.1 document |
 | `app.typescript_client()` | Generated TS source |
-| `app.manifest()` | The raw manifest |
+| `app.manifest()` · `app.manifest_json()` | The raw manifest, as a dict or as JSON text |
 | `app.schema_sql` | Generated DDL |
+| `app.doctor(*, online=False, url=None, key=None)` | What `webcortex doctor` reports, as a dict |
+| `app.status(*, url=None, key=None)` | The running app's live view (`GET /status`) |
 | `app.run()` | Boot and serve; blocks |
+
+`public_routes` in the security report lists every route a caller with no credential can
+reach: routes with no scopes, and routes whose scopes are all in `app.anonymous_scopes(...)`.
 
 ---
 
@@ -342,7 +410,9 @@ Mounted under `control_prefix`. Everything but `/health` needs
 | `GET /models` | Aliases, live providers, priced models |
 | `GET /usage` | The spend ledger |
 | `GET /audit` | Recent events |
-| `GET /status` | The live view: requests, recent errors, runs, spend, devices |
+| `GET /status` · `GET /errors` | The live view: requests, recent errors, runs, spend, devices |
+| `GET /devices` | Every device, with frames in and dropped |
+| `GET /halt` · `POST /halt` · `POST /release` | The emergency stop |
 | `GET /traces` · `GET /traces/{id}` | Recent run traces, and one with every span (`latest` works as an id) |
 | `GET /approvals` | Runs waiting on a human |
 | `POST /approvals/{id}` | `{"approve": bool, "note": str}` — continue a run |
