@@ -40,6 +40,27 @@ Python types map to SQLite affinities:
 $ webcortex sql        # inspect the generated DDL
 ```
 
+A `bool` field is stored as `0`/`1` but, since 2.9, read back as `false`/`true`,
+as the route's schema says.
+
+### What a resource accepts
+
+The generated create and update routes check the JSON body against the schema
+they advertise before any SQL runs. A missing field, a key the resource does
+not declare, or a value of the wrong type is a **422** (`WC206`) naming the
+field. Before 2.9 such a body was bound as it came, so a missing field was
+written as `NULL` and a string could land in an `INTEGER` column.
+
+- `POST` needs every field except a generated integer key.
+- `PUT` replaces the row and needs every writable field. There is no partial
+  update yet: read the row, change it, send it back.
+- `GET /<name>` returns the newest rows first (by primary key, descending).
+  `limit` defaults to 50 and is clamped to 1–1000; `offset` is never negative.
+
+There are no `NOT NULL` or `CHECK` constraints in the generated DDL. The route
+schema is the check; a write from anywhere else (a Python handler, another
+process) is not held to it.
+
 ## Migrations: deliberately absent
 
 `create_table=True` emits `CREATE TABLE IF NOT EXISTS` and **nothing else**.
@@ -80,6 +101,10 @@ returns="one"       # single object, 404 if no match
 returns="affected"  # {"affected": n, "last_insert_id": m}
 ```
 
+`last_insert_id` is `null` unless the statement inserted a row. (Before 2.9 an
+`UPDATE` or `DELETE` reported whatever id the pooled connection had last
+inserted, which could belong to another request.)
+
 ### Writes that return the row
 
 SQLite supports `RETURNING`, which is how `app.resource` gives you the created
@@ -102,6 +127,10 @@ $ curl "localhost:8000/tickets?limit=1%20OR%201=1"
 
 That 400 *is* the proof: `1 OR 1=1` arrived as a string bound to a LIMIT, which
 is a type error rather than an injected clause.
+
+The same 400 (`WC211`) answers an integer too large for SQLite's 64-bit
+`INTEGER` (since 2.9). It used to be stored as the nearest float, silently
+changing the number.
 
 The SQL text itself must come from your source. Never build a query string from
 request data — if you find yourself wanting to, use a Python handler and a real

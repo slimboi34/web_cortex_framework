@@ -122,7 +122,7 @@ def triage(ctx, input):
                     "properties": {"urgency": {"enum": ["low", "high"]}}},
         )
         if verdict["urgency"] == "high":                       # a real branch
-            ctx.call("update_tickets", id=ticket["id"], priority=1)
+            ctx.call("update_tickets", **{**ticket, "priority": 1})
 ```
 
 [Behaviours :material-arrow-right:](behaviours.md){ .md-button }

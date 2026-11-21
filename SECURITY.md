@@ -402,6 +402,86 @@ Not tested: the exporter against a real collector (it is tested against a local 
 endpoint that records what it receives), and trace memory under sustained very high run
 rates.
 
+## Review — 2.9.0 (stress test)
+
+2.9.0 came from a planned stress test of 2.8.0: a hostile pass over authorization and agent
+authority, injection, denial of service and the supply chain, a concurrency and functional
+sweep, a check of the 2.8 evidence features, and two newcomers following the README, the
+tutorial and the reference pages. It confirmed 60 defects (3 high, 14 medium, 43 low) out of 79
+raw findings; 17 were refuted. The controls that held under attack again: the control-plane
+scope matrix, the emergency stop, request smuggling, slowloris on headers, SQL binding, path
+traversal and the 2.7 → 2.8 upgrade.
+
+**High, fixed:**
+
+1. **An approval gate could be bypassed through a flow step.** A flow ran its steps through the
+   dispatcher, which never checked `approval`; the gate was checked only by name at each entry
+   point (agent loop, MCP, behaviour). So an agent, an MCP client or a behaviour that could call
+   a flow ran the gated step inside it, with no approval. Now a flow whose steps include a gated
+   tool, directly or through nested flows and parallel or route branches, is refused at boot;
+   the flow runner refuses such a step again before it runs; and MCP and behaviours refuse to
+   start a flow that contains one.
+2. **Slow-read denial of service.** A response was released from the in-flight count as soon as
+   the handler returned, before the body was written, and any byte in either direction (an
+   HTTP/2 PING, a slow drip) counted as activity. A client that never read its responses could
+   pin them in memory without limit. Now a response counts as in flight until its body is sent,
+   a connection whose body makes no progress is closed after a send deadline that the client's
+   own reads and pings cannot extend, static files are streamed from disk rather than read
+   whole, and HTTP/2 allows fewer concurrent streams per connection.
+3. **Worker-pool deadlock.** Behaviours and sync route handlers shared one thread pool, and a
+   behaviour's `ctx.call` blocked with no deadline. Eight anonymous requests to a public
+   behaviour that called a sync route could take every thread, wedge the app permanently, and
+   leave it unable to exit on SIGTERM. Now behaviours have their own pool, the excess is refused
+   with 503 instead of queued, every blocking call from a behaviour has a deadline, and the
+   worker threads cannot keep the process alive past the shutdown drain. Either half alone
+   prevents the wedge.
+
+**Medium, fixed (the ones with a security impact):** `app.jwt(audience=, issuer=)` accepted
+tokens that left the claim out; agent turns over a WebSocket bypassed the rate limit; a socket
+opened with a JWT kept running agent turns after the token expired; the proxy followed upstream
+redirects to any host, sending the upstream credentials and a `Referer` there; request bodies of
+up to 32 MB were buffered before routing and the scope check; `public_routes` left out routes
+opened by `anonymous_scopes`; resource routes did not enforce the input schema they advertised;
+`ctx.ask(schema=)` returned answers that did not match; `| json` in a template was invalid
+inside a script block, and `| json | safe` was an XSS; `.txt` and `.json` templates were served
+as unescaped `text/html`. See `CHANGELOG.md` for the full list, including the low-severity
+findings (a JWT `sub` equal to an API key's id, one principal evicting everyone's approvals, a
+starter placeholder working as an admin key, and others).
+
+**Changed behaviour you may notice:** a flow with an approval-gated step no longer boots; a
+token missing `aud`/`iss` is a 401 when either is configured; a resource body that breaks its
+schema is a 422; the proxy relays a `3xx` instead of following it; WebSocket turns are rate
+limited and end at token expiry; typed outputs refuse extra keys; `.txt` and `.json` templates
+change content type; resource lists are newest first and clamped; a key that still starts with
+`replace-me` is not registered.
+
+**Documented rather than changed:**
+
+- **Typed parameters are converted, not validated.** A value that cannot be converted reaches
+  the handler unchanged (`id: int` can receive `"1 OR 1=1"`). Strict binding would be a
+  breaking change and is not in this release; `docs/routing.md` now says so and tells handlers
+  to validate.
+- **Device ingest keys are not bound to a device by default.** Every device that keeps the
+  default `ingest_scopes` accepts the same `devices:ingest`. `docs/device-hub.md` shows how to
+  give each device its own scope; changing the default would break existing device keys.
+- **Approval gates govern models, not people.** A direct HTTP call by a caller holding the
+  route's scopes is not gated, by design.
+- **An admin key given to an MCP client is a full admin credential**, because the MCP endpoint
+  is a control-plane route.
+- **Full identity namespacing** (prefixing principal ids by how they authenticated) would
+  orphan stored memory and sessions without a migration. This release refuses a JWT whose
+  `sub` collides with an API key's id or the `watcher:` prefix instead.
+- **Upstream credentials in `headers=`** are embedded in the manifest. `webcortex context
+  --json` now redacts them; an environment-variable form for non-bearer headers is planned.
+
+**Not tested in this review:** TLS and HSTS over a real `https` deployment (WebCortex never
+speaks TLS itself); the timing of key comparison under statistical measurement;
+coverage-guided fuzzing of the pre-auth parsers (manifest, JSON-RPC, router); behaviour against
+real model providers (every agent test ran against the deterministic fake); the Rust unit
+tests themselves (the review drove the built extension); Linux and Windows (the stress test ran
+on macOS). The ten bugs
+already known before the review were carried in without being re-verified.
+
 ## Reporting
 
 Report a vulnerability privately through

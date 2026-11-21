@@ -102,6 +102,9 @@ app = WebCortex(
     request_timeout=30,            # int, seconds
     agent_timeout=600,             # int, seconds — agent, flow and behaviour routes
     shutdown_timeout=25,           # int, seconds
+    start_halted=False,            # bool — boot with the emergency stop engaged
+    max_connections=10_000,        # int — open connections incl. WebSockets; 0 = no cap
+    api_key_header="x-api-key",    # str (2.9) — lower-cased; authorization/cookie refused
 )
 ```
 
@@ -159,7 +162,12 @@ Binding rules, exactly:
 - A parameter named `req` or `request`, **or** annotated `Request`, receives the
   whole `Request` and is excluded from the schema.
 - Every other parameter is resolved **path → query string → JSON body**, in that
-  order, and coerced to its annotation.
+  order, and converted to its annotation. **A value that cannot be converted is
+  passed through unchanged** (`id: int` can receive `"abc"`; a dataclass
+  parameter can receive the raw dict). The annotation is not validation: in
+  generated handlers, check values before relying on them, and never
+  interpolate one into SQL, a shell command or a path. Strict binding (422 on a
+  failed conversion) is not implemented.
 - Path parameters are taken from `{name}` segments in `path` (`{*rest}`, a
   wildcard, binds `rest`).
 - Parameters with defaults are optional; parameters without are required.
@@ -201,17 +209,24 @@ app.query(method, path, sql, *, params=(), returns="many", **kw) -> int
 ```
 Binds a route directly to SQL. `params` names the values bound to each `?` **in
 order**; each is resolved path → query → body. `returns` is `"many"`, `"one"`,
-or `"affected"` — any other value raises `ValueError`. This is the fastest kind
-of route WebCortex has.
+or `"affected"` — any other value raises `ValueError`. `"affected"` answers
+`{"affected", "last_insert_id"}`, with `last_insert_id` `null` unless the
+statement inserted a row. An integral number outside i64 is refused (400
+`WC211`), never bound as a rounded float. This is the fastest kind of route
+WebCortex has.
 
 ```python
-app.upstream(name, base_url, *, headers=None, bearer_env=None, timeout_ms=30_000) -> None
+app.upstream(name, base_url, *, headers=None, bearer_env=None, timeout_ms=30_000,
+             max_response_bytes=64 * 1024 * 1024) -> None
 app.proxy(method, path, *, upstream, rewrite=None, **kw) -> int
 ```
 Declare an external API, then forward routes to it. **Credentials are named, not
 embedded**: `bearer_env` holds the *name* of an environment variable, resolved at
 boot. This keeps the manifest safe to log, diff, and hand to an agent. Never
-inline a token here.
+inline a token here (`headers=` values are embedded; `webcortex context --json`
+redacts them, but the manifest holds them). The proxy has its own HTTP client
+that never follows redirects and sends no `Referer`: a `3xx` is relayed to the
+caller with its `Location` (rewritten when it points inside `base_url`).
 
 ```python
 app.static_files(path, directory, *, index=None, cache_secs=3600) -> int
@@ -234,6 +249,15 @@ app.resource(
 
 Generates the full five-route CRUD surface (list, get, create, update, delete),
 executed entirely in Rust. With `tools=True` those five become five agent tools.
+
+Since 2.9 a native query route that carries an `input_schema` and takes a body
+validates the body before binding: a missing required field, an unknown key or
+a wrong type is 422 `WC206` naming the field. `POST` requires every field but a
+generated integer key; `PUT` replaces the row and requires every writable
+field (there is no `PATCH`), so a generated `ctx.call("update_x", ...)` must
+send the whole row: `ctx.call("update_x", **{**row, "field": value})`. The list
+is `ORDER BY <primary_key> DESC`, `limit` clamped to 1–1000 (default 50),
+`offset` ≥ 0. A field declared `bool` reads back as `true`/`false`.
 
 Authorization is deliberately split, because reads and writes rarely warrant the
 same scope:
@@ -260,14 +284,21 @@ app.api_key(env_var, *, id, scopes=())
 ```
 Accepts an API key read from `env_var`. The secret never appears in source or in
 the manifest — only the variable name. The runtime stores a SHA-256 and compares
-in constant time.
+in constant time. It is read from the `api_key_header` header (`x-api-key`). A
+secret that starts with `replace-me` (a starter placeholder) is not registered,
+and `webcortex doctor` fails on it; starters ship the variables empty.
 
 ```python
 app.jwt(*, secret_env, algorithm="HS256", audience=None, issuer=None, leeway_secs=30)
 ```
-Bearer JWTs verified with the secret in `secret_env`. Scopes come from the
-standard `scope` (space-delimited) or `scopes` (array) claims. `exp` is
-**required and always validated**. `leeway_secs` is stated explicitly rather than
+Bearer JWTs verified with the secret in `secret_env` (the PEM public key for RS,
+ES and EdDSA). Scopes come from the standard `scope` (space-delimited) or
+`scopes` (array) claims. `exp` is **required and always validated**; `aud` and
+`iss` are **required** when `audience` / `issuer` are set (2.9; before, a token
+without the claim passed). `algorithm` is one of HS256/384/512, RS256/384/512,
+ES256, ES384, EdDSA, else `ValueError`. A token whose `sub` equals a configured
+API key's `id` or starts with `watcher:` is a 401, because principal ids are not
+namespaced by how they authenticated. `leeway_secs` is stated explicitly rather than
 inherited because the underlying library defaults to 60s, and an expired token
 staying valid for another minute should be a decision.
 
@@ -275,7 +306,12 @@ staying valid for another minute should be a decision.
 app.anonymous_scopes(*scopes)
 ```
 Grants scopes to callers with no credential. Empty by default. This is the single
-most common way a route someone believed was protected becomes public.
+most common way a route someone believed was protected becomes public. A route
+is public when auth is off, or when every scope it requires (route and tool
+scopes; `expose_scopes` for agents, behaviours and flows) is in
+`anonymous_scopes`; `security_report()["public_routes"]` lists exactly those
+(2.9: it used to list only unscoped routes). An agent, behaviour or flow in that
+list can be started anonymously, so give it a `token_budget`.
 
 ```python
 app.cors(*origins, credentials=False, methods=None, headers=None, expose=(), max_age=600)
@@ -307,6 +343,10 @@ Already sensible without calling this. Call it to tune, not to enable.
   **start** a run. They default to the same set.
 - Behaviour tool calls run under a **delegated principal** and cannot exceed the
   caller's scopes. `tests/test_pentest.py` proves this; do not regress it.
+- `expose_scopes` defaults to `scopes`, so an agent, behaviour or flow with
+  neither is a public route.
+- The control plane, `/mcp` included, needs `webcortex:admin` once auth is
+  configured: a key handed to an MCP client is a full admin credential.
 
 ---
 
@@ -331,6 +371,15 @@ def ctx(...) -> dict: ...
 ```
 
 Template output is HTML-escaped. `tests/test_fullstack.py` asserts this.
+
+Escaping and the response's content type both follow the template's extension,
+looking through `.j2`/`.jinja`/`.jinja2` (2.9): `.html`/`.htm`/`.xhtml` →
+`text/html`, `.xml` → `application/xml`, `.svg` → `image/svg+xml` (all
+HTML-escaped), `.txt` → `text/plain` (not escaped), `.json` →
+`application/json` (JSON auto-escape: `{{ v }}` writes a JSON value). The
+`json` filter (alias `tojson`) is script-safe: `<`, `>`, `&`, `'`, U+2028 and
+U+2029 come out as `\uXXXX`, and it returns a safe string. **Never generate
+`| safe` after `| json`** or on user data.
 
 ---
 
@@ -444,7 +493,7 @@ def triage(ctx, input):
         if verdict["urgency"] > 7:                # a real branch
             urgent += 1
             ctx.call("page_oncall", ticket=ticket["id"])
-        ctx.call("update_tickets", id=ticket["id"], category=verdict["category"])
+        ctx.call("update_tickets", **{**ticket, "category": verdict["category"]})  # PUT: whole row
     return {"triaged": len(tickets), "urgent": urgent}
 ```
 
@@ -453,9 +502,9 @@ The `ctx` surface:
 | call | meaning |
 | --- | --- |
 | `ctx.call(tool, **kwargs)` | invoke one of the app's tools, in-process, under the delegated principal |
-| `ctx.gather(*items, return_exceptions=False)` | several tool calls concurrently; items are `(tool, kwargs)`, a name, or `{"tool": …, **kwargs}`; one step each; admitted/scoped/gated exactly like `call` |
-| `ctx.ask(prompt, *, schema=None, system=None, model=None, max_tokens=None, temperature=None)` | a model call; with a schema the model is **forced** into that shape (tool_choice), and JSON is recovered from prose if a local model answers in text; `model` may be an alias |
-| `ctx.ask_many(prompts, *, schema=None, ..., concurrency=8)` | concurrent `ask`; answers in order; one step per prompt |
+| `ctx.gather(*items, return_exceptions=False)` | several tool calls concurrently; items are `(tool, kwargs)`, a name, or `{"tool": …, **kwargs}`; one step each; admitted/scoped/gated exactly like `call`. Admission (undeclared tool → `PermissionError`, gated tool or a flow containing one → halt, step budget) happens before any call and raises **even with `return_exceptions=True`** |
+| `ctx.ask(prompt, *, schema=None, system=None, model=None, max_tokens=None, temperature=None)` | a model call; with a schema the model is **forced** into that shape (tool_choice), JSON is recovered from prose if a local model answers in text, and (2.9) the answer is validated with `schema::validate`: up to two corrections, then it raises with `WC318`; `model` may be an alias |
+| `ctx.ask_many(prompts, *, schema=None, ..., concurrency=8)` | concurrent `ask`; answers in order; one step per prompt; each answer validated like `ask` |
 | `ctx.context(name)` | a declared context provider's raw value; `PermissionError` if not declared on the behaviour |
 | `ctx.log(msg)` | structured log line |
 | `ctx.halt(reason)` | stop the behaviour |
@@ -478,9 +527,14 @@ also charged to the request tree's shared budget (§8a), so a behaviour started
 by an agent cannot outspend the agent. Do not remove these bounds in generated
 code.
 
-Behaviours run on the sync thread pool and block on `Handle::block_on`;
-`gather`/`ask_many` block once on a `join_all`. Never run a behaviour on an
-event loop.
+Behaviours run on a thread pool of their own (2.9: separate from the sync
+handler pool, so a nested `ctx.call` to a sync route always has a thread) and
+block on `Handle::block_on`; `gather`/`ask_many` block once on a `join_all`.
+Every such block has a deadline (the request's remaining time), and a run that
+finds the behaviour pool full is refused with 503 instead of queued. Never run a
+behaviour on an event loop, and never add an unbounded `block_on`.
+
+A behaviour with no `scopes` and no `expose_scopes` is a public route.
 
 ---
 
@@ -531,6 +585,15 @@ A typo in `tools`, `handoffs` or `context` is a **boot error** with a "did you
 mean" hint. An agent that lists itself in `handoffs` is rejected, and so is one
 whose `tools` include `transfer_to_<h>` for one of its own handoffs `h`.
 
+`max_steps` counts provider round trips, not tool executions: every tool call
+in one response runs. A gated call is suspended only if the run's delegated
+principal holds the route's scopes; otherwise it is refused at once
+(WC602) and no approval is created, with a hint naming the
+agent's scopes (2.9). So give an agent the scopes of every gated tool it should
+be able to propose. Agent turns over a WebSocket are rate limited per turn
+(WC401 + `retry_after`), and a socket opened with a JWT refuses turns after the
+token's `exp` (WC603, close 1008).
+
 Result shape: `run_id, agent, path, status, output, steps, usage,
 pending_approval?, session_id?, data?, trace_id?`. `status` ∈ `completed | max_tokens |
 step_limit | budget_exhausted | awaiting_approval | failed` (`max_tokens`: the
@@ -560,7 +623,8 @@ reset depth to zero on tool calls, which bypassed the nesting ceiling.
 
 Sessions: `SessionStore` keyed by `(agent, principal.id, session_id)`,
 in-memory, `server.session_capacity` (1000) / `session_ttl_secs` (3600),
-LRU-evicted; each keeps its newest 400 messages / 8 MB, cut at a turn boundary
+LRU-evicted, with a per-root-principal share (2.9: a principal at its share evicts its own
+LRU session, never another's); each keeps its newest 400 messages / 8 MB, cut at a turn boundary
 (`session::bound`). Those, `approval_ttl_secs` and `max_invocation_depth` are
 manifest defaults that `WebCortex(...)` does not set yet. Saved after any terminal status except `awaiting_approval`. A `session_id` from an anonymous root caller is a 401.
 
@@ -570,7 +634,10 @@ already produced. `POST /_webcortex/approvals/{id}` with
 `{"approve": bool, "note": str}` (admin scope) executes or refuses the gated
 call, runs the **rest of the turn**, and continues the loop. A decision is
 consumed; expiry is `server.approval_ttl_secs` (3600). Denial pushes a
-`tool_result` error carrying the note.
+`tool_result` error carrying the note. The store holds at most 1000, with a
+per-root-principal share: at its share a principal's own oldest request is
+evicted. The gate binds models only: a direct HTTP call by a caller holding the
+route's scopes runs at once.
 
 ### 8b. Flows
 
@@ -582,8 +649,12 @@ app.flow(name, *, pipeline=None, parallel=None, merge="collect", route=None,
 ```
 
 Exactly one of `pipeline` / `parallel` / `route`. A step is a tool name or
-`{"tool": name, "input": template}`; every step must be an exposed tool, and a
-flow may not contain itself. Executed in Rust (`flow.rs`) under a delegated
+`{"tool": name, "input": template}`; every step must be an exposed tool, a
+flow may not contain itself, and (2.9) a flow whose steps name an
+approval-gated tool, transitively through nested flows and parallel/route
+branches, is a boot error: a flow cannot suspend, and in 2.8 the gated step ran
+unchecked. `flow::call_step` refuses such a step again (WC309), and MCP and
+behaviours refuse to start such a flow. Executed in Rust (`flow.rs`) under a delegated
 principal, `depth + 1`, and one shared budget. Mounted at
 `/flows/<name-with-hyphens>` as a
 tool named `<name>`.
@@ -667,11 +738,17 @@ No vision model is embedded (DESIGN §5); pixels are carried to the model.
   (`Timing`), streams are pinged when quiet, and protocol errors are closed
   with 1002/1007/1009 (`close_for`).
   Connections are served with `serve_connection_with_upgrades`. A browser may
-  authenticate an upgrade with `?access_token=` (it is injected as the API-key
-  header only on upgrades with no header credential). Agent routes accept
+  authenticate an upgrade with `?access_token=` (only on upgrades with no header
+  credential): a three-segment token becomes `authorization: Bearer` when JWT is
+  configured, anything else the API-key header. A JWT socket is closed at the
+  token's `exp`. Agent routes accept
   sockets too: `RunOptions.events` (an mpsc sender) receives
   `{"type":"step"}` from `RunState::emit`, called after each model step, each
   tool call, at the top of the loop and in `finish`.
+- **Ingest authority is by scope, not by device.** Every device that keeps the
+  default `ingest_scopes=["devices:ingest"]` accepts any key holding it. For
+  per-device keys, give each device its own scope (`devices:ingest:<name>`);
+  the default is kept for compatibility.
 - **Watchers:** `devices::spawn_watchers` (called in `serve_with_shutdown`,
   aborted on shutdown) → `run_watcher_once`: current frame and telemetry →
   SHA-256 of their bytes (skip if unchanged and `only_on_change`) → hourly
@@ -703,8 +780,19 @@ dataclass, a `TypedDict` or a schema dict; its top-level type must be `"object"`
 - `flow::unwrap_output` hands the next step `data` rather than `output` when a run has it.
 
 `schema.rs` is a deliberate subset of JSON Schema (the keywords `schema.py` emits, plus
-bounds and `anyOf`/`oneOf`/`allOf`); unknown keywords are **ignored**. Do not make it refuse
-them, and do not add a regex dependency for `pattern`.
+bounds, `uniqueItems`, `anyOf`/`oneOf`/`allOf`, and `$ref` to a local `#/$defs/...`);
+unknown keywords are **ignored**. Do not make it refuse them, and do not add a regex
+dependency for `pattern`. `patternProperties` is ignored and, when present, switches off the
+`additionalProperties` check for that object. Known keywords of the wrong type (a non-list
+`required`, a fractional `minItems`, a dangling local `$ref`) are refused at boot by
+`output_schema_problem`. Numeric equality is by value and recursive; integers compare
+exactly. `schema.py` closes dataclass and `TypedDict` output schemas
+(`additionalProperties: false`; `dict[str, X]` stays open) and describes a recursive type
+under root `$defs`. Prose recovery (`recover_json`) returns the **last** balanced JSON object
+that parses.
+
+A typed agent may not hand off, directly or transitively, to an agent whose `tools` include
+a `final_answer` route (boot error), and `specs_for` never sends two tools of one name.
 
 **Request options** (`options=` on agents and behaviours, `app.request_options` /
 `app.provider(options=)` per provider → `AgentDef.options`, `BehaviourDef.options`,
@@ -749,17 +837,23 @@ provider with `App::with_provider` for `record` (`RecordingProvider` around the 
 and returns `{status, body, error, usage, trace, cassette?, replay?}`. Expectations are
 checked in Python (`check_result`); `tools_called` is read from the trace, so it sees the
 whole tree. Replay is per agent name, in recorded call order, and each call's
-`replay::fingerprint` (agent name, model, system, tools with schemas, forced tool,
-`max_tokens`, `temperature`, `reasoning`, options) must match or the call fails with
-`WC319`. The conversation is deliberately **not** fingerprinted: tool results carry run ids
-and timings. `WC320` is an unreadable cassette or an eval that cannot be run. There is no
-model-graded check, on purpose.
+`replay::fingerprint` (agent name, model alias and the concrete model it resolved to, system,
+context provider names and static definitions, tools with schemas, forced tool,
+`max_tokens`, `temperature`, `reasoning`, the agent's options merged over the provider's)
+must match or the call fails with `WC319`; 2.8.0 cassettes are therefore stale once. The
+conversation is deliberately **not** fingerprinted: tool results carry run ids
+and timings. `WC320` is an unreadable cassette or an eval that cannot be run (every
+`OSError` on a cassette, with the path). Trace-derived checks (`tools_called`,
+`tools_not_called`, `max_model_calls`) **fail closed** when the trace is missing or has
+dropped spans. Refused calls (`WC307`, `WC317`, `WC602`, `WC502`) are not "called". `expect`
+values are type-checked at declaration; `true` never equals `1` in `data`; an exception in
+`check` fails that eval only. There is no model-graded check, on purpose.
 
 ## 9. Introspection and output
 
 | call | returns |
 | --- | --- |
-| `app.check()` | validated report: routes, tools, agents, behaviours, flows, contexts. Raises on any invalid declaration |
+| `app.check()` | validated report: routes, tools, agents, behaviours, flows, contexts. Raises on any invalid declaration (2.9: including a page template that is missing or does not parse). `webcortex check` also prints the route table: method, path, engine, scopes |
 | `app.manifest()` / `app.manifest_json()` | the manifest the Rust runtime executes |
 | `app.openapi()` | OpenAPI document, with `x-webcortex-tool` and `x-webcortex-op` extensions |
 | `app.schema_sql` | property — DDL for declared resources and memories |
@@ -818,10 +912,11 @@ webcortex tools    [target]
 webcortex sql      [target]
 webcortex security [target]
 webcortex typegen  [target] [-o client/api.ts]
-webcortex context  [target] [--json]
+webcortex context  [target] [--json] [--show-secrets]
+webcortex mcp-config [target]
 webcortex evolve   REQUEST [target] [-m MODEL] [-o FILE] [--json]
-webcortex halt     [target] [--reason R] [--status] [--key K]
-webcortex release  [target] [--key K]
+webcortex halt     [target] [--reason R] [--status] [--key K] [--url U]
+webcortex release  [target] [--key K] [--url U]
 webcortex doctor   [target] [--online] [--json] [--url U] [--key K]
 webcortex status   [target] [--json] [--url U] [--key K]
 webcortex explain  [CODE] [--list] [--json]
@@ -836,7 +931,13 @@ always for `check`).
 
 `halt` and `release` call the running app's control plane (`POST
 {control_prefix}/halt|release`, admin scope) using `--key` or
-`$WEBCORTEX_API_KEY`, at `WEBCORTEX_HOST`/`WEBCORTEX_PORT` or the app's own.
+`$WEBCORTEX_API_KEY`, at `--url` (2.9), else `WEBCORTEX_HOST`/`WEBCORTEX_PORT` or
+the app's own over plain HTTP.
+
+`context --json` replaces upstream header values with `"<redacted>"` unless
+`--show-secrets` is passed. `mcp-config` prints the `mcpServers` entry and a
+shell-quoted `claude mcp add` command (server name reduced to `[A-Za-z0-9_-]`).
+`dev` does not reload; restart it after editing `api.py`.
 
 `evolve` calls `_core.ask_model(manifest_json, model, system, prompt, schema,
 max_tokens)`, which builds a `ProviderRegistry` from the app's `models`

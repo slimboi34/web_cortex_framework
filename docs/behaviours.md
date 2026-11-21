@@ -36,7 +36,7 @@ def triage(ctx, input):
             },
         )
         if verdict["urgency"] == "high":                 # a real branch
-            ctx.call("update_tickets", id=ticket["id"], priority=1)
+            ctx.call("update_tickets", **{**ticket, "priority": 1})
             urgent += 1
 
     return {"reviewed": len(tickets), "escalated": urgent}
@@ -70,6 +70,10 @@ tickets = ctx.call("list_tickets", status="open", limit=50)
 Scope enforcement is the same code that guards the HTTP path. A Behaviour cannot
 reach a route its caller could not.
 
+A call that fails raises. So does a call the runtime will not even start: a
+tool the behaviour did not declare (`PermissionError`), or an approval-gated
+tool or a flow containing one (the behaviour halts).
+
 ### `ctx.ask(prompt, *, schema=None, system=None, model=None, max_tokens=None, temperature=None)`
 
 A model call. With `schema`, the result is validated JSON — so the surrounding
@@ -89,6 +93,16 @@ if verdict["legitimate"]:
 
 Without `schema` you get text.
 
+With it, the model is forced to answer through a tool whose input is the schema,
+and since 2.9 the answer is checked against it (the same validator as an
+agent's [structured output](structured-output.md)): a missing key, a wrong type,
+a value outside an `enum` or an array where an object belongs goes back to the
+model with the list of problems, up to twice, and a third miss raises with
+`WC318` and the problems in the message. Before 2.9 whatever came back was
+returned, so `verdict["legitimate"]` could be missing or a string. Each retry
+is a model call and counts against the budget. `ctx.ask_many` checks every
+answer the same way.
+
 ### `ctx.gather(*items, return_exceptions=False)`
 
 Several tool calls at once. Each item is `(tool, kwargs)`, a bare tool name,
@@ -103,6 +117,12 @@ rows = ctx.gather(("get_orders", {"id": 1}), ("get_orders", {"id": 2}), "ping")
 By default the first failure is raised after every call has finished. With
 `return_exceptions=True`, failures come back in place as
 `{"error": "...", "ok": False}`.
+
+`return_exceptions` covers calls that ran and failed. It does not cover a call
+the runtime refuses to start: if any item names a tool the behaviour did not
+declare, an approval-gated tool, or a flow containing one, or the items would
+take the run past `max_steps`, `gather` raises before any call runs, whatever
+`return_exceptions` says.
 
 ### `ctx.ask_many(prompts, *, schema=None, model=None, concurrency=8, ...)`
 
@@ -179,7 +199,8 @@ Pick the model per leaf. `model="fast"` on the behaviour, or on an individual
 ## Exposing a Behaviour
 
 By default a Behaviour is itself an agent tool (`tool=True`), so agents can
-invoke your procedures. Mount it over HTTP with `expose_at`:
+invoke your procedures. It is also a route, at `/behaviours/<name-with-hyphens>`
+or wherever `expose_at` puts it:
 
 ```python
 @app.behaviour(
@@ -194,7 +215,22 @@ def triage(ctx, input): ...
 ```
 
 Note the split again: `scopes` is what the procedure may do, `expose_scopes` is
-who may start it.
+who may start it. `expose_scopes` defaults to `scopes`, and every behaviour
+has a route (`/behaviours/<name-with-hyphens>` unless `expose_at` says
+otherwise), so a behaviour with neither is **public**: anyone with no
+credential may start it and spend its `token_budget`, and `webcortex security`
+lists it under `public_routes`. Its tool calls are then held to the anonymous caller's scopes,
+but its model calls are not held to anything but the budget.
+
+### Concurrency
+
+Behaviours run on a thread pool of their own, separate from the one that runs
+sync route handlers, so a behaviour's `ctx.call` to a sync route always finds a
+thread. When every behaviour thread is busy, a new run is refused with `503`
+rather than queued. `ctx.call`, `ctx.gather`, `ctx.ask` and `ctx.ask_many` wait
+at most for the request's remaining time, then raise, so a stuck call cannot
+hold a thread forever. (In 2.8, a handful of concurrent behaviours calling sync
+routes could deadlock the shared pool for good.)
 
 ## Worked example: refund processing
 

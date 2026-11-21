@@ -56,10 +56,12 @@ breaks a tool's schema, drops a scope, or reorders a pipeline, the replay fails.
 ### A cassette is tied to the agent it was recorded for
 
 Each recorded response carries a **fingerprint** of the request's stable parts: the agent's
-name, system prompt and model name, its tools (names, descriptions and input schemas), a
-forced tool, `max_tokens`, `temperature`, `reasoning` and its
-[request options](request-options.md). On replay the fingerprint of the call being made is
-compared with the recorded one. If they differ, the recorded answer is an answer to a
+name, system prompt and model name, the concrete model that name resolved to, its context
+providers (their names and declarations, not what they returned), its tools (names,
+descriptions and input schemas), a forced tool, `max_tokens`, `temperature`, `reasoning`, and
+its [request options](request-options.md), including those set for the whole provider with
+`app.request_options(...)`. On replay the fingerprint of the call being made is compared with
+the recorded one. If they differ, the recorded answer is an answer to a
 different question, and the run fails with `WC319` instead of pretending:
 
 ```text
@@ -69,9 +71,15 @@ different question, and the run fails with `WC319` instead of pretending:
            change is intended, record again with `webcortex eval --record`
 ```
 
-So a prompt change cannot slip through on old recordings. Record again, and read the diff of
+So a prompt change cannot slip through on old recordings, and neither can re-pointing an
+alias (`app.models(fast=...)`) or adding a context provider. Record again, and read the diff of
 the cassette in review: it is a plain JSON file, and that diff is what your prompt change did
 to the model's behaviour.
+
+!!! note "Cassettes recorded with 2.8.0 are stale once"
+    2.9 added the resolved model, the context providers and provider-level options to the
+    fingerprint, so every cassette recorded with 2.8.0 reports `WC319` on its first replay.
+    Run `webcortex eval --record` once after upgrading and commit the result.
 
 The conversation itself is not part of the fingerprint. Tool results carry run ids and timings
 that differ on every run, so matching on them would make every replay miss. Responses are
@@ -95,6 +103,11 @@ replayed per agent, in the order they were recorded. Two consequences:
 
 Also: `--only NAME` (repeatable), `--dir DIR` (default `evals`), `--list`, `--json`.
 
+A cassette that cannot be read or written (unreadable, a directory, not valid JSON) is
+`WC320` with its path, never a traceback. The other ways a run can fail before it starts, such
+as an `--only` name no eval has, are coded too: the command exits 1, and with `--json` prints
+`{"ok": false, "error": {...}}` on stdout.
+
 Under `WEBCORTEX_FAKE_PROVIDER=1` "the providers" is the deterministic fake, so evals written
 in its command language (`tool:<name> {…}`, `handoff:<agent>`) need no cassette at all.
 
@@ -111,7 +124,7 @@ cannot quietly turn a check into nothing.
 | `output_contains` | the output contains the string, or every string of a list |
 | `output_not_contains` | it contains none of them |
 | `output_matches` | the regular expression is found in the output |
-| `data` | the [structured answer](structured-output.md) (or a behaviour's or route's JSON result) contains this subset: nested objects are matched key by key, everything else by equality |
+| `data` | the [structured answer](structured-output.md) (or a behaviour's or route's JSON result) contains this subset: nested objects are matched key by key, everything else by equality, where `true` does not equal `1` (but `1` equals `1.0`) |
 | `tools_called` | these tools ran, in this order, anywhere in the request tree (other calls may come between) |
 | `tools_not_called` | none of these ran |
 | `path` | the agents the run passed through are exactly these |
@@ -121,10 +134,24 @@ cannot quietly turn a check into nothing.
 
 `tools_called` is read from the run's [trace](tracing.md), so it sees tools called by a nested
 agent, a flow step or a behaviour, not only the outermost agent's. A call the runtime refused
-(a tool the agent was not given) does not count as called.
+does not count as called: a tool the agent was not given (`WC307`), a malformed call
+(`WC317`), a missing scope (`WC602`) or an actuator refused by the emergency stop (`WC502`).
+
+`tools_called`, `tools_not_called` and `max_model_calls` need the trace, so they **fail** when
+there is none to read: when tracing is off (`app.tracing(enabled=False)`), or when the trace
+was truncated at `max_spans` and dropped spans (the failure says how many). Before 2.9 they
+fell back to the outermost agent's own steps, and `tools_not_called` could pass on a run that
+had called the tool from a nested agent.
+
+Each value is type-checked when the eval is declared: `max_steps`, `max_tokens`,
+`max_model_calls` and `http_status` must be integers (not `True`), `status` and `code`
+strings, and `tools_called`, `tools_not_called` and `path` a string or a list of strings.
+Anything else is a `ValueError`, like an unknown key.
 
 For anything else, pass a function. It receives the result body; raising, returning `False`
-or returning a string (the reason) fails the eval:
+or returning a non-empty string (the reason) fails the eval, and anything else (`None`,
+`True`, an empty string) passes it. An exception raised by `check` fails that eval only: the
+others still run, and `--json` still prints the report:
 
 ```python
 def cites_an_invoice(result):
