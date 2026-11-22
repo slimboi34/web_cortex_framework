@@ -319,7 +319,6 @@ proptest! {
     /// the single percent-decoding of the segment the client sent (the same
     /// lenient decoding `percent_decode_str` does), whenever that is UTF-8.
     #[test]
-    #[ignore = "fails on 2.9.0: router double-decodes (%4%31 binds \"A\"); repro_router_double_decode.py"]
     fn router_param_is_decoded_exactly_once(seg in "([0-7g-z.~_-]|%|%[0-7]|%[0-7][0-9A-Fa-f]){1,10}") {
         let single = percent_encoding::percent_decode_str(&seg).decode_utf8();
         prop_assume!(single.is_ok());
@@ -332,7 +331,6 @@ proptest! {
     /// handler sees the original bytes rather than a lossy rewrite"
     /// (router.rs, `decode_param`).
     #[test]
-    #[ignore = "fails on 2.9.0: an undecodable parameter is returned normalised (%aa -> %AA), not as sent"]
     fn router_undecodable_param_is_kept_as_sent(seg in "([a-z0-9]|%[0-9A-Fa-f]{2}){0,4}%[89a-fA-F][0-9a-fA-F]([a-z0-9]|%[0-9A-Fa-f]{2}){0,4}") {
         let single = percent_encoding::percent_decode_str(&seg).decode_utf8();
         prop_assume!(single.is_err());

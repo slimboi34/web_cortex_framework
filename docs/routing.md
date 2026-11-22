@@ -377,6 +377,11 @@ unreserved characters are decoded and hex is upper-cased, so `/p%69ng` is
 `/ping`, and a route with a non-ASCII literal segment (`/café/{n}`) answers
 whether the client sends raw UTF-8, `%C3%A9` or `%c3%a9`. `%2F`, `%5C` and
 `%25` stay encoded, so an encoded separator never splits a segment, and a
-parameter is still decoded exactly once.
+parameter is decoded exactly once: `/echo/%4%31` binds `"%41"`, the single
+decoding of what was sent (2.9.0 decoded it again to `"A"`, so `%2%45%2%45`
+reached a handler as `..`). A parameter that is not UTF-8 once decoded
+(`/echo/%FF`) reaches the handler exactly as the client sent it, escapes and
+case included. Query values are different: an undecodable byte there becomes
+U+FFFD.
 
 [Database :material-arrow-right:](database.md){ .md-button .md-button--primary }
