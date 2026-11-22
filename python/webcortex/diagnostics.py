@@ -421,8 +421,12 @@ def doctor(app: Any, *, online: bool = False, url: str | None = None, key: str |
 
 
 def _without_userinfo(url: str) -> str:
-    """``url`` with any ``user:password@`` replaced, so a check can name it."""
-    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@", r"\1<redacted>@", url)
+    """``url`` with any ``user:password@`` replaced, so a check can name it.
+
+    Up to the last ``@`` of the authority, as URL parsers read it, so a
+    password that contains an ``@`` is hidden whole.
+    """
+    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@", r"\1<redacted>@", url)
 
 
 def _otlp_check(tracing: dict) -> dict | None:

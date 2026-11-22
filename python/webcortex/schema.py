@@ -576,11 +576,16 @@ def coerce(value: Any, annotation: Any) -> Any:
     enum member, and ``items: list[Item]`` a list of ``Item``. Anything we
     cannot convert is passed through unchanged so the handler can decide
     what to do with it. Conversions never lose information: ``3.7`` is not
-    an ``int`` and a JSON object is not a ``str``, so both pass through.
+    an ``int``, ``2**53 + 1`` is not a ``float`` (no float equals it) and a
+    JSON object is not a ``str``, so all three pass through.
     """
     try:
         return _coerce(value, annotation, 0)
-    except RecursionError:
+    except (RecursionError, ArithmeticError, ValueError, TypeError):
+        # A conversion that failed in a way no branch foresaw passes the value
+        # through, as promised: through 2.9.0 an int past the float range
+        # (OverflowError) or past the int/str digit limit (ValueError) made
+        # any client's request a 500 before the handler ran.
         return value
 
 
@@ -646,7 +651,13 @@ def _coerce(value: Any, annotation: Any, depth: int) -> Any:
         if isinstance(value, float):
             return value
         if isinstance(value, int) and not isinstance(value, bool):
-            return float(value)
+            # Only a float that equals the int: 2**53 + 1 has none (it would
+            # come out as 2**53), and 10**400 is past the float range.
+            try:
+                number = float(value)
+            except OverflowError:
+                return value
+            return number if number == value else value
         if isinstance(value, str):
             try:
                 number = float(value)

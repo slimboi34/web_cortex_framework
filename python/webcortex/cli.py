@@ -399,10 +399,16 @@ _REDACTED = "<redacted>"
 
 
 def _redact_url(url: Any) -> Any:
-    """A URL with any ``user:password@`` replaced."""
+    """A URL with any ``user:password@`` replaced.
+
+    The userinfo ends at the *last* ``@`` before the path, query or fragment,
+    as every URL parser reads it: ``https://svc:p@ss@host`` has the password
+    ``p@ss``. Through 2.9.0 the redaction stopped at the first ``@`` and showed
+    ``<redacted>@ss@host``.
+    """
     if not isinstance(url, str):
         return url
-    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@", rf"\1{_REDACTED}@", url)
+    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@", rf"\1{_REDACTED}@", url)
 
 
 def redacted_manifest(manifest: dict) -> dict:
