@@ -105,7 +105,9 @@ jobs:
           PYTHON: ${{ matrix.python }}
         run: |
           uv venv --python "$PYTHON"
-          uv pip install maturin pytest
+          # hypothesis and typing_extensions: the 2.9.1 property and mutation
+          # tests (they skip without them, so a bare install still passes).
+          uv pip install maturin pytest hypothesis typing_extensions
           source .venv/bin/activate
           # The exact patch release matters. `3.14` is a moving target — uv
           # hands out whatever the newest build is at the time the runner runs,
