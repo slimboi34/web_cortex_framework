@@ -155,7 +155,7 @@ pub static CATALOGUE: &[ErrorInfo] = &[
     e!("WC317", "agent", None, "Malformed tool call",
        "The model asked for a tool with arguments that are not a JSON object (cut off, garbled, or a bare value), so the tool was not run. The model is told and may retry; a small local model that keeps doing it needs a larger max_tokens or a simpler input schema."),
     e!("WC318", "agent", Some(502), "Answer does not match the output schema",
-       "The agent has an output schema and its answer still did not match after being corrected twice. The failing steps list what was wrong. Simplify the schema, say in the system prompt what each field means, raise max_tokens if the answer is being cut off, or use a stronger model."),
+       "The agent has an output schema and its answer still did not match after being corrected twice. The failing steps list what was wrong. Simplify the schema, say in the system prompt what each field means, raise max_tokens if the answer is being cut off, or use a stronger model. A problem saying checking stopped after some number of steps means the schema's alternatives multiply at one place; give the union fewer, flatter members."),
     e!("WC319", "agent", Some(502), "No recorded response to replay",
        "A run replayed from a cassette asked for a model response the cassette does not hold: the agent's system prompt, model, tools or options changed since it was recorded, or the run now takes a different path. If the change is intended, record again with `webcortex eval --record`."),
     e!("WC320", "agent", None, "Unreadable cassette or eval",

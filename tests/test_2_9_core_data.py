@@ -306,7 +306,14 @@ def test_a_json_page_is_json_and_writes_values_as_json(server):
 @pytest.mark.parametrize("raw", ["18446744073709551615", "9223372036854775808", "123456789012345678901234567890"])
 def test_an_integer_outside_64_bits_is_refused_not_rounded(server, raw):
     status, body, _ = server.json("POST", "/accounts", raw=('{"balance_cents": %s}' % raw).encode())
-    assert status == 400 and body["error"]["code"] == "WC211", body
+    if len(raw) > 20:
+        # Past u64 the JSON parser holds it as a double, and since 2.9.1 the
+        # input schema refuses that before the database sees it.
+        assert status == 422 and body["error"]["code"] == "WC206", body
+        assert "outside the integers the runtime carries exactly" in body["error"]["message"]
+    else:
+        # A u64 past i64: SQLite's binding refuses it.
+        assert status == 400 and body["error"]["code"] == "WC211", body
 
 
 def test_integers_that_fit_are_stored_exactly(server):

@@ -787,8 +787,16 @@ unknown keywords are **ignored**. Do not make it refuse them, and do not add a r
 dependency for `pattern`. `patternProperties` is ignored and, when present, switches off the
 `additionalProperties` check for that object. Known keywords of the wrong type (a non-list
 `required`, a fractional `minItems`, a dangling local `$ref`) are refused at boot by
-`output_schema_problem`. Numeric equality is by value and recursive; integers compare
-exactly. `schema.py` closes dataclass and `TypedDict` output schemas
+`output_schema_problem`, and so is a `$ref` graph the checker could not follow (`ref_graph`:
+an in-place cycle, or more than `MAX_REFS_IN_PLACE` in a row). Numeric equality is by value
+and recursive; integers in the 64-bit range compare exactly, and a double beyond it
+(`rounded`) never passes `type: integer` or an equality that rests on it. Checking must stay
+polynomial: alternatives are tried fail-fast in a trial `Sink` (scalars first), `anyOf`
+stops at the first match and `oneOf` at the second, `$ref` verdicts on objects and arrays are
+memoised by address, and a step budget (`STEPS_PER_VALUE`, `MIN_STEPS`, `MAX_STEPS`) ends a
+check with one problem. Do not add a keyword that walks the value without going through
+`check`, or the budget stops counting it. `agent.rs` checks answers on the blocking pool
+(`check_output`); `ctx.ask` checks them with the GIL released. `schema.py` closes dataclass and `TypedDict` output schemas
 (`additionalProperties: false`; `dict[str, X]` stays open) and describes a recursive type
 under root `$defs`. Prose recovery (`recover_json`) returns the **last** balanced JSON object
 that parses.

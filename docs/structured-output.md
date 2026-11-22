@@ -96,7 +96,37 @@ other step.
 `maxLength`, `anyOf`, `oneOf`, `allOf`, and `$ref` to a local `#/$defs/...` entry.
 
 Numbers compare by value wherever they appear, so `1` matches an `enum` or `const` of `1.0`,
-inside arrays and objects too, and integers are compared exactly, however large.
+inside arrays and objects too, and integers from -2^63 to 2^64 - 1 are compared exactly
+(`maximum: 9007199254740992` refuses `9007199254740993`).
+
+**Integers beyond 64 bits.** The core's JSON parser holds an integer outside that range as the
+nearest double, so `18446744073709551617` arrives as `18446744073709551616.0`. Rather than hand
+such a value on rounded, the validator refuses it where it matters: `type: "integer"` refuses
+it (as `WC318`, with a problem naming the range, so the model can send a string instead), and
+so does a `minimum`/`maximum`, `const`, `enum` or `uniqueItems` decision that rests on two
+values being equal only as doubles. A `number` field still takes any double, `6.02e23`
+included. If a field can hold such integers, declare it a string.
+
+**How long checking takes.** Checking is polynomial in the size of the answer and the schema.
+`anyOf` stops at the first alternative that matches and `oneOf` at the second, each try stops at
+its first problem, and the verdict of a `$defs` entry on each object or array is remembered,
+so a recursive union such as an expression tree (`Add | Sub | Lit`) is checked in time linear
+in the answer. A step budget (256 steps per value in the answer, at least 100,000 and at most
+4,000,000) bounds the rest: a schema whose alternatives multiply at one place stops with a
+`WC318` problem saying so, rather than holding a thread. The check runs on the blocking pool,
+off the server's async workers.
+
+**Which problem the model is told.** When no member of a union matches, the member the answer
+got furthest into (past its type, its discriminator and its required keys) is taken to be the
+one it meant, and its own problems are reported: `$.expr.left.value: expected integer, got
+string`, not "matches none of the 3 alternatives" at the top. When no member stands out, the
+problem says so and lists the first problem of each of the first three.
+
+**Schemas the boot check refuses.** Besides keywords of the wrong type and `$ref`s to missing
+definitions, an output schema is refused at boot when the checker could not follow its `$ref`s:
+a cycle of `$ref`s that describe no part of the value (including a sub-schema pointing at
+itself, `#/$defs/D/allOf/0`), or more than 32 `$ref`s in a row at one place. Recursion through a
+property or an item is fine.
 
 It is a deliberate subset. `pattern`, `format` and any other `$ref` are **ignored**, not
 refused: an unknown keyword never fails an answer that is otherwise right. If a field needs a

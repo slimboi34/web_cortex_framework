@@ -324,7 +324,7 @@ The model asked for a tool with arguments that are not a JSON object (cut off, g
 
 *agent · HTTP 502*
 
-The agent has an output schema and its answer still did not match after being corrected twice. The failing steps list what was wrong. Simplify the schema, say in the system prompt what each field means, raise max_tokens if the answer is being cut off, or use a stronger model.
+The agent has an output schema and its answer still did not match after being corrected twice. The failing steps list what was wrong. Simplify the schema, say in the system prompt what each field means, raise max_tokens if the answer is being cut off, or use a stronger model. A problem saying checking stopped after some number of steps means the schema's alternatives multiply at one place; give the union fewer, flatter members.
 
 ### WC319 — No recorded response to replay {#wc319}
 

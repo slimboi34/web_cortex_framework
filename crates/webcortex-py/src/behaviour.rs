@@ -587,7 +587,11 @@ impl BehaviourContext {
                     answers[i] = Some(self.text_answer(py, response, elapsed)?);
                     continue;
                 };
-                match Self::structured(&response, schema) {
+                // Checked without the GIL: the check is bounded, but a large
+                // answer to a schema with many alternatives can take a
+                // noticeable fraction of a second, and other Python threads
+                // should run meanwhile.
+                match py.detach(|| Self::structured(&response, schema)) {
                     Ok(value) => {
                         self.record("ask", "structured", value.clone(), elapsed);
                         answers[i] = Some(json_to_py(py, &value)?);

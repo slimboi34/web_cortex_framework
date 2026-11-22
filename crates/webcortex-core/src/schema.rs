@@ -21,12 +21,31 @@
 //! which keys are "additional" depends on the patterns.
 //!
 //! Numbers compare as JSON Schema means them: `1` equals `1.0` at any depth,
-//! and two integers compare exactly, however large, instead of through `f64`.
-//! Count keywords (`minItems`, `maxLength`, …) accept an integral float such as
-//! `2.0`, which JSON Schema counts as an integer.
+//! and two integers in the 64-bit range (`-2^63` to `2^64 - 1`) compare
+//! exactly instead of through `f64`. Count keywords (`minItems`, `maxLength`,
+//! …) accept an integral float such as `2.0`, which JSON Schema counts as an
+//! integer.
+//!
+//! An integer outside that range cannot be carried exactly: the JSON parser
+//! keeps it as the nearest `f64` (serde_json without `arbitrary_precision`,
+//! which would change how every number in the runtime is held). So the checker
+//! never lets such a value pass on a rounding: `type: integer` refuses it, and
+//! a `minimum`/`maximum`, `const`, `enum` or `uniqueItems` decision that rests
+//! on two values being equal only as doubles, where one is beyond that range,
+//! is refused with a problem saying so.
+//!
+//! Checking takes time polynomial in the size of the schema and the value.
+//! Alternatives (`anyOf`, `oneOf`) are tried fail-fast — the first problem
+//! ends a try, `anyOf` stops at the first alternative that matches and
+//! `oneOf` at the second — and the verdict of a `$ref` target on an object or
+//! an array is remembered, so a recursive union (an expression tree, an AST)
+//! checks each part of the value once per member rather than once per path to
+//! it. A step budget bounds what is left (a schema whose alternatives multiply
+//! at one place): past it the check stops with a problem rather than run on.
 
 use serde_json::{Map, Number, Value};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 /// Stop collecting after this many problems: the list is shown to a model,
 /// which needs the first few, not all two hundred.
@@ -34,14 +53,36 @@ pub const MAX_PROBLEMS: usize = 8;
 
 /// How many `$ref`s may be followed at one place in a value before the
 /// checker stops: a chain this long that consumes none of the value is a
-/// mistake, and a cycle would otherwise never end.
-const MAX_REFS_IN_PLACE: usize = 32;
+/// mistake, and a cycle would otherwise never end. The boot check
+/// ([`output_schema_problem`]) refuses a schema that could need more.
+pub const MAX_REFS_IN_PLACE: usize = 32;
+
+/// The step budget of one check is this many steps for each JSON value in the
+/// checked value (each object, array, string, number, …), never less than
+/// [`MIN_STEPS`] and never more than [`MAX_STEPS`]. A step is one schema
+/// applied to one value. Ordinary schemas, unions included, take a handful of
+/// steps per value, so only a schema whose alternatives multiply at one place
+/// comes near it.
+pub const STEPS_PER_VALUE: usize = 256;
+
+/// The least step budget a check gets, whatever the size of the value.
+pub const MIN_STEPS: usize = 100_000;
+
+/// The most steps any one check may take (a fraction of a second in a release
+/// build), however large the value.
+pub const MAX_STEPS: usize = 4_000_000;
+
+/// The most verdicts one check remembers. Past it checking goes on without
+/// remembering more (the step budget still bounds it), so a huge value cannot
+/// turn the memo into a large allocation.
+const MAX_MEMO: usize = 1 << 18;
 
 /// The JSON Schema type names.
 const TYPE_NAMES: [&str; 7] = ["null", "boolean", "integer", "number", "string", "array", "object"];
 
-/// Check `value` against `schema`. Returns every problem found, each naming
-/// the JSON pointer it is at; empty means the value conforms.
+/// Check `value` against `schema`. Returns every problem found (up to
+/// [`MAX_PROBLEMS`]), each naming the JSON pointer it is at; empty means the
+/// value conforms.
 ///
 /// ```
 /// use serde_json::json;
@@ -50,16 +91,56 @@ const TYPE_NAMES: [&str; 7] = ["null", "boolean", "integer", "number", "string",
 /// assert_eq!(webcortex_core::schema::validate(&schema, &json!({})), vec!["$: missing required property \"n\""]);
 /// ```
 pub fn validate(schema: &Value, value: &Value) -> Vec<String> {
-    let mut problems = Vec::new();
-    Checker { root: schema }.check(schema, value, "$", &[], &mut problems);
-    problems
+    let budget = STEPS_PER_VALUE.saturating_mul(count_values(value)).clamp(MIN_STEPS, MAX_STEPS);
+    validate_within(schema, value, budget)
+}
+
+/// [`validate`] with an explicit step budget.
+fn validate_within(schema: &Value, value: &Value, budget: usize) -> Vec<String> {
+    let mut checker = Checker {
+        root: schema,
+        steps: 0,
+        budget,
+        exhausted: false,
+        memo: HashMap::new(),
+        reported: HashSet::new(),
+    };
+    let mut sink = Sink::collect();
+    checker.check(schema, value, &Path::root(), &[], &mut sink);
+    if checker.exhausted {
+        // What was found before the budget ran out may be incomplete, and an
+        // alternative cut short is no verdict: say only why checking stopped.
+        return vec![format!(
+            "$: checking stopped after {budget} steps without a verdict: the schema's alternatives (anyOf, oneOf, \
+             allOf) and $refs make a value like this too costly to check; send a smaller or simpler value"
+        )];
+    }
+    sink.list
+}
+
+/// How many JSON values `value` holds, itself included.
+fn count_values(value: &Value) -> usize {
+    let mut n = 0;
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        n += 1;
+        match v {
+            Value::Array(items) => stack.extend(items),
+            Value::Object(map) => stack.extend(map.values()),
+            _ => {}
+        }
+    }
+    n
 }
 
 /// Why `schema` cannot be used as an agent's output schema, if it cannot. A
 /// tool's input must be a JSON object on both wire formats, so the answer is
 /// an object too. A keyword of the wrong type (`"required": "name"`, a
 /// negative `maxItems`, a `$ref` to a definition that does not exist) is
-/// refused here, at boot, rather than silently ignored on every answer.
+/// refused here, at boot, rather than silently ignored on every answer; so is
+/// a `$ref` graph the checker could not follow: a cycle that describes no part
+/// of the value, or a chain of more than [`MAX_REFS_IN_PLACE`] `$ref`s at one
+/// place.
 pub fn output_schema_problem(schema: &Value) -> Option<String> {
     let Some(obj) = schema.as_object() else {
         return Some("it must be a JSON Schema object".into());
@@ -73,7 +154,7 @@ pub fn output_schema_problem(schema: &Value) -> Option<String> {
         }
         None => return Some("it must declare \"type\": \"object\" at the top level".into()),
     }
-    malformed(schema, schema, "#").and_then(|()| ref_cycle(schema)).err()
+    malformed(schema, schema, "#").and_then(|()| ref_graph(schema)).err()
 }
 
 fn type_name(v: &Value) -> &'static str {
@@ -100,10 +181,40 @@ fn is_type(v: &Value, wanted: &str) -> bool {
     }
 }
 
-fn push(problems: &mut Vec<String>, at: &str, message: String) {
-    if problems.len() < MAX_PROBLEMS {
-        problems.push(format!("{at}: {message}"));
+fn is_container(v: &Value) -> bool {
+    matches!(v, Value::Object(_) | Value::Array(_))
+}
+
+/// A number held as a double outside the range where JSON integers are kept
+/// exactly (`-2^63` to `2^64 - 1`): it may be an integer the parser rounded
+/// (`18446744073709551617` is held as `2^64`), so an equality it takes part
+/// in may hold only after rounding. `-2^63` itself counts: as a double it is
+/// also what `-9223372036854775809` rounds to.
+fn rounded(n: &Number) -> bool {
+    // 2^64 and -2^63, exactly.
+    const ABOVE: f64 = 18_446_744_073_709_551_616.0;
+    const BELOW: f64 = -9_223_372_036_854_775_808.0;
+    exact_int(n).is_none() && n.as_f64().is_some_and(|f| f >= ABOVE || f <= BELOW)
+}
+
+/// Whether `v` holds a [`rounded`] number anywhere.
+fn holds_rounded(v: &Value) -> bool {
+    match v {
+        Value::Number(n) => rounded(n),
+        Value::Array(items) => items.iter().any(holds_rounded),
+        Value::Object(map) => map.values().any(holds_rounded),
+        _ => false,
     }
+}
+
+/// The problem for an equality that holds only as doubles.
+fn only_as_doubles(what: &str) -> String {
+    format!(
+        "is equal to {what} only as a double: an integer outside {} to {} is held rounded, so it cannot be compared \
+         exactly; send a number inside that range, or a string",
+        i64::MIN,
+        u64::MAX
+    )
 }
 
 /// The definition a `$ref` names, when it is a local reference into the root
@@ -133,8 +244,136 @@ fn count_value(v: &Value) -> Option<u64> {
     })
 }
 
+/// Where in the value a check is, built only when a problem is reported:
+/// `$`, `$.key`, `$.list[3]`.
+#[derive(Clone, Copy)]
+enum Seg<'a> {
+    Root,
+    Key(&'a str),
+    Index(usize),
+}
+
+#[derive(Clone, Copy)]
+struct Path<'a> {
+    parent: Option<&'a Path<'a>>,
+    seg: Seg<'a>,
+    depth: usize,
+}
+
+impl<'a> Path<'a> {
+    fn root() -> Path<'static> {
+        Path { parent: None, seg: Seg::Root, depth: 0 }
+    }
+
+    fn key(&'a self, key: &'a str) -> Path<'a> {
+        Path { parent: Some(self), seg: Seg::Key(key), depth: self.depth + 1 }
+    }
+
+    fn index(&'a self, i: usize) -> Path<'a> {
+        Path { parent: Some(self), seg: Seg::Index(i), depth: self.depth + 1 }
+    }
+
+    fn render(&self) -> String {
+        use std::fmt::Write;
+        let mut segs = Vec::with_capacity(self.depth + 1);
+        let mut node = Some(self);
+        while let Some(p) = node {
+            segs.push(p.seg);
+            node = p.parent;
+        }
+        let mut out = String::new();
+        for seg in segs.iter().rev() {
+            match seg {
+                Seg::Root => out.push('$'),
+                Seg::Key(k) => {
+                    out.push('.');
+                    out.push_str(k);
+                }
+                Seg::Index(i) => {
+                    let _ = write!(out, "[{i}]");
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Where the problems of one check go.
+///
+/// The main check collects up to [`MAX_PROBLEMS`], in the order the value is
+/// walked. A *try* of one alternative (`anyOf`/`oneOf`) stops at its first
+/// problem, looks at a value's scalar properties before descending into its
+/// objects and arrays (so a wrong discriminator such as `"kind": "sub"` ends
+/// it before any subtree is walked), and formats no message unless one is
+/// wanted for a report.
+struct Sink {
+    list: Vec<String>,
+    found: usize,
+    limit: usize,
+    /// A try of one alternative rather than the main check.
+    trial: bool,
+    /// Format each problem (always, in the main check).
+    keep: bool,
+    /// How deep in the value the first problem is.
+    first: Option<usize>,
+}
+
+impl Sink {
+    fn collect() -> Self {
+        Sink { list: Vec::new(), found: 0, limit: MAX_PROBLEMS, trial: false, keep: true, first: None }
+    }
+
+    fn trial(keep: bool) -> Self {
+        Sink { list: Vec::new(), found: 0, limit: 1, trial: true, keep, first: None }
+    }
+
+    fn full(&self) -> bool {
+        self.found >= self.limit
+    }
+
+    fn push(&mut self, at: &Path<'_>, message: impl FnOnce() -> String) {
+        self.push_as(at, at.depth, message);
+    }
+
+    /// A problem at `at`, counted as being `depth` deep (how far into the
+    /// value an alternative got before failing: see [`Checker::no_alternative`]).
+    fn push_as(&mut self, at: &Path<'_>, depth: usize, message: impl FnOnce() -> String) {
+        if self.full() {
+            return;
+        }
+        self.found += 1;
+        self.first.get_or_insert(depth);
+        if self.keep {
+            self.list.push(format!("{}: {}", at.render(), message()));
+        }
+    }
+
+    /// A problem known only from a remembered verdict (a try without messages).
+    fn mark(&mut self, depth: usize) {
+        if !self.full() {
+            self.found += 1;
+            self.first.get_or_insert(depth);
+        }
+    }
+}
+
+/// A remembered verdict of a `$ref` target on one object or array.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Valid,
+    /// Invalid, with the first problem this many levels below the place.
+    Invalid(usize),
+}
+
 struct Checker<'s> {
     root: &'s Value,
+    steps: usize,
+    budget: usize,
+    exhausted: bool,
+    /// `(target, value)` → verdict, by address: both live as long as the check.
+    memo: HashMap<(usize, usize), Verdict>,
+    /// `(target, value)` pairs whose problems are already in the main list.
+    reported: HashSet<(usize, usize)>,
 }
 
 impl<'s> Checker<'s> {
@@ -142,14 +381,19 @@ impl<'s> Checker<'s> {
     /// it is emptied whenever the check descends into a property or an item,
     /// so a recursive type may recurse as deep as the value does, but a
     /// reference that comes back to itself without consuming anything stops.
-    fn check(&self, schema: &'s Value, value: &Value, at: &str, refs: &[&'s str], problems: &mut Vec<String>) {
-        if problems.len() >= MAX_PROBLEMS {
+    fn check(&mut self, schema: &'s Value, value: &Value, at: &Path<'_>, refs: &[&'s str], sink: &mut Sink) {
+        if self.exhausted || sink.full() {
+            return;
+        }
+        self.steps += 1;
+        if self.steps > self.budget {
+            self.exhausted = true;
             return;
         }
         let Some(s) = schema.as_object() else {
             // `true` and `{}` accept anything; `false` accepts nothing.
             if schema == &Value::Bool(false) {
-                push(problems, at, "no value is allowed here".into());
+                sink.push(at, || "no value is allowed here".into());
             }
             return;
         };
@@ -162,39 +406,94 @@ impl<'s> Checker<'s> {
             && let Some(target) = resolve_local(self.root, reference)
         {
             if refs.contains(&reference.as_str()) {
-                push(problems, at, format!("the schema's $ref {reference:?} refers back to itself here"));
+                sink.push(at, || format!("the schema's $ref {reference:?} refers back to itself here"));
             } else if refs.len() >= MAX_REFS_IN_PLACE {
-                push(problems, at, format!("the schema follows more than {MAX_REFS_IN_PLACE} $refs here"));
+                sink.push(at, || format!("the schema follows more than {MAX_REFS_IN_PLACE} $refs here"));
             } else {
                 let mut chain = refs.to_vec();
                 chain.push(reference.as_str());
-                self.check(target, value, at, &chain, problems);
+                self.follow(target, value, at, &chain, sink);
+            }
+            if sink.full() {
+                return;
             }
         }
 
         match s.get("type") {
             Some(Value::String(t)) if !is_type(value, t) => {
-                push(problems, at, format!("expected {t}, got {}", type_name(value)));
+                sink.push(at, || format!("expected {t}, got {}", type_name(value)));
                 return;
             }
             Some(Value::Array(ts)) if !ts.iter().filter_map(Value::as_str).any(|t| is_type(value, t)) => {
-                let names: Vec<&str> = ts.iter().filter_map(Value::as_str).collect();
-                push(problems, at, format!("expected one of {}, got {}", names.join(" | "), type_name(value)));
+                sink.push(at, || {
+                    let names: Vec<&str> = ts.iter().filter_map(Value::as_str).collect();
+                    format!("expected one of {}, got {}", names.join(" | "), type_name(value))
+                });
                 return;
             }
-            _ => {}
+            Some(t) => {
+                // An integer beyond the 64-bit range arrives rounded, so it is
+                // not the integer that was sent.
+                let names = |name: &str| match t {
+                    Value::String(x) => x == name,
+                    Value::Array(xs) => xs.iter().any(|x| x == name),
+                    _ => false,
+                };
+                if let Value::Number(n) = value
+                    && rounded(n)
+                    && names("integer")
+                    && !names("number")
+                {
+                    sink.push(at, || {
+                        format!(
+                            "expected integer, got {n}, which is outside the integers the runtime carries exactly \
+                             ({} to {}); send a number inside that range, or a string",
+                            i64::MIN,
+                            u64::MAX
+                        )
+                    });
+                    return;
+                }
+            }
+            None => {}
         }
 
-        if let Some(Value::Array(allowed)) = s.get("enum")
-            && !allowed.iter().any(|a| same(a, value))
-        {
-            let shown: Vec<String> = allowed.iter().take(12).map(Value::to_string).collect();
-            push(problems, at, format!("must be one of {}", shown.join(", ")));
+        // A value that is not the constant (or not on the list) is wrong as a
+        // whole: what is inside it would only add noise, and in a union this
+        // is the discriminator that rules an alternative out.
+        if let Some(Value::Array(allowed)) = s.get("enum") {
+            let mut unsure = false;
+            let listed = allowed.iter().any(|a| match same(a, value) {
+                Some(yes) => yes,
+                None => {
+                    unsure = true;
+                    false
+                }
+            });
+            if !listed {
+                sink.push(at, || {
+                    if unsure {
+                        only_as_doubles("one of the allowed values")
+                    } else {
+                        let shown: Vec<String> = allowed.iter().take(12).map(Value::to_string).collect();
+                        format!("must be one of {}", shown.join(", "))
+                    }
+                });
+                return;
+            }
         }
-        if let Some(c) = s.get("const")
-            && !same(c, value)
-        {
-            push(problems, at, format!("must be {c}"));
+        if let Some(c) = s.get("const") {
+            match same(c, value) {
+                Some(true) => {}
+                Some(false) => {
+                    sink.push(at, || format!("must be {c}"));
+                    return;
+                }
+                None => {
+                    sink.push(at, || only_as_doubles(&c.to_string()));
+                    return;
+                }
+            }
         }
 
         match value {
@@ -202,7 +501,10 @@ impl<'s> Checker<'s> {
                 if let Some(Value::Array(required)) = s.get("required") {
                     for name in required.iter().filter_map(Value::as_str) {
                         if !map.contains_key(name) {
-                            push(problems, at, format!("missing required property {name:?}"));
+                            sink.push(at, || format!("missing required property {name:?}"));
+                            if sink.full() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -211,16 +513,24 @@ impl<'s> Checker<'s> {
                 // patterns, which are not evaluated; applying it anyway would
                 // refuse keys the patterns allow.
                 let patterned = s.contains_key("patternProperties");
-                for (key, item) in map {
-                    let here = format!("{at}.{key}");
-                    match props.and_then(|p| p.get(key)) {
-                        Some(sub) => self.check(sub, item, &here, &[], problems),
-                        None if patterned => {}
-                        None => match s.get("additionalProperties") {
-                            Some(Value::Bool(false)) => push(problems, at, format!("unexpected property {key:?}")),
-                            Some(sub @ Value::Object(_)) => self.check(sub, item, &here, &[], problems),
-                            _ => {}
-                        },
+                let extra = s.get("additionalProperties");
+                if sink.trial {
+                    // Scalars first: a discriminator settles a try before any
+                    // subtree is walked.
+                    for scalars in [true, false] {
+                        for (key, item) in map.iter().filter(|(_, item)| is_container(item) != scalars) {
+                            self.property(props, patterned, extra, key, item, at, sink);
+                            if sink.full() {
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    for (key, item) in map {
+                        self.property(props, patterned, extra, key, item, at, sink);
+                        if sink.full() {
+                            return;
+                        }
                     }
                 }
             }
@@ -229,54 +539,56 @@ impl<'s> Checker<'s> {
                 if let Some(min) = count_keyword(s, "minItems")
                     && n < min
                 {
-                    push(problems, at, format!("needs at least {min} item(s), has {n}"));
+                    sink.push(at, || format!("needs at least {min} item(s), has {n}"));
                 }
                 if let Some(max) = count_keyword(s, "maxItems")
                     && n > max
                 {
-                    push(problems, at, format!("allows at most {max} item(s), has {n}"));
+                    sink.push(at, || format!("allows at most {max} item(s), has {n}"));
                 }
                 if s.get("uniqueItems") == Some(&Value::Bool(true))
                     && let Some((first, again)) = first_duplicate(items)
                 {
-                    push(problems, at, format!("items must be unique, but items {first} and {again} are equal"));
+                    sink.push(at, || {
+                        if holds_rounded(&items[first]) || holds_rounded(&items[again]) {
+                            format!(
+                                "items {first} and {again} are equal only as doubles: an integer outside {} to {} \
+                                 is held rounded, so they cannot be told apart; send numbers inside that range, or \
+                                 strings",
+                                i64::MIN,
+                                u64::MAX
+                            )
+                        } else {
+                            format!("items must be unique, but items {first} and {again} are equal")
+                        }
+                    });
+                }
+                if sink.full() {
+                    return;
                 }
                 let prefix = s.get("prefixItems").and_then(Value::as_array);
                 for (i, item) in items.iter().enumerate() {
-                    let here = format!("{at}[{i}]");
+                    let here = at.index(i);
                     match prefix.and_then(|p| p.get(i)) {
-                        Some(sub) => self.check(sub, item, &here, &[], problems),
+                        Some(sub) => self.check(sub, item, &here, &[], sink),
                         None => {
                             if let Some(sub) = s.get("items") {
-                                self.check(sub, item, &here, &[], problems);
+                                self.check(sub, item, &here, &[], sink);
                             }
                         }
+                    }
+                    if sink.full() {
+                        return;
                     }
                 }
             }
             Value::Number(num) => {
-                let bound = |key: &str| s.get(key).and_then(Value::as_number);
-                let below = |b: &Number| num_cmp(num, b) == Some(Ordering::Less);
-                let above = |b: &Number| num_cmp(num, b) == Some(Ordering::Greater);
-                if let Some(min) = bound("minimum")
-                    && below(min)
-                {
-                    push(problems, at, format!("must be >= {min}"));
-                }
-                if let Some(max) = bound("maximum")
-                    && above(max)
-                {
-                    push(problems, at, format!("must be <= {max}"));
-                }
-                if let Some(min) = bound("exclusiveMinimum")
-                    && !above(min)
-                {
-                    push(problems, at, format!("must be > {min}"));
-                }
-                if let Some(max) = bound("exclusiveMaximum")
-                    && !below(max)
-                {
-                    push(problems, at, format!("must be < {max}"));
+                for key in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
+                    if let Some(bound) = s.get(key).and_then(Value::as_number)
+                        && let Some(problem) = bound_problem(num, key, bound)
+                    {
+                        sink.push(at, || problem);
+                    }
                 }
             }
             Value::String(text) => {
@@ -284,40 +596,207 @@ impl<'s> Checker<'s> {
                 if let Some(min) = count_keyword(s, "minLength")
                     && n < min
                 {
-                    push(problems, at, format!("must be at least {min} character(s) long"));
+                    sink.push(at, || format!("must be at least {min} character(s) long"));
                 }
                 if let Some(max) = count_keyword(s, "maxLength")
                     && n > max
                 {
-                    push(problems, at, format!("must be at most {max} character(s) long"));
+                    sink.push(at, || format!("must be at most {max} character(s) long"));
                 }
             }
             _ => {}
         }
+        if sink.full() {
+            return;
+        }
 
         if let Some(Value::Array(all)) = s.get("allOf") {
             for sub in all {
-                self.check(sub, value, at, refs, problems);
-            }
-        }
-        for key in ["anyOf", "oneOf"] {
-            if let Some(Value::Array(options)) = s.get(key) {
-                let matching = options
-                    .iter()
-                    .filter(|sub| {
-                        let mut local = Vec::new();
-                        self.check(sub, value, at, refs, &mut local);
-                        local.is_empty()
-                    })
-                    .count();
-                if matching == 0 {
-                    push(problems, at, format!("matches none of the {} alternatives in {key}", options.len()));
-                } else if key == "oneOf" && matching > 1 {
-                    push(problems, at, format!("matches {matching} alternatives in oneOf; exactly one is allowed"));
+                self.check(sub, value, at, refs, sink);
+                if sink.full() {
+                    return;
                 }
             }
         }
+        for key in ["anyOf", "oneOf"] {
+            let Some(Value::Array(options)) = s.get(key) else { continue };
+            // anyOf is settled by the first match, oneOf by the second.
+            let enough = if key == "oneOf" { 2 } else { 1 };
+            let mut matched: Vec<usize> = Vec::with_capacity(2);
+            // Each alternative that failed, with how deep its first problem is.
+            let mut failed: Vec<(usize, usize)> = Vec::new();
+            for (i, sub) in options.iter().enumerate() {
+                let mut trial = Sink::trial(false);
+                self.check(sub, value, at, refs, &mut trial);
+                if self.exhausted {
+                    return;
+                }
+                if trial.found == 0 {
+                    matched.push(i);
+                    if matched.len() == enough {
+                        break;
+                    }
+                } else {
+                    failed.push((i, trial.first.unwrap_or(at.depth)));
+                }
+            }
+            if matched.is_empty() {
+                self.no_alternative(key, options, &failed, value, at, refs, sink);
+            } else if matched.len() > 1 {
+                let (a, b) = (matched[0] + 1, matched[1] + 1);
+                sink.push(at, || {
+                    format!("matches more than one alternative in oneOf (alternatives {a} and {b}); exactly one is allowed")
+                });
+            }
+            if sink.full() {
+                return;
+            }
+        }
     }
+
+    /// Check one property of an object against its schema.
+    #[allow(clippy::too_many_arguments)]
+    fn property(
+        &mut self,
+        props: Option<&'s Map<String, Value>>,
+        patterned: bool,
+        extra: Option<&'s Value>,
+        key: &str,
+        item: &Value,
+        at: &Path<'_>,
+        sink: &mut Sink,
+    ) {
+        let here = at.key(key);
+        match props.and_then(|p| p.get(key)) {
+            Some(sub) => self.check(sub, item, &here, &[], sink),
+            None if patterned => {}
+            None => match extra {
+                Some(Value::Bool(false)) => sink.push(at, || format!("unexpected property {key:?}")),
+                Some(sub @ Value::Object(_)) => self.check(sub, item, &here, &[], sink),
+                _ => {}
+            },
+        }
+    }
+
+    /// Check `value` against the `$ref` target `target`, remembering the
+    /// verdict for an object or an array: the same definition meets the same
+    /// part of the value once per union member that reaches it, and without
+    /// this a recursive union re-checked every subtree once per path to it.
+    fn follow(&mut self, target: &'s Value, value: &Value, at: &Path<'_>, chain: &[&'s str], sink: &mut Sink) {
+        if sink.full() {
+            return;
+        }
+        // The verdict does not depend on how the target was reached: the boot
+        // check refuses the in-place cycles and long chains that would make
+        // `chain` matter.
+        let key = is_container(value).then_some((target as *const Value as usize, value as *const Value as usize));
+        if let Some(key) = key {
+            match self.memo.get(&key).copied() {
+                Some(Verdict::Valid) => return,
+                Some(Verdict::Invalid(below)) if sink.trial && !sink.keep => {
+                    sink.mark(at.depth + below);
+                    return;
+                }
+                _ if !sink.trial && self.reported.contains(&key) => return,
+                _ => {}
+            }
+        }
+        let before = sink.found;
+        self.check(target, value, at, chain, sink);
+        let Some(key) = key else { return };
+        if self.exhausted {
+            return;
+        }
+        if self.memo.len() >= MAX_MEMO {
+            // Past the cap nothing more is remembered; already-reported
+            // problems are still not repeated.
+            if sink.found != before && !sink.trial {
+                self.reported.insert(key);
+            }
+        } else if sink.found == before {
+            self.memo.insert(key, Verdict::Valid);
+        } else if sink.trial {
+            let below = sink.first.unwrap_or(at.depth).saturating_sub(at.depth);
+            self.memo.entry(key).or_insert(Verdict::Invalid(below));
+        } else {
+            self.reported.insert(key);
+        }
+    }
+
+    /// Report a value that matched none of a union's alternatives in a way a
+    /// model can act on.
+    ///
+    /// Each alternative was tried until its first problem, scalars before
+    /// subtrees, so how deep that problem is says how far the value got into
+    /// it. When one alternative got strictly furthest — past its type, its
+    /// discriminator and its required names — it is the one the value meant,
+    /// and its own problems are reported: for an expression tree that is
+    /// `$.expr.left.value: expected integer`, not "matches none of the 3
+    /// alternatives" at the top. Otherwise the first problem of each of the
+    /// first three alternatives is listed.
+    #[allow(clippy::too_many_arguments)]
+    fn no_alternative(
+        &mut self,
+        key: &str,
+        options: &'s [Value],
+        failed: &[(usize, usize)],
+        value: &Value,
+        at: &Path<'_>,
+        refs: &[&'s str],
+        sink: &mut Sink,
+    ) {
+        let n = options.len();
+        let furthest = failed.iter().map(|f| f.1).max().unwrap_or(at.depth);
+        if sink.trial {
+            // Only the verdict matters in a try, and how far the value got,
+            // for the union around this one to compare.
+            sink.push_as(at, furthest, || format!("matches none of the {n} alternatives in {key}"));
+            return;
+        }
+        if let [(only, _)] = failed.iter().filter(|f| f.1 == furthest).collect::<Vec<_>>()[..] {
+            let before = sink.found;
+            self.check(&options[*only], value, at, refs, sink);
+            if sink.found > before || self.exhausted {
+                return;
+            }
+        }
+        let mut detail = Vec::new();
+        for &(i, _) in failed.iter().take(3) {
+            let mut first = Sink::trial(true);
+            self.check(&options[i], value, at, refs, &mut first);
+            if self.exhausted {
+                return;
+            }
+            if let Some(problem) = first.list.pop() {
+                detail.push(format!("{}. {problem}", i + 1));
+            }
+        }
+        let more = if failed.len() > 3 { "; …" } else { "" };
+        sink.push(at, || {
+            if detail.is_empty() {
+                format!("matches none of the {n} alternatives in {key}")
+            } else {
+                format!("matches none of the {n} alternatives in {key} ({}{more})", detail.join("; "))
+            }
+        });
+    }
+}
+
+/// The problem with `num` against the bound keyword `key`, if any. An
+/// equality that holds only between doubles, one of them beyond the exact
+/// integer range, is no verdict either way, and is refused.
+fn bound_problem(num: &Number, key: &str, bound: &Number) -> Option<String> {
+    let ord = num_cmp(num, bound);
+    if ord == Some(Ordering::Equal) && (rounded(num) || rounded(bound)) {
+        return Some(only_as_doubles(&format!("{key} {bound}")));
+    }
+    let (holds, op) = match key {
+        "minimum" => (ord != Some(Ordering::Less), ">="),
+        "maximum" => (ord != Some(Ordering::Greater), "<="),
+        "exclusiveMinimum" => (ord == Some(Ordering::Greater), ">"),
+        _ => (ord == Some(Ordering::Less), "<"),
+    };
+    (!holds).then(|| format!("must be {op} {bound}"))
 }
 
 /// An integer's exact value. `None` for a float.
@@ -361,15 +840,41 @@ fn num_cmp(a: &Number, b: &Number) -> Option<Ordering> {
 }
 
 /// Equality as JSON Schema means it, at any depth: `1` and `1.0` are the
-/// same number, in an array or an object as much as on their own.
-fn same(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => num_cmp(x, y) == Some(Ordering::Equal),
-        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same(p, q)),
-        (Value::Object(x), Value::Object(y)) => {
-            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w)))
+/// same number, in an array or an object as much as on their own. `None` when
+/// the two are equal only as doubles and one of the numbers that decides it is
+/// [`rounded`]: they may be two different integers.
+fn same(a: &Value, b: &Value) -> Option<bool> {
+    // Equal throughout, unless some part is unsure; any part that differs
+    // settles it.
+    fn all<'x>(pairs: impl Iterator<Item = (&'x Value, &'x Value)>) -> Option<bool> {
+        let mut unsure = false;
+        for (p, q) in pairs {
+            match same(p, q) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None => unsure = true,
+            }
         }
-        _ => a == b,
+        if unsure { None } else { Some(true) }
+    }
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match num_cmp(x, y) {
+            Some(Ordering::Equal) if rounded(x) || rounded(y) => None,
+            ord => Some(ord == Some(Ordering::Equal)),
+        },
+        (Value::Array(x), Value::Array(y)) => {
+            if x.len() != y.len() {
+                return Some(false);
+            }
+            all(x.iter().zip(y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            if x.len() != y.len() || x.keys().any(|k| !y.contains_key(k)) {
+                return Some(false);
+            }
+            all(x.iter().map(|(k, v)| (v, &y[k])))
+        }
+        _ => Some(a == b),
     }
 }
 
@@ -569,31 +1074,106 @@ fn known_type(name: &str, at: &str) -> Result<(), String> {
     }
 }
 
-/// A definition that reaches itself through `$ref`s (directly, or through
-/// `allOf`/`anyOf`/`oneOf`) without describing any part of the value — so
-/// checking it would never get anywhere. Recursion through a property or an
-/// item is fine: each step consumes part of the value.
-fn ref_cycle(root: &Value) -> Result<(), String> {
-    let Some(defs) = root.get("$defs").and_then(Value::as_object) else { return Ok(()) };
-    for (name, start) in defs {
-        let mut stack = in_place_refs(start);
-        let mut seen: Vec<*const Value> = Vec::new();
-        while let Some(reference) = stack.pop() {
-            let Some(target) = resolve_local(root, reference) else { continue };
-            if std::ptr::eq(target, start) {
-                return Err(format!(
-                    "#/$defs/{} refers back to itself through {reference:?} without describing any part of the \
-                     value, so no answer could ever be checked against it",
-                    segment(name)
-                ));
-            }
-            if !seen.contains(&(target as *const Value)) {
-                seen.push(target);
-                stack.extend(in_place_refs(target));
+/// The `$ref` graph, as the checker will follow it. Refused:
+///
+/// - a cycle of `$ref`s that apply at the same place in the value (directly,
+///   or through `allOf`/`anyOf`/`oneOf`) without describing any part of it,
+///   whether it comes back to a `$defs` entry or to a sub-schema inside one
+///   (`#/$defs/D/allOf/0` pointing at itself): checking it would never get
+///   anywhere;
+/// - a chain of more than [`MAX_REFS_IN_PLACE`] such `$ref`s, which the
+///   checker would stop following, so that every answer failed.
+///
+/// Recursion through a property or an item is fine: each step consumes part
+/// of the value.
+fn ref_graph(root: &Value) -> Result<(), String> {
+    let mut refs = Vec::new();
+    schema_refs(root, &mut refs);
+    let mut longest: HashMap<*const Value, usize> = HashMap::new();
+    let mut stack: Vec<*const Value> = Vec::new();
+    // A target is read as a schema wherever it points (even somewhere that is
+    // not a schema position), so the references inside it count too.
+    let mut walked: HashSet<*const Value> = HashSet::new();
+    let mut i = 0;
+    while let Some(&reference) = refs.get(i) {
+        i += 1;
+        if let Some(target) = resolve_local(root, reference) {
+            chain_from(root, reference, target, &mut longest, &mut stack)?;
+            if walked.insert(target as *const Value) {
+                schema_refs(target, &mut refs);
             }
         }
     }
     Ok(())
+}
+
+/// The most `$ref`s followed in a row at one place once `target` is entered
+/// through `reference` (itself included), by depth-first search over the
+/// in-place references, remembering each finished target.
+fn chain_from<'s>(
+    root: &'s Value,
+    reference: &str,
+    target: &'s Value,
+    longest: &mut HashMap<*const Value, usize>,
+    stack: &mut Vec<*const Value>,
+) -> Result<usize, String> {
+    let key = target as *const Value;
+    if let Some(&n) = longest.get(&key) {
+        return Ok(n);
+    }
+    if stack.contains(&key) {
+        return Err(format!(
+            "{reference} refers back to itself through $refs that describe no part of the value, so no answer could \
+             ever be checked against it"
+        ));
+    }
+    if stack.len() >= MAX_REFS_IN_PLACE {
+        return Err(format!(
+            "the schema follows more than {MAX_REFS_IN_PLACE} $refs in a row at one place (the chain reaches \
+             {reference:?}) without describing any part of the value, and the checker follows at most \
+             {MAX_REFS_IN_PLACE}; shorten the chain"
+        ));
+    }
+    stack.push(key);
+    let mut most = 0;
+    for next in in_place_refs(target) {
+        if let Some(t) = resolve_local(root, next) {
+            most = most.max(chain_from(root, next, t, longest, stack)?);
+        }
+    }
+    stack.pop();
+    longest.insert(key, most + 1);
+    Ok(most + 1)
+}
+
+/// Every `$ref` in a place the checker reads a schema from: the root, its
+/// `$defs`, and every sub-schema under `properties`, `additionalProperties`,
+/// `items`, `prefixItems`, `allOf`, `anyOf` and `oneOf`. (A `const` or an
+/// `enum` holds data, not schemas.)
+fn schema_refs<'s>(schema: &'s Value, out: &mut Vec<&'s str>) {
+    let Some(s) = schema.as_object() else { return };
+    if let Some(Value::String(r)) = s.get("$ref") {
+        out.push(r);
+    }
+    for key in ["properties", "$defs"] {
+        if let Some(Value::Object(subs)) = s.get(key) {
+            for sub in subs.values() {
+                schema_refs(sub, out);
+            }
+        }
+    }
+    for key in ["additionalProperties", "items"] {
+        if let Some(sub) = s.get(key) {
+            schema_refs(sub, out);
+        }
+    }
+    for key in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        if let Some(Value::Array(subs)) = s.get(key) {
+            for sub in subs {
+                schema_refs(sub, out);
+            }
+        }
+    }
 }
 
 /// The `$ref`s that apply at the same place in the value as `schema` itself.
@@ -853,5 +1433,166 @@ mod tests {
         ] {
             assert_eq!(output_schema_problem(&good), None, "{good}");
         }
+    }
+
+    /// `Add | Sub | Lit`, two records sharing the recursive fields: the shape
+    /// that made 2.9.0's checking exponential in the answer's depth.
+    fn expr() -> Value {
+        let binary = |kind: &str| {
+            json!({
+                "type": "object",
+                "properties": {"kind": {"const": kind}, "left": {"$ref": "#/$defs/E"}, "right": {"$ref": "#/$defs/E"}},
+                "required": ["kind", "left", "right"],
+                "additionalProperties": false,
+            })
+        };
+        json!({
+            "type": "object",
+            "properties": {"expr": {"$ref": "#/$defs/E"}},
+            "required": ["expr"],
+            "$defs": {
+                "Add": binary("add"),
+                "Sub": binary("sub"),
+                "Lit": {"type": "object", "properties": {"kind": {"const": "lit"}, "value": {"type": "integer"}},
+                        "required": ["kind", "value"], "additionalProperties": false},
+                "E": {"anyOf": [{"$ref": "#/$defs/Add"}, {"$ref": "#/$defs/Sub"}, {"$ref": "#/$defs/Lit"}]},
+            },
+        })
+    }
+
+    /// A chain `depth` deep, alternating add and sub, with `leaf` at the bottom.
+    fn expr_chain(depth: usize, leaf: Value) -> Value {
+        let mut e = leaf;
+        for i in 0..depth {
+            let kind = if i % 2 == 0 { "sub" } else { "add" };
+            e = json!({"kind": kind, "left": e, "right": {"kind": "lit", "value": 1}});
+        }
+        json!({"expr": e})
+    }
+
+    #[test]
+    fn a_recursive_union_is_checked_in_time_linear_in_the_answer() {
+        let schema = expr();
+        assert_eq!(output_schema_problem(&schema), None);
+        // 2.9.0 took minutes at depth 22; this is 120 deep.
+        let started = std::time::Instant::now();
+        let good = expr_chain(120, json!({"kind": "lit", "value": 0}));
+        assert_eq!(validate(&schema, &good), Vec::<String>::new());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        // The union member the value meant is the one reported, at the place
+        // that is wrong, not "matches none" at the top.
+        let bad = expr_chain(3, json!({"kind": "lit", "value": "zero"}));
+        assert_eq!(validate(&schema, &bad), vec!["$.expr.left.left.left.value: expected integer, got string"]);
+        let unknown = json!({"expr": {"kind": "mul", "left": {"kind": "lit", "value": 1}, "right": {"kind": "lit", "value": 2}}});
+        let problems = validate(&schema, &unknown);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with("$.expr: matches none of the 3 alternatives in anyOf (1. $.expr.kind: must be \"add\"; "),
+                "{problems:?}");
+    }
+
+    #[test]
+    fn one_of_stops_at_the_second_match_and_names_both() {
+        let s = json!({"oneOf": [{"type": "integer"}, {"type": "string"}, {"type": "number", "minimum": 0},
+                                 {"type": "number", "maximum": 9}]});
+        assert!(valid(s.clone(), json!("x")));
+        assert_eq!(validate(&s, &json!(3)), vec!["$: matches more than one alternative in oneOf (alternatives 1 and 3); exactly one is allowed"]);
+    }
+
+    #[test]
+    fn a_failed_const_or_enum_is_not_descended_into() {
+        let s = json!({"const": {"a": 1}, "properties": {"a": {"type": "string"}}});
+        assert_eq!(validate(&s, &json!({"a": 2})), vec!["$: must be {\"a\":1}"]);
+        let s = json!({"enum": [[1]], "items": {"type": "string"}});
+        assert_eq!(validate(&s, &json!([2])), vec!["$: must be one of [1]"]);
+    }
+
+    #[test]
+    fn a_schema_whose_alternatives_multiply_stops_at_the_step_budget() {
+        // D0 .. D29, each "D(i+1) or D(i+1)": 2^30 ways to check one scalar,
+        // all at one place. A chain of 30 in-place $refs boots.
+        let mut defs = Map::new();
+        for i in 0..30 {
+            let next = json!({"$ref": format!("#/$defs/D{}", i + 1)});
+            defs.insert(format!("D{i}"), json!({"anyOf": [next.clone(), {"allOf": [next]}]}));
+        }
+        defs.insert("D30".into(), json!({"type": "string"}));
+        let schema = json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/D0"}}, "$defs": defs});
+        assert_eq!(output_schema_problem(&schema), None);
+        let started = std::time::Instant::now();
+        let problems = validate(&schema, &json!({"x": 1}));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with(&format!("$: checking stopped after {MIN_STEPS} steps without a verdict")), "{problems:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        // An answer the first alternatives settle is still accepted.
+        assert!(validate(&schema, &json!({"x": "s"})).is_empty());
+        // The budget grows with the value.
+        assert_eq!(validate_within(&json!({"type": "integer"}), &json!(1), 0).len(), 1);
+        assert!(validate_within(&json!({"type": "integer"}), &json!(1), 1).is_empty());
+    }
+
+    #[test]
+    fn integers_beyond_64_bits_are_never_passed_on_a_rounding() {
+        let big = json!(18_446_744_073_709_551_616.0); // what 2^64 + 1 parses to
+        let int = json!({"type": "integer"});
+        let p = validate(&int, &big);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].starts_with("$: expected integer, got 1.8446744073709552e+19, which is outside the integers"), "{p:?}");
+        assert!(!valid(json!({"type": ["integer", "null"]}), big.clone()));
+        assert!(valid(json!({"type": ["integer", "number"]}), big.clone()));
+        assert!(valid(json!({"type": "number"}), big.clone()));
+        assert!(!valid(int.clone(), json!(-9_223_372_036_854_775_808.0)));
+        assert!(valid(int.clone(), json!(i64::MIN)));
+        assert!(valid(int.clone(), json!(u64::MAX)));
+        assert!(valid(int, json!(9_223_372_036_854_775_808.0)));
+        // An equality that holds only as doubles is no verdict.
+        let p = validate(&json!({"maximum": 18_446_744_073_709_551_616.0}), &big);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("is equal to maximum 1.8446744073709552e+19 only as a double"), "{p:?}");
+        assert!(!valid(json!({"minimum": 18_446_744_073_709_551_616.0}), big.clone()));
+        assert!(!valid(json!({"const": 18_446_744_073_709_551_616.0}), big.clone()));
+        assert!(!valid(json!({"enum": [1, 18_446_744_073_709_551_616.0]}), big.clone()));
+        assert!(!valid(json!({"const": i64::MIN}), json!(-9_223_372_036_854_775_808.0)));
+        assert!(!valid(json!({"const": [1, 18_446_744_073_709_551_616.0]}), json!([1, 18_446_744_073_709_551_616.0])));
+        // Strict order is exact either way, and a part that differs settles it.
+        assert!(valid(json!({"maximum": 1e30}), big.clone()));
+        assert!(!valid(json!({"maximum": u64::MAX}), big.clone()));
+        assert!(!valid(json!({"const": [2, 18_446_744_073_709_551_616.0]}), json!([1, 18_446_744_073_709_551_616.0])));
+        assert!(valid(json!({"enum": [18_446_744_073_709_551_616.0, 5]}), json!(5)));
+        let p = validate(&json!({"uniqueItems": true}), &json!([1e20, 1e20]));
+        assert_eq!(p.len(), 1);
+        assert!(p[0].starts_with("$: items 0 and 1 are equal only as doubles"), "{p:?}");
+        assert!(valid(json!({"uniqueItems": true}), json!([1e20, 2e20])));
+    }
+
+    #[test]
+    fn boot_refuses_ref_graphs_the_checker_could_not_follow() {
+        let chain = |n: usize| {
+            let mut defs = Map::new();
+            for i in 0..n - 1 {
+                defs.insert(format!("D{i}"), json!({"$ref": format!("#/$defs/D{}", i + 1)}));
+            }
+            defs.insert(format!("D{}", n - 1), json!({"type": "integer"}));
+            json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/D0"}}, "$defs": defs})
+        };
+        // 32 in a row is what the checker follows; 33 it would refuse on every answer.
+        assert_eq!(output_schema_problem(&chain(MAX_REFS_IN_PLACE)), None);
+        assert!(validate(&chain(MAX_REFS_IN_PLACE), &json!({"x": 3})).is_empty());
+        let long = output_schema_problem(&chain(MAX_REFS_IN_PLACE + 1)).expect("33 refused");
+        assert!(long.contains("more than 32 $refs in a row at one place"), "{long}");
+        // A sub-schema pointing at itself consumes nothing.
+        let selfptr = json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/D0"}},
+                             "$defs": {"D0": {"allOf": [{"$ref": "#/$defs/D0/allOf/0"}]}}});
+        let why = output_schema_problem(&selfptr).expect("self-pointing refused");
+        assert!(why.starts_with("#/$defs/D0/allOf/0 refers back to itself"), "{why}");
+        // So does a cycle through two definitions, and one reached only
+        // through a target that is not a schema position.
+        let two = json!({"type": "object", "$defs": {"A": {"anyOf": [{"$ref": "#/$defs/B"}]}, "B": {"allOf": [{"$ref": "#/$defs/A"}]}}});
+        assert!(output_schema_problem(&two).unwrap().contains("refers back to itself"));
+        let hidden = json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/A/const"}},
+                            "$defs": {"A": {"const": {"anyOf": [{"$ref": "#/$defs/A/const"}]}}}});
+        assert!(output_schema_problem(&hidden).unwrap().contains("refers back to itself"));
+        // Recursion through a property is fine, however deep.
+        assert_eq!(output_schema_problem(&tree()), None);
+        assert_eq!(output_schema_problem(&expr()), None);
     }
 }

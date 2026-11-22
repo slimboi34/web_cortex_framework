@@ -9,12 +9,17 @@
 //! `PROPTEST_CASES` (default 256 per property; heavier properties run fewer).
 //! Run: `cargo test -p webcortex-core --test proptest_fuzz`.
 //!
-//! Tests marked `#[ignore]` fail on 2.9.0 and each names the defect; run them
-//! with `-- --ignored` to check a fix. Their standalone repros (against the
-//! published wheel) live with the fuzzing report, not in this tree.
+//! Deterministic by default: every property starts from a fixed seed, so a
+//! run in CI is the same run each time. `PROPTEST_RNG_SEED=<n>` picks another
+//! seed and `PROPTEST_RANDOM=1` a fresh one per run (with a large
+//! `PROPTEST_CASES`, that is a fuzzing campaign).
+//!
+//! Six of these failed on 2.9.0 and were `#[ignore]`d with the defect named;
+//! 2.9.1 fixed them (double-decoded path parameters, exponential checking of
+//! recursive unions, boot accepting `$ref` graphs the checker refuses).
 
 use proptest::prelude::*;
-use proptest::test_runner::Config as ProptestConfig;
+use proptest::test_runner::{Config as ProptestConfig, RngSeed};
 use serde_json::{Map, Number, Value, json};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -33,12 +38,19 @@ use webcortex_core::trace::Tracer;
 
 fn cases(scale: f64) -> ProptestConfig {
     let base: f64 = std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(256.0);
+    let defaults = ProptestConfig::default();
+    // PROPTEST_RNG_SEED (read into the defaults) wins; otherwise a fixed seed.
+    let rng_seed = match defaults.rng_seed {
+        RngSeed::Random if std::env::var_os("PROPTEST_RANDOM").is_none() => RngSeed::Fixed(0x5EED_0291),
+        seed => seed,
+    };
     ProptestConfig {
         cases: ((base * scale).max(16.0)) as u32,
         // Failures are reported with their minimal input; no regression files
         // are written into the source tree.
         failure_persistence: None,
-        ..ProptestConfig::default()
+        rng_seed,
+        ..defaults
     }
 }
 
@@ -193,6 +205,44 @@ fn oracle_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// A double outside the range where JSON integers are held exactly (-2^63 to
+/// 2^64 - 1). It may be an integer the parser rounded (serde_json keeps
+/// `18446744073709551617` as the double 2^64), so since 2.9.1 the checker
+/// lets neither `type: integer` nor an equality that rests on it pass.
+fn rounded(n: &Number) -> bool {
+    n.as_i64().is_none()
+        && n.as_u64().is_none()
+        && n.as_f64().is_some_and(|f| f >= 18_446_744_073_709_551_616.0 || f <= -9_223_372_036_854_775_808.0)
+}
+
+/// [`oracle_eq`] under that rule: `None` when the two are equal only through
+/// a rounded number (they may be two different integers). A part that
+/// differs settles it either way.
+fn oracle_same(a: &Value, b: &Value) -> Option<bool> {
+    fn combine(parts: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+        let parts: Vec<Option<bool>> = parts.collect();
+        if parts.contains(&Some(false)) {
+            Some(false)
+        } else if parts.contains(&None) {
+            None
+        } else {
+            Some(true)
+        }
+    }
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            let eq = exact_cmp(x, y) == Ordering::Equal;
+            if eq && (rounded(x) || rounded(y)) { None } else { Some(eq) }
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => combine(x.iter().zip(y).map(|(p, q)| oracle_same(p, q))),
+        (Value::Object(x), Value::Object(y)) if x.len() == y.len() && x.keys().all(|k| y.contains_key(k)) => {
+            combine(x.iter().map(|(k, v)| oracle_same(v, &y[k])))
+        }
+        (Value::Array(_), Value::Array(_)) | (Value::Object(_), Value::Object(_)) => Some(false),
+        _ => Some(a == b),
+    }
+}
+
 fn ok(schema: &Value, value: &Value) -> bool {
     validate(schema, value).is_empty()
 }
@@ -340,31 +390,35 @@ proptest! {
     #![proptest_config(cases(16.0))]
 
     /// `minimum`/`maximum` and the exclusive bounds compare exactly, integer
-    /// against integer, integer against float and float against float.
+    /// against integer, integer against float and float against float. An
+    /// equality through a rounded number is refused, as no verdict.
     #[test]
     fn validator_numeric_bounds_are_exact(v in arb_number(), b in arb_number()) {
         let c = exact_cmp(&v, &b);
+        let sure = !(c == Ordering::Equal && (rounded(&v) || rounded(&b)));
         let value = Value::Number(v.clone());
-        prop_assert_eq!(ok(&json!({"minimum": b}), &value), c != Ordering::Less, "minimum {} vs {}", b, v);
-        prop_assert_eq!(ok(&json!({"maximum": b}), &value), c != Ordering::Greater, "maximum {} vs {}", b, v);
-        prop_assert_eq!(ok(&json!({"exclusiveMinimum": b}), &value), c == Ordering::Greater, "exclusiveMinimum {} vs {}", b, v);
-        prop_assert_eq!(ok(&json!({"exclusiveMaximum": b}), &value), c == Ordering::Less, "exclusiveMaximum {} vs {}", b, v);
+        prop_assert_eq!(ok(&json!({"minimum": b}), &value), sure && c != Ordering::Less, "minimum {} vs {}", b, v);
+        prop_assert_eq!(ok(&json!({"maximum": b}), &value), sure && c != Ordering::Greater, "maximum {} vs {}", b, v);
+        prop_assert_eq!(ok(&json!({"exclusiveMinimum": b}), &value), sure && c == Ordering::Greater, "exclusiveMinimum {} vs {}", b, v);
+        prop_assert_eq!(ok(&json!({"exclusiveMaximum": b}), &value), sure && c == Ordering::Less, "exclusiveMaximum {} vs {}", b, v);
     }
 
-    /// `type: integer` accepts exactly the integral numbers, floats included.
+    /// `type: integer` accepts exactly the integral numbers, floats included,
+    /// except a rounded one (it is not the integer that was sent).
     #[test]
     fn validator_integer_type_is_integral_value(v in arb_number()) {
-        prop_assert_eq!(ok(&json!({"type": "integer"}), &Value::Number(v.clone())), is_integral(&v), "{}", v);
+        prop_assert_eq!(ok(&json!({"type": "integer"}), &Value::Number(v.clone())), is_integral(&v) && !rounded(&v), "{}", v);
         prop_assert!(ok(&json!({"type": "number"}), &Value::Number(v.clone())), "number refused {}", v);
     }
 
-    /// `const` and `enum` use JSON Schema equality: 1 == 1.0, at any depth.
+    /// `const` and `enum` use JSON Schema equality: 1 == 1.0, at any depth;
+    /// an equality through a rounded number does not count.
     #[test]
     fn validator_const_and_enum_use_numeric_equality(a in arb_json(), b in arb_json(), extra in prop::collection::vec(arb_json(), 0..3)) {
-        prop_assert_eq!(ok(&json!({"const": a}), &b), oracle_eq(&a, &b), "const {} vs {}", a, b);
+        prop_assert_eq!(ok(&json!({"const": a}), &b), oracle_same(&a, &b) == Some(true), "const {} vs {}", a, b);
         let mut allowed = extra.clone();
         allowed.push(a.clone());
-        let want = allowed.iter().any(|x| oracle_eq(x, &b));
+        let want = allowed.iter().any(|x| oracle_same(x, &b) == Some(true));
         prop_assert_eq!(ok(&json!({"enum": allowed}), &b), want, "enum with {}", b);
     }
 
@@ -519,7 +573,6 @@ proptest! {
     /// checking a value never stops at "refers back to itself" or "more than
     /// 32 $refs": those schemas are the ones boot is documented to refuse.
     #[test]
-    #[ignore = "fails on 2.9.0: boot accepts a self-pointing sub-schema; repro_output_schema_boot_gaps.py"]
     fn validator_accepted_ref_graphs_always_resolve(kinds in prop::collection::vec(arb_def_kind(), 1..48), value in arb_json()) {
         let schema = defs_graph(&kinds);
         if output_schema_problem(&schema).is_none() {
@@ -561,7 +614,6 @@ proptest! {
 /// so boot accepts it; checking must then follow it rather than refuse every
 /// answer at that place.
 #[test]
-#[ignore = "fails on 2.9.0: boot accepts a >32-alias chain the checker refuses; repro_output_schema_boot_gaps.py"]
 fn validator_long_alias_chain_accepted_at_boot_is_followed() {
     let kinds: Vec<DefKind> = (0..40).map(|i| if i < 39 { DefKind::Next } else { DefKind::Terminal }).collect();
     let schema = defs_graph(&kinds);
@@ -573,7 +625,6 @@ fn validator_long_alias_chain_accepted_at_boot_is_followed() {
 /// A definition whose `allOf` entry points at itself (`#/$defs/D0/allOf/0`)
 /// consumes nothing, so boot should refuse it as it refuses `D0 -> D0`.
 #[test]
-#[ignore = "fails on 2.9.0: boot accepts a self-pointing sub-schema; repro_output_schema_boot_gaps.py"]
 fn validator_self_pointing_subschema_is_refused_at_boot() {
     let schema = defs_graph(&[DefKind::IntoAllOf(0)]);
     let boot = output_schema_problem(&schema);
@@ -627,12 +678,11 @@ fn expr_chain(depth: usize) -> Value {
 /// checks the whole subtree once per member, so 2.9.0 does ~2^depth work
 /// (debug build: depth 14 = 1.7 s, 16 = 8 s, 18 = 34 s).
 #[test]
-#[ignore = "fails on 2.9.0: anyOf checking is exponential in answer depth; repro_validator_exponential_union.py"]
 fn validator_time_is_not_exponential_in_answer_depth() {
     let schema = expr_schema();
     assert!(output_schema_problem(&schema).is_none());
     let mut last = std::time::Duration::ZERO;
-    for depth in [4usize, 8, 10, 12, 14] {
+    for depth in [4usize, 8, 10, 12, 14, 40, 100] {
         let value = expr_chain(depth);
         let t = std::time::Instant::now();
         let problems = validate(&schema, &value);
@@ -640,7 +690,7 @@ fn validator_time_is_not_exponential_in_answer_depth() {
         eprintln!("expr depth {depth:>2}: {:>10.3} ms ({} bytes)", last.as_secs_f64() * 1e3, value.to_string().len());
         assert!(problems.is_empty(), "{problems:?}");
     }
-    assert!(last < std::time::Duration::from_millis(50), "depth 14 took {last:?}");
+    assert!(last < std::time::Duration::from_millis(50), "depth 100 took {last:?}");
 }
 
 // ======================================================================

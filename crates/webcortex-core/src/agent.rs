@@ -811,10 +811,12 @@ impl AgentRuntime {
                 // model that ignores tool_choice), otherwise say what was
                 // wrong and require the answer as a call.
                 if let Some(schema) = st.entry.output_schema.clone() {
-                    let candidate = recover_json(&response.text);
-                    let problems = match &candidate {
-                        Some(value) => crate::schema::validate(&schema, value),
-                        None => vec![format!("$: the answer was plain text, not a {FINAL_TOOL} call")],
+                    let (candidate, problems) = match recover_json(&response.text) {
+                        Some(value) => {
+                            let (value, problems) = check_output(schema, value).await;
+                            (Some(value), problems)
+                        }
+                        None => (None, vec![format!("$: the answer was plain text, not a {FINAL_TOOL} call")]),
                     };
                     if let (Some(value), true) = (candidate, problems.is_empty()) {
                         self.accept_output(&mut st, value);
@@ -859,13 +861,13 @@ impl AgentRuntime {
             if call.name == FINAL_TOOL
                 && let Some(schema) = st.entry.output_schema.clone()
             {
-                let problems = if call.arguments.is_object() {
-                    crate::schema::validate(&schema, &call.arguments)
+                let (answer, problems) = if call.arguments.is_object() {
+                    check_output(schema, call.arguments.clone()).await
                 } else {
-                    vec!["$: the arguments were not a JSON object".to_string()]
+                    (Value::Null, vec!["$: the arguments were not a JSON object".to_string()])
                 };
                 if problems.is_empty() {
-                    self.accept_output(st, call.arguments.clone());
+                    self.accept_output(st, answer);
                     results.push(tool_result(&call.id, &json!({"accepted": true}), false));
                 } else {
                     let correction = self.reject_output(app, st, &problems);
@@ -1599,6 +1601,23 @@ fn refused(index: u32, call: &ToolCall, msg: &str, started: std::time::Instant) 
         hint: None,
         duration_ms: started.elapsed().as_millis() as u64,
     }
+}
+
+/// Check a structured answer against the agent's output schema on the
+/// blocking pool, and hand the answer back with what is wrong with it.
+///
+/// The check is bounded (the step budget in `schema.rs`), but a large answer
+/// to a schema with many alternatives can still take a noticeable fraction of
+/// a second, and through 2.9.0 that time was spent on a tokio worker, where
+/// nothing (not the route timeout, not `/_webcortex/health`) could run until
+/// it finished.
+async fn check_output(schema: Value, answer: Value) -> (Value, Vec<String>) {
+    tokio::task::spawn_blocking(move || {
+        let problems = crate::schema::validate(&schema, &answer);
+        (answer, problems)
+    })
+    .await
+    .unwrap_or_else(|e| (Value::Null, vec![format!("$: the answer could not be checked: {e}")]))
 }
 
 pub fn tool_result(id: &str, content: &Value, is_error: bool) -> Value {
