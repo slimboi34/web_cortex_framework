@@ -3,7 +3,7 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
-## [2.9.1] — 2026-11-21
+## [2.9.1] — 2026-11-22
 
 Fixes from machine-driven testing of the published 2.9.0 wheel. Where 2.9.0 came from people
 and agents attacking 2.8.0, this pass was generated: raw-socket fuzzers sent about 1.2 million
