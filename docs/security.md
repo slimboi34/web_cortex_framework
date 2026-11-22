@@ -254,9 +254,14 @@ nested JSON; malformed MCP payloads; CORS origin reflection.
 
 Full detail — **including what was not tested** — in
 [SECURITY.md](https://github.com/slimboi34/web_cortex_framework/blob/main/SECURITY.md).
-Its 2.9.0 section covers the stress test behind this release: an approval gate
+Its 2.9.0 section covers the stress test behind that release: an approval gate
 bypass through a flow step, a slow-read denial of service and a worker-pool
-deadlock, all fixed, and the behaviour changes that came with them.
+deadlock, all fixed, and the behaviour changes that came with them. Its 2.9.1
+section covers the machine-driven testing behind this one (about 1.2 million
+fuzzed requests, a differential test of the output validator, property and
+mutation tests): exponential checking of recursive union answers and
+double-decoded path parameters, fixed, and the HTTP/1 protocol errors hyper
+answers without a code, documented.
 
 ## Checklist before you ship
 

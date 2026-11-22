@@ -12,6 +12,16 @@ Where a code appears: the `code` and `hint` fields of an HTTP error body (and th
 ring of [`/_webcortex/status`](diagnostics.md#the-live-status-view), `webcortex doctor` checks,
 and CLI failures (`error[WC101]: …`).
 
+**One exception: HTTP/1 protocol errors.** A request that does not parse as HTTP/1 at all is
+answered by hyper, the HTTP library under WebCortex, before WebCortex sees it: a malformed
+request line or header line (400 Bad Request), a header section over hyper's limit (431
+Request Header Fields Too Large) and a request target over its limit (414 URI Too Long). These
+responses have an empty body, no `code`, no `x-webcortex-error`, no `x-request-id` and none of
+the security headers, and the connection is closed. hyper offers no hook for the body of its
+own error responses, so this is a known limit rather than a bug; nothing about the request
+reached the app, and a client that sends well-formed HTTP never meets it. (Found by the 2.9.0
+fuzzing; see `SECURITY.md`, "Review — 2.9.1".)
+
 ## Internal faults (WC0xx)
 
 ### WC001 — Internal error {#wc001}

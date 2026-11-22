@@ -482,6 +482,60 @@ tests themselves (the review drove the built extension); Linux and Windows (the 
 on macOS). The ten bugs
 already known before the review were carried in without being re-verified.
 
+## Review — 2.9.1 (machine-driven testing)
+
+2.9.1 comes from machine-driven testing of the published 2.9.0 wheel: about 1.2 million
+generated HTTP/1, HTTP/2 (h2c), MCP and WebSocket inputs from raw-socket fuzzers (malformed
+framing, smuggling and desync attempts, credential bleed between pipelined requests, slow
+readers), a differential test of the output validator against the `jsonschema` library (50,000
+schema and value pairs), property tests in Python (Hypothesis) and Rust (proptest), JWT
+judgements against an oracle written from the docs, and mutation testing of the Python lines
+2.9.0 changed (511 mutants; 103 survived the release's tests, and the new tests kill every
+one that is not equivalent). FakeProvider only, on macOS.
+
+What held: no authorization bypass, no credential bleed between pipelined requests, no panic,
+no server death, no unbounded memory (peak RSS 97 MB) and no 5xx without a code; refusals came
+before the body was read; 40 of 40 slow readers were cut off; JWT judgements were right on
+about 8,000 claim sets over HTTP and about 400,000 in Rust.
+
+**Fixed:**
+
+1. **High (when an app declares a recursive union output): checking an answer took time
+   exponential in its depth, on a tokio worker.** An agent whose `output=` is an expression
+   tree or an AST (`Add | Sub | Lit`, the members sharing recursive fields) re-checked every
+   subtree once per member at every level: a 1.4 KB answer 22 levels deep took 66 s to check,
+   and twelve such runs froze `/_webcortex/health` for over a minute, past the route timeout,
+   which cannot interrupt synchronous work. The model's answer is untrusted input, so a prompt
+   injection could choose it. Now alternatives are tried fail-fast, the verdict of each
+   definition on each object or array is remembered, checking is linear for such schemas
+   (1.7 ms at depth 22 in a debug build), a step budget ends any check that is still too costly
+   with a coded refusal, and the check runs on the blocking pool. The same checker guards
+   native query and resource bodies (`input_schema`), where the budget bounds what a client
+   can make a worker do.
+2. **Medium (a 2.9.0 regression): path parameters were percent-decoded twice.** The path
+   normalisation 2.9.0 added left a `%` that starts no escape bare, so a decoded character after
+   it could complete a new escape that the parameter decoding then decoded again:
+   `%2%45%2%45` reached a handler as `..`, `b%2%46c` as `b/c`, `%0%30` as NUL. Routing and
+   static files were not affected, but a handler could receive a traversal a proxy or WAF that
+   decodes once never saw. A bare `%` is now written `%25` before matching, so a parameter is
+   decoded exactly once, and one that does not decode to UTF-8 reaches the handler as sent.
+3. **Low:** a JSON integer too large for a float sent to a `float` parameter answered 500 before
+   the handler ran (any client); integers beyond 64 bits were rounded silently in typed answers
+   and compared inexactly; `webcortex context --json` and the doctor showed the part of a
+   password after an `@`; evals reported an invalid app as `WC001`; and the boot check
+   accepted two `$ref` graphs the checker then refused on every answer. See `CHANGELOG.md`.
+
+**Known limit:** HTTP/1 requests that do not parse (a malformed request or header line, a
+header section or request target over hyper's limits) are answered by hyper with an empty 400,
+431 or 414, before WebCortex's service runs: no code, no `x-request-id`, no security headers.
+hyper has no hook for the body of its own error responses. Nothing about such a request
+reaches the app, and the connection is closed.
+
+**Not tested here:** coverage-guided fuzzing of the Rust parsers, TLS/HSTS, the timing of key
+comparison, real providers, the proxy against a live upstream, approvals over MCP, JWT expiry
+on an open WebSocket, soak runs longer than 20 minutes, Linux and Windows, and mutation
+testing of the Rust code.
+
 ## Reporting
 
 Report a vulnerability privately through

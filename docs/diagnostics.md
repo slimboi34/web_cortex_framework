@@ -13,7 +13,9 @@ something is wrong:
 
 Every error that reaches a user carries a `code` from one catalogue and a `hint` saying what to
 do. The existing fields are unchanged; `code` and `hint` are added beside them, so a client
-written for 2.4 keeps working.
+written for 2.4 keeps working. The one exception is a request that is not valid HTTP/1, which
+hyper answers itself with an empty 400, 414 or 431 (see
+[Error codes](error-codes.md)).
 
 ```json
 {"error": {"status": 423, "message": "actuators are halted (person in the cell); …",
