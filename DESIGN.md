@@ -63,8 +63,8 @@ Everything else in this document is downstream of those five ideas.
 
 ## 2. What exists and has been measured
 
-Working today, with **334 Rust tests and 916 Python tests** passing and clippy
-clean (as of 2.9.0):
+Working today, with **369 Rust tests and 1,073 Python tests** passing and clippy
+clean (as of 2.9.1):
 
 **Runtime**
 - Manifest IR, boot-time validation, method-partitioned radix router
@@ -381,6 +381,11 @@ Ordered by what unblocks the most.
    a boot error rather than silently ignored.
 ✅ Behaviours run on a pool of their own with a cap, and every blocking call
    from a behaviour has a deadline (see §7).
+✅ 2.9.1: machine-driven testing of 2.9.0 (fuzzing, a differential test of the
+   validator, property and mutation tests) found the validator exponential on
+   recursive unions and path parameters decoded twice. Checking is now
+   polynomial with a step budget, off the async workers; see `SECURITY.md`
+   ("Review — 2.9.1").
 
 **Later, if warranted**
 12. Durable agent runs — only with a real design for exactly-once tool

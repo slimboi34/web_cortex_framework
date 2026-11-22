@@ -3,6 +3,147 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org); before 2.0, minor
 bumps could contain breaking changes.
 
+## [2.9.1] — 2026-11-21
+
+Fixes from machine-driven testing of the published 2.9.0 wheel. Where 2.9.0 came from people
+and agents attacking 2.8.0, this pass was generated: raw-socket fuzzers sent about 1.2 million
+HTTP/1, HTTP/2 (h2c), MCP and WebSocket inputs (malformed framing, smuggling and desync
+attempts, credential bleed between pipelined requests, slow readers); the output validator was
+run differentially against the `jsonschema` library on 50,000 schema and value pairs; property
+tests covered the Python layer (Hypothesis) and the Rust core (proptest: the router, the
+validator, templates and the `json` filter, the error catalogue, `OTEL_EXPORTER_OTLP_HEADERS`,
+query strings, JWT acceptance); and the Python lines 2.9.0 changed were mutation-tested: of 511
+mutants, 103 survived the release's own tests, 14 of them equivalent, and the new tests kill
+the other 89. FakeProvider only, on macOS.
+
+It found nine defects: one high (when an app declares a recursive union output type), one
+medium (a 2.9.0 regression) and seven low. Eight are fixed here, each with a regression test;
+one, HTTP/1 protocol errors answered by hyper without a code, is a documented limit. Nothing it
+found was an authorization bypass, a panic, a crash, unbounded memory or a 5xx without a code.
+The tests it wrote are now part of the suite: `tests/test_2_9_1_properties.py`,
+`tests/test_2_9_1_mutation_killers.py` and `crates/webcortex-core/tests/proptest_fuzz.rs`,
+deterministic and a few seconds each by default. `SECURITY.md` has the review ("Review —
+2.9.1").
+
+### Security
+
+- **Checking a typed agent's answer is no longer exponential in its depth** (high, for apps
+  whose `output=` is a recursive union: an expression tree, an AST, any `Add | Sub | Lit` whose
+  members share recursive fields). The validator checked every `anyOf`/`oneOf` alternative in
+  full, kept descending into a value after its `const` or `enum` had failed, and so re-checked
+  each subtree once per member at every level: a 1.4 KB answer 22 levels deep took 66 s, and it
+  ran on a tokio worker, where the route timeout cannot interrupt it; twelve such runs froze
+  `/_webcortex/health` for over a minute. The answer is the model's, so a prompt injection
+  could choose it. Now:
+  - an alternative is tried until its first problem, looking at a value's scalars before its
+    subtrees, so a wrong discriminator ends the try at once; `anyOf` stops at the first match
+    and `oneOf` at the second; a failed `const` or `enum` is not descended into;
+  - the verdict of each `$defs` entry on each object or array is remembered, so a recursive
+    union is checked in time linear in the answer (1.7 ms at depth 22 in a debug build);
+  - a step budget (256 steps per value in the answer, at least 100,000, at most 4,000,000)
+    ends any check that is still too costly, such as a schema whose alternatives multiply at
+    one place, with a `WC318` problem saying so;
+  - agent answers are checked on the blocking pool, and `ctx.ask` checks with the GIL released.
+
+  The same checker guards the bodies of native query and resource routes, where the budget now
+  bounds what a client can make a worker do.
+- **Path parameters are decoded exactly once again** (medium, a 2.9.0 regression). The path
+  normalisation added in 2.9.0 left a `%` that starts no escape bare, so a decoded character
+  after it could complete a new escape that the parameter decoding then decoded a second time:
+  `/echo/%2%45%2%45` gave a handler `..`, `b%2%46c` gave `b/c`, `%0%30` a NUL. Routing and
+  static files were not affected, but a handler could be given a traversal that a proxy or WAF
+  decoding once never saw. A bare `%` is now written `%25` before matching, so the normal form
+  is its own normal form and the handler gets the single decoding of what was sent (`%41` for
+  `%4%31`).
+- **A JSON integer too large for a float no longer makes a `float` parameter a 500.** Any
+  client could send `{"x": 1` followed by 400 zeros to a handler with `x: float` (or
+  `list[float]`, `Optional[float]`, a dataclass field) and get 500 `WC002` before the handler
+  ran, with a traceback in the log each time. `schema.coerce` caught only `RecursionError`; it
+  now passes the value through unchanged on any conversion error, as it documents.
+
+### Fixed
+
+- **Integers beyond 64 bits are refused rather than rounded.** The core's JSON parser holds an
+  integer outside -2^63 to 2^64 - 1 as the nearest double, so a typed answer `{"n":
+  18446744073709551617}` came back as `1.8446744073709552e19`, `maximum: 2^64` accepted 2^64 +
+  1, and the docs claimed integers compared exactly "however large". Now `type: "integer"`
+  refuses such a value with a problem naming the range (the model can send a string instead),
+  and a `minimum`/`maximum`, `const`, `enum` or `uniqueItems` decision that rests on two values
+  being equal only as doubles is refused as no verdict. Strict order is exact either way, and
+  a `number` field still takes any double. See Known limits for why the integers are not kept
+  exactly.
+- **`webcortex context --json` and the doctor no longer show part of a password containing
+  `@`.** `https://svc:p@ssw0rd@host` was shown as `https://<redacted>@ssw0rd@host`; the
+  redaction now runs to the last `@` of the authority, as URL parsers read it.
+- **An eval of an invalid application reports `WC101`**, as `webcortex check` does, not `WC001`
+  (internal error) with a hint pointing at a server log that does not exist.
+- **The boot check refuses the `$ref` graphs the checker cannot follow.** A sub-schema that
+  points at itself (`"#/$defs/D/allOf/0"` inside `D`'s `allOf`) and a chain of more than 32
+  `$ref`s in a row at one place both booted in 2.9.0 and then failed every answer with
+  `WC318`. Any in-place cycle reachable from the schema, and any longer chain, is now an
+  invalid application (`WC101`) naming the reference.
+- **`schema.coerce` never loses information converting an int to a float.** `coerce(2**53 + 1,
+  float)` returned `9007199254740992.0`; an int now becomes a float only when the float equals
+  it, and otherwise passes through, by the rule that already kept `3.7` from becoming an `int`.
+  `coerce(10**5000, str)` and `Decimal` no longer raise.
+
+### Changed
+
+Upgrading from 2.9.0, these may be visible:
+
+- A typed answer with an integer beyond 64 bits in an `integer` field is refused with `WC318`
+  (it was passed on rounded). A body with one, sent to a native resource or query route that
+  declares the field an integer, is a 422 `WC206` from the input schema; 2.9.0 answered 400
+  `WC211` when the database refused it.
+- A `minimum`/`maximum`/`const`/`enum` check that holds only as doubles beyond 64 bits is
+  refused, so a schema such as `{"const": 1e30}` no longer accepts `1e30`.
+- When no member of a union matches, the problem names the member the answer got furthest
+  into and its own problem (`$.expr.left.value: expected integer, got string`), or lists the
+  first problem of each of the first three members (`matches none of the 3 alternatives in
+  anyOf (1. …; 2. …; 3. …)`); 2.9.0 said only "matches none of the N alternatives". A value
+  matching several `oneOf` members gets `matches more than one alternative in oneOf
+  (alternatives 1 and 3)`. A value that fails `const` or `enum` gets that one problem, not also
+  the problems inside it. The same problem from the same definition at the same place is
+  reported once.
+- An output schema with an in-place `$ref` cycle through a sub-schema, or more than 32 `$ref`s
+  in a row, no longer boots. A cycle's message names the reference that closes it.
+- A path parameter that does not decode to UTF-8 reaches the handler exactly as sent
+  (`%aa` stays `%aa`; 2.9.0 gave the normal form, `%AA`).
+- `schema.coerce(int, float)` returns the int unchanged when no float equals it (past 2^53),
+  and any value it cannot convert, whatever the error, passes through.
+- The `WC318` hint mentions the step budget.
+- Rust: `schema::MAX_REFS_IN_PLACE` is public, with the new `schema::STEPS_PER_VALUE`,
+  `MIN_STEPS` and `MAX_STEPS`.
+- CI installs `hypothesis` and `typing_extensions` for the new tests (also in the `dev` extra);
+  without them the tests that need them are skipped. The Rust property tests use `proptest`
+  (a dev-dependency) from a fixed seed; `PROPTEST_RANDOM=1` with a large `PROPTEST_CASES` makes
+  them a fuzzing campaign.
+
+### Known limits
+
+- **HTTP/1 protocol errors carry no code.** A request that does not parse (a malformed request
+  or header line, a header section or request target over hyper's limits) is answered by hyper
+  with an empty 400, 431 or 414 before WebCortex's service runs, so it has no `code`, no
+  `x-request-id` and no security headers. hyper has no hook for the body of its own error
+  responses; `docs/error-codes.md` and `SECURITY.md` say so.
+- **Integers beyond 64 bits are not carried exactly.** Keeping them would mean serde_json's
+  `arbitrary_precision`, which changes how every number in the runtime is held: numbers would
+  reach minijinja templates as maps, and the `f64` fields inside the manifest's internally
+  tagged enums would stop parsing. So such an integer is refused where it matters (above), and
+  two of them that differ only past double precision cannot be told apart: `uniqueItems`
+  refuses `[2^64, 2^64 + 1]`. Declare such fields as strings.
+- **The input-schema check of native routes runs on the async worker**, bounded by the step
+  budget; agent answers moved to the blocking pool, but native routes keep their fast path.
+- **A request body to an agent, behaviour or flow route may take `agent_timeout` (600 s) to
+  arrive**, as documented since 2.9.0; a separate, short body-arrival timeout is not built.
+- **An undecodable byte in a query value becomes U+FFFD** (`?q=%FF` and `?q=%FE` arrive alike),
+  while a path parameter keeps its escapes; `docs/routing.md` now says so.
+- **A handler can set `x-webcortex-trace`** on its own response. Handlers are trusted code.
+- **Not tested:** coverage-guided fuzzing of the Rust parsers, TLS/HSTS, the timing of key
+  comparison, real providers, the proxy with a live upstream, high-rate device ingest,
+  approvals over MCP, JWT expiry on an open WebSocket, soak runs longer than 20 minutes, Linux
+  and Windows, and mutation testing of the Rust code.
+
 ## [2.9.0] — 2026-11-21
 
 Hardening. This release comes out of a stress test of 2.8.0 that Fable planned and a team of
