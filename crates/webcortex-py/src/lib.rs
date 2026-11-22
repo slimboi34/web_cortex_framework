@@ -576,7 +576,12 @@ fn eval_call(
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
         rt.block_on(async move {
-            let app = App::build(manifest, bridge).await.map_err(PyRuntimeError::new_err)?;
+            // Prefixed as `check` and `run` prefix it, so the eval reports
+            // WC101 for an app that cannot boot (through 2.9.0 it was WC001,
+            // an internal error, with a hint pointing at a server log).
+            let app = App::build(manifest, bridge)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("invalid application: {e}")))?;
             // Both sides fingerprint against the app's aliases, provider options and contexts.
             let scope = FingerprintScope::of(&app);
             if let Some(r) = &replayer {
